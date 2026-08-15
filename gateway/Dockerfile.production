@@ -1,0 +1,52 @@
+# Production builds must supply a digest-pinned base image. Domain-test may use
+# the reviewed local tag only through its explicit build-only escape hatch.
+ARG GATEWAY_BASE_IMAGE=nginx:1.30.4-alpine
+FROM ${GATEWAY_BASE_IMAGE}
+
+ARG GATEWAY_BASE_IMAGE
+ARG ALLOW_MUTABLE_BASE_IMAGE=false
+ARG GATEWAY_SERVER_CONFIG=production.conf
+ARG OPENSSL_PACKAGE=openssl=3.5.7-r0
+
+RUN case "${ALLOW_MUTABLE_BASE_IMAGE}" in \
+      true|false) ;; \
+      *) echo >&2 "ALLOW_MUTABLE_BASE_IMAGE must be exactly true or false"; exit 1 ;; \
+    esac \
+ && case "${GATEWAY_SERVER_CONFIG}" in \
+      production.conf) \
+        baked_mode=production; \
+        test "${ALLOW_MUTABLE_BASE_IMAGE}" = "false" || \
+          { echo >&2 "production.conf forbids ALLOW_MUTABLE_BASE_IMAGE=true"; exit 1; } ;; \
+      domain-test.conf) baked_mode=domain-test ;; \
+      *) \
+        echo >&2 "GATEWAY_SERVER_CONFIG must be production.conf or domain-test.conf"; \
+        exit 1 ;; \
+    esac \
+ && image="${GATEWAY_BASE_IMAGE}"; digest="${image##*@sha256:}"; \
+    case "${image}" in \
+      *@sha256:*) \
+        test "${#digest}" -eq 64 && \
+        case "${digest}" in *[!0-9a-f]*) false ;; *) true ;; esac ;; \
+      *) \
+        test "${baked_mode}" = "domain-test" && \
+        test "${ALLOW_MUTABLE_BASE_IMAGE}" = "true" || \
+          { echo >&2 "production base images require @sha256:<64 lowercase hex>"; exit 1; } ;; \
+    esac \
+ && printf '%s\n' "${baked_mode}" > /usr/local/share/platform-gateway-config-mode \
+ && apk add --no-cache "${OPENSSL_PACKAGE}"
+
+COPY nginx-main.production.conf /etc/nginx/nginx.conf
+COPY proxy-https.conf /etc/nginx/includes/proxy-https.conf
+COPY ${GATEWAY_SERVER_CONFIG} /etc/nginx/conf.d/default.conf
+COPY --chmod=0555 entrypoint-production.sh /usr/local/bin/platform-gateway-entrypoint
+
+ENV PLATFORM_GATEWAY_MODE=production
+
+EXPOSE 3030
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:8080/healthz || exit 1
+
+USER nginx
+ENTRYPOINT ["/usr/local/bin/platform-gateway-entrypoint"]
+CMD ["nginx", "-g", "daemon off;"]

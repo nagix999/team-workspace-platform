@@ -1,0 +1,42 @@
+{
+  "schema_version": 2,
+  "shared_volume": {
+    "name": "jupyter-shared",
+    "mount_path": "/home/jovyan/shared",
+    "gid": 100
+  },
+  "profiles": [
+    {
+      "id": "replace-before-production",
+      "version": 1,
+      "enabled": false,
+      "selectable": false,
+      "config_digest": "sha256:3489afefee5c6b78c5a8f7e839e6dfa5471a838d00d35519a38467e245f43698",
+      "image": "registry.invalid/replace@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cpu_limit": 1.0,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 5368709120,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 1073741824,
+      "tmpfs_size_bytes": 268435456,
+      "shm_size_bytes": 268435456,
+      "log_max_size_bytes": 10485760,
+      "log_max_files": 3,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    }
+  ]
+}

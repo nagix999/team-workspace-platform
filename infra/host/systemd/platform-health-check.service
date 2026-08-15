@@ -1,0 +1,9 @@
+[Unit]
+Description=Publish platform network and storage health manifests
+After=docker.service platform-jupyter-firewall.service
+Requires=docker.service platform-jupyter-firewall.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/platform/infra/host/check_network_health.py --config /etc/platform/host.json
+ExecStart=/usr/bin/python3 /opt/platform/infra/host/check_storage_health.py --config /etc/platform/host.json

@@ -1,0 +1,13 @@
+[Unit]
+Description=Invalidate platform health on Docker generation change
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/platform/infra/host/rotate_docker_generation.py --config /etc/platform/host.json
+ExecStop=/usr/bin/python3 /opt/platform/infra/host/rotate_docker_generation.py --config /etc/platform/host.json --invalidate-only
+RemainAfterExit=yes
+
+[Install]
+WantedBy=docker.service

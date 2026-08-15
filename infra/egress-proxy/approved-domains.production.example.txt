@@ -1,0 +1,4 @@
+# Fail-closed placeholder: comments do not authorize any destination.
+# Add only reviewed package/Git endpoints, one dstdomain value per line.
+# Prefer exact hosts. A leading dot also allows every subdomain and needs review.
+deny.invalid

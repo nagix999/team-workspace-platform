@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh platform host health every 30 seconds
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=30s
+AccuracySec=2s
+Unit=platform-health-check.service
+
+[Install]
+WantedBy=timers.target

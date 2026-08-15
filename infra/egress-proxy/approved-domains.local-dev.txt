@@ -1,0 +1,9 @@
+# Explicit local-development set; review before copying any entry to production.
+pypi.org
+files.pythonhosted.org
+registry.npmjs.org
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com

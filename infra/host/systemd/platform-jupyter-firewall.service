@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply platform Jupyter DOCKER-USER policy
+After=docker.service platform-docker-generation.service
+Requires=docker.service platform-docker-generation.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/platform/infra/host/enforce_jupyter_bridge_policy.py --config /etc/platform/host.json
+ExecStart=/usr/bin/python3 /opt/platform/infra/host/apply_jupyter_firewall.py --config /etc/platform/host.json
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

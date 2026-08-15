@@ -1,0 +1,732 @@
+{
+  "schema_version": 2,
+  "shared_volume": {
+    "name": "jupyter-shared-local",
+    "mount_path": "/home/jovyan/shared",
+    "gid": 100
+  },
+  "profiles": [
+    {
+      "id": "python-local",
+      "version": 1,
+      "enabled": true,
+      "selectable": false,
+      "config_digest": "sha256:b89d38d699271991f14976b728436141f0cef43a1001a3d3833d4ca0d0ed7021",
+      "image": "quay.io/jupyterhub/singleuser:5.5",
+      "cpu_limit": 1.0,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100
+    },
+    {
+      "id": "python312-cpu1-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:93ecb269bf3f47b6a1c178e67da892a384bf3343792b07503d41cc96ebde3405",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu1-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:b83eb2d0e3c709edc8dece9c1cb6965b09f40b906ccb7b9e19cd1cfba607a22a",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu1-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:567d64df10eefc051b4a850337eab08152cf84e5914db1231ecea3e49d61864b",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu2-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:58c3dfd63cce445ec2c60d1279968b3d57a306630f751df068ba2d320f727e58",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu2-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:da7faa24f2193040c21a2f7dfc0bb1f38a111b28cf9439f8c7a9a7e1ca56175d",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu2-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:8153801d3abd3ac5f7058a76fee5316ea260f65e82c878cb84055317cfc94cfc",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu4-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:3de24f3214d9506d58ac69e6e6f9d4b94a62451ab63657065c149a8a3a619a73",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu4-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:a020f8a2bcb34a7a3f3ed0e6c7984e2c05a17431627b95b659dad57cd3330eed",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python312-cpu4-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:8cdade4f96d984aa24236d4d3f3f9addab392f9781614a4a3f373f786b5bf508",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312"
+    },
+    {
+      "id": "python313-cpu1-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:9f3e91f8e292f529bef87cf70a20c70746334c947a962219b83ef204f8fbcd6b",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu1-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:28bf2c8a0f435a25baaf2e4d42df5df3c7faab609d8863e32020583804f44689",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu1-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:dc86d3cad858458939936c53f1a6f7aac2ea8cf4049a4bc7917a0b3e2f5e903a",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu2-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:937bd031d44670f91a53d5a340126bf86b9159277a2ee92f348ab15f0bf94dc5",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu2-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:8452d53b0177eab3e118cb8412e36cbeff7bf2c277bebb00dff605122643f1be",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu2-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:848e52bdbd28b9c5e889ea5dfc60e4a6cebc724ef08487449dec1575967a8331",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu4-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:1acccaa0e17b19a87a27c80f28040ec936f296d6e9487a3ebfe2b4e795b85648",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu4-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:d833e562e62150156be20bb10e1d2e222d18b8be509776403ab589b86eea0aa3",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    },
+    {
+      "id": "python313-cpu4-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:0daa529aec940f57e81885cbaf64f7a418fd40418093837425232721d6938f87",
+      "image": "team-platform-singleuser:py312-py313-local",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "environment": "local-dev",
+  "docker": {
+    "engine_version": "ALLOW_CURRENT_LOCAL_DEV",
+    "firewall_backend": "iptables"
+  },
+  "network": {
+    "name": "platform-jupyter-local",
+    "bridge_name": "br-plt-jlocal",
+    "subnet": "172.31.0.0/24",
+    "dynamic_ip_range": "172.31.0.128/25",
+    "hub_ip": "172.31.0.10",
+    "egress_proxy_ip": "172.31.0.20",
+    "egress_out_subnet": "172.23.0.0/16",
+    "egress_out_proxy_ip": "172.23.0.2",
+    "hub_api_port": 8081,
+    "singleuser_port": 8888,
+    "egress_proxy_port": 3128
+  },
+  "storage": {
+    "enabled": false,
+    "mount_path": "/tmp/platform-userdata-local",
+    "private_root": "/tmp/platform-userdata-local/private",
+    "shared_path": "/tmp/platform-userdata-local/shared",
+    "manifest_dir": "/tmp/platform-userdata-local/manifests",
+    "inventory_file": "/tmp/platform-userdata-local/manifests/volume-inventory.json",
+    "shared_volume_name": "jupyter-shared-local",
+    "slot_count": 5,
+    "uid": 1000,
+    "gid": 100,
+    "shared_gid": 100,
+    "private_hard_limit_bytes": 1073741824,
+    "shared_hard_limit_bytes": 1073741824,
+    "shared_project_id": 1,
+    "docker_data_root": "/var/lib/docker",
+    "docker_storage_driver": "overlay2"
+  },
+  "health": {
+    "output_dir": "/run/platform-health-local",
+    "ttl_seconds": 60
+  }
+}

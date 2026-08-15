@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+# The upstream notebook image entrypoint sources activation hooks before this
+# command. Those hooks may put the base Conda environment back at the front of
+# PATH, so re-assert the digest-bound profile selection at the final execution
+# boundary. The verifier below still checks the resulting PATH and every
+# kernelspec before Jupyter starts.
+platform_python_executable=${PLATFORM_PYTHON_EXECUTABLE:-}
+case "$platform_python_executable" in
+  /*/*) platform_python_bin=${platform_python_executable%/*} ;;
+  *)
+    echo >&2 "platform kernel verification failed: default Python executable is not an absolute path"
+    exit 78
+    ;;
+esac
+PATH="${platform_python_bin}:${PATH:-}"
+export PATH
+
+/opt/conda/bin/python /usr/local/libexec/verify_kernel_contract.py
+
+# A real workspace is identified by PLATFORM_WORKSPACE_ID and must provide the
+# complete private-volume contract. Image-only preflight commands omit all four
+# values. The verifier changes only the mounted directory root mode; it does not
+# traverse or alter user files.
+workspace_id=${PLATFORM_WORKSPACE_ID:-}
+private_mount_path=${PLATFORM_PRIVATE_MOUNT_PATH:-}
+private_uid=${PLATFORM_PRIVATE_UID:-}
+private_gid=${PLATFORM_PRIVATE_GID:-}
+if [ -n "${workspace_id}" ] || [ -n "${private_mount_path}" ] || [ -n "${private_uid}" ] || [ -n "${private_gid}" ]; then
+  if [ -z "${workspace_id}" ] || [ -z "${private_mount_path}" ] || [ -z "${private_uid}" ] || [ -z "${private_gid}" ]; then
+    echo >&2 "private storage verification failed: incomplete runtime contract"
+    exit 78
+  fi
+  /opt/conda/bin/python /usr/local/libexec/verify_private_storage.py
+fi
+
+# The platform always supplies both values for a real workspace.  Image-only
+# preflight commands intentionally omit them because no shared volume is mounted.
+# A partial contract fails closed, while the inherited umask makes files created
+# later by Jupyter collaborative on the setgid shared volume.
+shared_mount_path=${PLATFORM_SHARED_MOUNT_PATH:-}
+shared_gid=${PLATFORM_SHARED_GID:-}
+if [ -n "${shared_mount_path}" ] || [ -n "${shared_gid}" ]; then
+  if [ -z "${shared_mount_path}" ] || [ -z "${shared_gid}" ]; then
+    echo >&2 "shared storage verification failed: incomplete runtime contract"
+    exit 78
+  fi
+  umask 0002
+  /opt/conda/bin/python /usr/local/libexec/verify_shared_storage.py
+fi
+
+exec /opt/conda/bin/jupyterhub-singleuser \
+  "--MappingKernelManager.default_kernel_name=${PLATFORM_DEFAULT_KERNEL}" \
+  "$@"

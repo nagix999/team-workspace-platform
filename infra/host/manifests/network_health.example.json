@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "kind": "network",
+  "healthy": false,
+  "checked_at_unix": 1800000000,
+  "expires_at_unix": 1800000060,
+  "boot_id": "00000000-0000-0000-0000-000000000000",
+  "docker_generation": "00000000-0000-0000-0000-000000000000",
+  "policy_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "checks": {
+    "docker_version_exact": false,
+    "network_exists": false,
+    "internal": false,
+    "ipv6_disabled": false,
+    "icc_disabled": false,
+    "isolated_gateway": false,
+    "subnet_exact": false,
+    "ip_range_exact": false,
+    "aux_addresses_exact": false,
+    "bridge_has_no_ip": false,
+    "firewall_policy_exact": false,
+    "no_unexpected_published_ports": false,
+    "singleuser_runtime_policy": false
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "kind": "storage",
+  "healthy": false,
+  "checked_at_unix": 1800000000,
+  "expires_at_unix": 1800000060,
+  "boot_id": "00000000-0000-0000-0000-000000000000",
+  "docker_generation": "00000000-0000-0000-0000-000000000000",
+  "policy_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "checks": {
+    "filesystem_xfs": false,
+    "docker_storage_driver_exact": false,
+    "docker_data_root_project_quota": false,
+    "project_quota_accounting": false,
+    "project_quota_enforcement": false,
+    "inventory_digest_exact": false,
+    "project_ids_nonzero_unique": false,
+    "projinherit_all": false,
+    "hard_limits_exact": false,
+    "docker_volume_labels_exact": false,
+    "shared_quota_exact": false
+  }
+}

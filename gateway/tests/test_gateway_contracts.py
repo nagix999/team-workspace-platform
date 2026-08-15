@@ -1,0 +1,629 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[2]
+GATEWAY = ROOT / "gateway"
+
+
+def docker_daemon_available() -> bool:
+    if not shutil.which("docker"):
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "info"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class DomainTestComposeContractTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is unavailable")
+    def test_rendered_overlay_is_loopback_tls_only(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "DOMAIN_TEST_TLS_CERT_FILE": "/dev/null",
+                "DOMAIN_TEST_TLS_KEY_FILE": "/dev/null",
+                "DOMAIN_TEST_TLS_GID": "1000",
+                "DOCKER_GID": environment.get("DOCKER_GID", "999"),
+                "PLATFORM_SECRET_GID": environment.get("PLATFORM_SECRET_GID", "1000"),
+            }
+        )
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                "compose.yaml",
+                "-f",
+                "compose.domain-test.yaml",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        config = json.loads(result.stdout)
+        gateway = config["services"]["gateway"]
+        self.assertEqual(
+            gateway["ports"],
+            [
+                {
+                    "mode": "ingress",
+                    "host_ip": "127.0.0.1",
+                    "target": 3030,
+                    "published": "443",
+                    "protocol": "tcp",
+                }
+            ],
+        )
+        self.assertEqual(gateway["environment"]["PLATFORM_GATEWAY_MODE"], "domain-test")
+        self.assertEqual(gateway["networks"]["edge"]["ipv4_address"], "172.28.0.10")
+        self.assertEqual(
+            config["services"]["api"]["environment"]["FORWARDED_ALLOW_IPS"],
+            "172.28.0.10",
+        )
+        self.assertEqual(
+            config["services"]["api"]["environment"]["PLATFORM_DOMAIN_TEST"], "true"
+        )
+        self.assertEqual(
+            config["services"]["jupyterhub"]["environment"]["PLATFORM_ENV"],
+            "domain-test",
+        )
+        for mount in gateway["volumes"]:
+            self.assertTrue(mount["read_only"])
+            self.assertIsNot(mount.get("bind", {}).get("create_host_path"), True)
+
+        reconciler = config["services"]["reconciler"]
+        self.assertEqual(reconciler["networks"], {"control": None})
+        self.assertNotIn("ports", reconciler)
+        self.assertEqual(
+            reconciler["environment"],
+            {
+                "JUPYTERHUB_INTERNAL_URL": "http://jupyterhub:8081",
+                "JUPYTERHUB_RECONCILER_TOKEN_FILE": (
+                    "/run/platform-secrets/reconciler_token"
+                ),
+                "PLATFORM_DATABASE_URL": ("sqlite:////var/lib/platform/platform.db"),
+                "PLATFORM_ENFORCE_SAFE_SQLITE": "false",
+                "PLATFORM_RECONCILIATION_FRESHNESS_SECONDS": "30",
+                "PLATFORM_RECONCILIATION_INTERVAL_SECONDS": "5",
+            },
+        )
+        self.assertEqual(
+            {
+                (mount["target"], mount.get("read_only", False))
+                for mount in reconciler["volumes"]
+            },
+            {
+                ("/var/lib/platform", False),
+                ("/run/platform-secrets/reconciler_token", True),
+            },
+        )
+        self.assertEqual(reconciler["cap_drop"], ["ALL"])
+        self.assertTrue(reconciler["read_only"])
+
+
+class NginxContractTests(unittest.TestCase):
+    def test_domain_test_and_production_fail_closed(self) -> None:
+        domain = (GATEWAY / "domain-test.conf").read_text(encoding="utf-8")
+        production = (GATEWAY / "production.conf").read_text(encoding="utf-8")
+        proxy = (GATEWAY / "proxy-https.conf").read_text(encoding="utf-8")
+        entrypoint = (GATEWAY / "entrypoint-production.sh").read_text(encoding="utf-8")
+
+        for config in (domain, production):
+            self.assertIn("listen 3030 ssl default_server", config)
+            self.assertIn("ssl_reject_handshake on", config)
+            self.assertIn("client_max_body_size 2g", config)
+            self.assertIn("proxy_request_buffering off", config)
+            self.assertNotIn("~*^[a-z0-9]", config)
+            callback = re.search(
+                r"location = /api/v1/auth/callback\s*\{(?P<body>.*?)\n\s*\}",
+                config,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(callback)
+            callback_body = callback.group("body") if callback else ""
+            self.assertIn(
+                "access_log /var/log/nginx/access.log safe_path;", callback_body
+            )
+            self.assertIn("error_log /var/log/nginx/error.log crit;", callback_body)
+            self.assertIn("proxy_pass http://api:8000;", callback_body)
+            self.assertIn(
+                "include /etc/nginx/includes/proxy-https.conf;", callback_body
+            )
+            self.assertRegex(
+                config,
+                r'location ~ "\^/user/.*?/oauth_callback\$"\s*\{'
+                r"(?s:.*?)access_log /var/log/nginx/access\.log safe_path;"
+                r"(?s:.*?)error_log /var/log/nginx/error\.log crit;",
+            )
+            self.assertRegex(
+                config,
+                r"location ~ \^/hub/\(login\|signup\).*?\{"
+                r"(?s:.*?)access_log /var/log/nginx/access\.log safe_path;"
+                r"(?s:.*?)error_log /var/log/nginx/error\.log crit;",
+            )
+        self.assertNotIn("company-vpn-allowlist", domain)
+        self.assertIn("include /tmp/company-vpn-allowlist.conf", production)
+        self.assertIn("if ($platform_ingress_allowed = 0) { return 444; }", production)
+        self.assertIn("X-Forwarded-Proto https", proxy)
+        self.assertIn("X-Forwarded-Port 443", proxy)
+        self.assertIn("X-Forwarded-For $remote_addr", proxy)
+        self.assertNotIn("$proxy_add_x_forwarded_for", proxy)
+        main_config = (GATEWAY / "nginx-main.production.conf").read_text(
+            encoding="utf-8"
+        )
+        safe_format = re.search(
+            r"log_format safe_path (?P<body>.*?);", main_config, re.DOTALL
+        )
+        self.assertIsNotNone(safe_format)
+        safe_body = safe_format.group("body") if safe_format else ""
+        self.assertIn("$request_method $uri $server_protocol", safe_body)
+        self.assertNotIn("$request_uri", safe_body)
+        self.assertNotIn("$args", safe_body)
+        self.assertIn("production company/VPN CIDR allowlist", entrypoint)
+        self.assertIn("DNS:*.hub.workspace.test", entrypoint)
+
+    def test_build_and_runtime_modes_are_fail_closed_and_coupled(self) -> None:
+        dockerfile = (GATEWAY / "Dockerfile.production").read_text(encoding="utf-8")
+        entrypoint = (GATEWAY / "entrypoint-production.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "GATEWAY_SERVER_CONFIG must be production.conf or domain-test.conf",
+            dockerfile,
+        )
+        self.assertIn(
+            "production.conf forbids ALLOW_MUTABLE_BASE_IMAGE=true", dockerfile
+        )
+        self.assertIn("/usr/local/share/platform-gateway-config-mode", dockerfile)
+        self.assertIn('test "${gateway_mode}" = "${baked_mode}"', entrypoint)
+        self.assertIn(
+            "PLATFORM_GATEWAY_MODE does not match the baked Nginx server config",
+            entrypoint,
+        )
+        self.assertIn("$0 == required { found = 1 }", entrypoint)
+
+
+@unittest.skipUnless(docker_daemon_available(), "a reachable Docker daemon is required")
+class GatewayImageModeIntegrationTests(unittest.TestCase):
+    def test_production_build_cannot_use_the_mutable_base_escape(self) -> None:
+        result = subprocess.run(
+            [
+                "docker",
+                "build",
+                "--file",
+                str(GATEWAY / "Dockerfile.production"),
+                "--build-arg",
+                "GATEWAY_SERVER_CONFIG=production.conf",
+                "--build-arg",
+                "ALLOW_MUTABLE_BASE_IMAGE=true",
+                str(GATEWAY),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "production.conf forbids ALLOW_MUTABLE_BASE_IMAGE=true",
+            result.stdout + result.stderr,
+        )
+
+    def test_domain_test_image_rejects_production_runtime_mode(self) -> None:
+        image = f"team-platform-gateway-mode-contract:audit-{os.getpid()}"
+        build = subprocess.run(
+            [
+                "docker",
+                "build",
+                "--tag",
+                image,
+                "--file",
+                str(GATEWAY / "Dockerfile.production"),
+                "--build-arg",
+                "GATEWAY_SERVER_CONFIG=domain-test.conf",
+                "--build-arg",
+                "ALLOW_MUTABLE_BASE_IMAGE=true",
+                str(GATEWAY),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        try:
+            started = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--env",
+                    "PLATFORM_GATEWAY_MODE=production",
+                    image,
+                    "true",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            subprocess.run(
+                ["docker", "image", "rm", image],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        self.assertNotEqual(started.returncode, 0)
+        self.assertIn(
+            "PLATFORM_GATEWAY_MODE does not match the baked Nginx server config",
+            started.stdout + started.stderr,
+        )
+
+
+class HostPreflightTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_module("check_domain_test", GATEWAY / "check_domain_test.py")
+
+    def test_exact_user_hosts(self) -> None:
+        self.assertEqual(
+            self.module.expected_hosts(["alice", "bob-2"]),
+            [
+                "platform.workspace.test",
+                "hub.workspace.test",
+                "alice.hub.workspace.test",
+                "bob-2.hub.workspace.test",
+            ],
+        )
+
+    def test_invalid_user_is_rejected(self) -> None:
+        for username in ("Alice", "a--b", "../x", "-alice"):
+            with self.subTest(username=username), self.assertRaises(ValueError):
+                self.module.expected_hosts([username])
+
+    def test_forbidden_loopback_probe_fails_closed_without_traceback(self) -> None:
+        with mock.patch.object(
+            self.module.socket, "socket", side_effect=PermissionError("blocked")
+        ):
+            self.assertFalse(self.module.port_443_is_free())
+
+
+class IdleDatabaseGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.database = Path(self.tempdir.name) / "platform.db"
+        connection = sqlite3.connect(self.database)
+        connection.executescript(
+            """
+            CREATE TABLE operations (
+                id TEXT, operation_type TEXT, status TEXT, requested_at TEXT
+            );
+            CREATE TABLE workspaces (
+                id TEXT, desired_state TEXT, observed_state TEXT, archived_at TEXT
+            );
+            CREATE TABLE user_provisioning_jobs (user_id TEXT, status TEXT);
+            """
+        )
+        connection.commit()
+        connection.close()
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def run_gate(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/check-domain-test-idle.py"),
+                "--database",
+                str(self.database),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_idle_database_passes(self) -> None:
+        self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_pending_operation_fails(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "INSERT INTO operations VALUES ('op-1', 'START', 'PENDING', 'now')"
+        )
+        connection.commit()
+        connection.close()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("busy operation", result.stderr)
+
+    def test_waiting_external_operation_fails(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "INSERT INTO operations VALUES "
+            "('op-delete', 'DELETE', 'WAITING_EXTERNAL', 'now')"
+        )
+        connection.commit()
+        connection.close()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("WAITING_EXTERNAL", result.stderr)
+
+    def test_running_deletion_fails_when_0004_table_exists(self) -> None:
+        connection = sqlite3.connect(self.database)
+        connection.execute(
+            "CREATE TABLE workspace_deletion_jobs ("
+            "workspace_id TEXT, operation_id TEXT, status TEXT, requested_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO workspace_deletion_jobs VALUES "
+            "('ws-delete', 'op-delete', 'RUNNING', 'now')"
+        )
+        connection.commit()
+        connection.close()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("busy deletion", result.stderr)
+
+    def test_0003_schema_without_deletion_table_still_passes(self) -> None:
+        self.assertEqual(self.run_gate().returncode, 0)
+
+
+class DomainTestDatabaseSnapshotTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.module = load_module(
+            "domain_test_database_snapshot",
+            ROOT / "scripts/domain_test_database_snapshot.py",
+        )
+
+    @staticmethod
+    def _database(path: Path, revision: str) -> None:
+        with sqlite3.connect(path) as database:
+            database.execute("CREATE TABLE alembic_version (version_num TEXT)")
+            database.execute("INSERT INTO alembic_version VALUES (?)", (revision,))
+            database.commit()
+
+    def test_secure_bundle_has_private_verified_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "backups"
+            parent.mkdir(mode=0o700)
+            bundle = self.module.prepare_bundle(parent, "domain-test-safe")
+            for filename, revision in (
+                ("platform.sqlite", "0004"),
+                ("jupyterhub.sqlite", "4621fec11365"),
+            ):
+                self._database(bundle / filename, revision)
+            manifest = self.module.finalize_bundle(bundle)
+
+            self.assertEqual(bundle.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((bundle / "manifest.json").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                manifest["files"]["platform.sqlite"]["schema_revision"], "0004"
+            )
+            self.module.verify_bundle(bundle)
+
+    def test_setgid_runtime_parent_is_normalized_to_exact_private_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "backups"
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o2700)
+
+            bundle = self.module.prepare_bundle(parent, "domain-test-setgid")
+
+            self.assertEqual(parent.stat().st_mode & 0o7777, 0o2700)
+            self.assertEqual(bundle.stat().st_mode & 0o7777, 0o700)
+
+    def test_online_snapshot_includes_committed_wal_and_is_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "live.sqlite"
+            output = root / "snapshot.sqlite"
+            with sqlite3.connect(source) as database:
+                database.execute("PRAGMA journal_mode=WAL")
+                database.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+                database.execute("INSERT INTO marker VALUES ('committed')")
+                database.commit()
+                self.module.snapshot_database(source, output)
+
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            with sqlite3.connect(output) as snapshot:
+                self.assertEqual(
+                    snapshot.execute("SELECT value FROM marker").fetchone(),
+                    ("committed",),
+                )
+                self.assertEqual(
+                    snapshot.execute("PRAGMA quick_check").fetchone(), ("ok",)
+                )
+
+    def test_group_access_and_symlink_bundle_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "backups"
+            parent.mkdir(mode=0o750)
+            with self.assertRaisesRegex(RuntimeError, "mode 0700"):
+                self.module.prepare_bundle(parent, "domain-test-unsafe")
+
+            target = Path(directory) / "target"
+            target.mkdir(mode=0o700)
+            parent.rmdir()
+            parent.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "non-symlink"):
+                self.module.prepare_bundle(parent, "domain-test-symlink")
+
+    def test_manifest_rejects_group_readable_backup_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "backups"
+            parent.mkdir(mode=0o700)
+            bundle = self.module.prepare_bundle(parent, "domain-test-tamper")
+            for filename in ("platform.sqlite", "jupyterhub.sqlite"):
+                self._database(bundle / filename, "0004")
+            self.module.finalize_bundle(bundle)
+            (bundle / "platform.sqlite").chmod(0o640)
+            with self.assertRaisesRegex(RuntimeError, "mode 0600"):
+                self.module.verify_bundle(bundle)
+
+
+class DomainTestTransitionContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.script = (ROOT / "scripts/domain-test.sh").read_text(encoding="utf-8")
+
+    def test_in_place_upgrade_allows_only_exact_managed_tls_listener(self) -> None:
+        helper = self.script[
+            self.script.index("managed_domain_test_listener()") : self.script.index(
+                "run_idle_check()"
+            )
+        ]
+        self.assertIn('container_is_running "$container_id"', helper)
+        self.assertIn("com.docker.compose.service", helper)
+        self.assertIn("PLATFORM_GATEWAY_MODE", helper)
+        self.assertIn('docker port "$container_id" 3030/tcp', helper)
+        self.assertIn("127.0.0.1:443", helper)
+
+        preflight = self.script[
+            self.script.index("preflight()") : self.script.index("snapshot_service()")
+        ]
+        self.assertIn("local -a port_guard=(--check-port-free)", preflight)
+        self.assertIn("if managed_domain_test_listener; then", preflight)
+        self.assertIn("port_guard=()", preflight)
+        self.assertIn('host_args+=("${port_guard[@]}")', preflight)
+
+    def test_worker_and_health_services_use_their_real_state_contracts(self) -> None:
+        self.assertNotIn("up -d --build --wait", self.script)
+        self.assertIn("wait_for_service worker running", self.script)
+        self.assertIn(
+            "for service in api frontend egress-proxy jupyterhub reconciler gateway",
+            self.script,
+        )
+        self.assertIn('wait_for_service "$service" healthy', self.script)
+        for service in ("migrate", "bootstrap-profile", "singleuser-image"):
+            self.assertIn(f"require_completed_service {service}", self.script)
+
+    def test_preflight_never_reconfigures_or_removes_live_edge_network(self) -> None:
+        preflight = self.script[
+            self.script.index("preflight()") : self.script.index("snapshot_service()")
+        ]
+        self.assertIn(
+            "compose_domain build singleuser-image api jupyterhub frontend gateway egress-proxy",
+            preflight,
+        )
+        self.assertIn("compose_base run --rm --no-deps singleuser-image", preflight)
+        self.assertNotIn("compose_domain run", preflight)
+        self.assertNotIn("stop_long_running_static_services", preflight)
+        self.assertNotIn("network disconnect", self.script)
+        self.assertNotIn("docker rm", preflight)
+        self.assertNotIn("compose_domain down", preflight)
+
+    def test_every_static_endpoint_stops_and_backup_precedes_network_replacement(
+        self,
+    ) -> None:
+        services_match = re.search(
+            r"readonly long_running_static_services=\((?P<body>.*?)\n\)",
+            self.script,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(services_match)
+        services = services_match.group("body").split() if services_match else []
+        self.assertEqual(
+            services,
+            [
+                "gateway",
+                "worker",
+                "reconciler",
+                "api",
+                "jupyterhub",
+                "frontend",
+                "egress-proxy",
+            ],
+        )
+        helper = self.script[
+            self.script.index(
+                "stop_long_running_static_services()"
+            ) : self.script.index("start_local_stack()")
+        ]
+        self.assertIn('compose_base stop "${long_running_static_services[@]}"', helper)
+
+        start = self.script.index("start_domain_test()")
+        start_body = self.script[
+            start : self.script.index("restore_database_backup()", start)
+        ]
+        self.assertLess(
+            start_body.index("stop_long_running_static_services"),
+            start_body.index("create_database_backup"),
+        )
+        self.assertLess(
+            start_body.index("create_database_backup"),
+            start_body.index("compose_domain down --remove-orphans"),
+        )
+
+    def test_network_recreation_never_mutates_host_firewall(self) -> None:
+        start = self.script.index("start_domain_test()")
+        start_body = self.script[
+            start : self.script.index("restore_database_backup()", start)
+        ]
+        self.assertNotIn("sudo", self.script)
+        self.assertNotIn("firewall-apply", self.script)
+        self.assertNotIn("apply_jupyter_firewall", self.script)
+        self.assertLess(
+            start_body.index("compose_domain up -d --build"),
+            start_body.index("wait_for_domain_test_stack"),
+        )
+
+    def test_post_down_failure_stays_down_and_prints_restore_command(self) -> None:
+        failure = self.script[
+            self.script.index("report_transition_failure()") : self.script.index(
+                "start_domain_test()"
+            )
+        ]
+        self.assertIn('[ "$transition_is_destructive" = true ]', failure)
+        self.assertIn("database writers remain stopped", failure)
+        self.assertIn("make domain-test-restore BACKUP=", failure)
+        destructive_branch = failure.split("return 0", 1)[0]
+        self.assertNotIn("start_local_stack", destructive_branch)
+
+    def test_database_restore_rejects_stopped_or_running_volume_users(self) -> None:
+        restore = self.script[self.script.index("restore_database_backup()") :]
+        self.assertIn(
+            'docker ps --all --filter "volume=${project_name}_platform_data"',
+            restore,
+        )
+        self.assertIn(
+            'docker ps --all --filter "volume=${project_name}_jupyterhub_data"',
+            restore,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

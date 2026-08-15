@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!Dockerfile.production
+!dev.conf
+!domain-test.conf
+!entrypoint-production.sh
+!nginx-main.conf
+!nginx-main.production.conf
+!production.conf
+!proxy-https.conf

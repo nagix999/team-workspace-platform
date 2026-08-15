@@ -1,0 +1,632 @@
+# Local integration stack only. It is intentionally bound to loopback and uses
+# HTTP, mutable development images, non-XFS volumes, and static health approval.
+# Do not deploy this file as the production stack.
+name: ${COMPOSE_PROJECT_NAME:-team-platform-local}
+
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+  image: team-platform-backend:local
+  environment: &backend-environment
+    PLATFORM_DATABASE_URL: sqlite:////var/lib/platform/platform.db
+    PLATFORM_PORTAL_ORIGIN: http://platform.localhost:8080
+    PLATFORM_INSECURE_LOCAL_DEV: "true"
+    PLATFORM_COOKIE_SECURE: "false"
+    PLATFORM_ENFORCE_SAFE_SQLITE: "false"
+    PLATFORM_EXECUTION_HOST_HEALTHY: "true"
+    PLATFORM_MAX_WORKSPACES_PER_USER: "5"
+    PLATFORM_MAX_ACTIVE_WORKSPACES: "15"
+    PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
+    PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+    PLATFORM_RECONCILIATION_FRESHNESS_SECONDS: "30"
+    PLATFORM_WEB_PROVISIONING_ENABLED: "true"
+    PLATFORM_WORKSPACE_DELETION_ENABLED: "true"
+    PLATFORM_PROVISIONING_LEASE_SECONDS: "300"
+    PLATFORM_PROVISIONING_MAX_ATTEMPTS: "3"
+    PLATFORM_ADMIN_USERNAMES: ${PLATFORM_ADMIN_USERNAME:-platform-admin}
+    JUPYTERHUB_INTERNAL_URL: http://jupyterhub:8081
+    JUPYTERHUB_PUBLIC_URL: http://hub.localhost:8080
+    JUPYTERHUB_USER_DOMAIN: hub.localhost
+    JUPYTERHUB_OAUTH_CLIENT_ID: service-platform-api
+    JUPYTERHUB_OAUTH_REDIRECT_URI: http://platform.localhost:8080/api/v1/auth/callback
+    JUPYTERHUB_OAUTH_CLIENT_SECRET_FILE: /run/platform-secrets/oauth_client_secret
+    PLATFORM_TOKEN_ENCRYPTION_KEY_FILE: /run/platform-secrets/token_encryption_key
+    PLATFORM_TOKEN_ENCRYPTION_KEY_ID: local-v1
+    PLATFORM_SESSION_HASH_KEY_FILE: /run/platform-secrets/session_hash_key
+    PLATFORM_INTERNAL_HMAC_KEY_FILE: /run/platform-secrets/spawn_hmac_key
+  volumes: &backend-volumes
+    - platform_data:/var/lib/platform
+    - ./secrets/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
+    - ./secrets/token_encryption_key:/run/platform-secrets/token_encryption_key:ro
+    - ./secrets/session_hash_key:/run/platform-secrets/session_hash_key:ro
+    - ./secrets/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
+    - ./.runtime:/runtime:ro
+    - ./infra/jupyterhub/profiles.local-dev.json:/etc/platform/profiles.local-dev.json:ro
+  networks:
+    - control
+  group_add:
+    - ${PLATFORM_SECRET_GID:?Run bash scripts/init-local.sh first}
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: &bounded-logs
+    driver: json-file
+    options:
+      max-size: 5m
+      max-file: "2"
+
+services:
+  singleuser-image:
+    build:
+      context: ./infra/singleuser
+      args:
+        SINGLEUSER_BASE_IMAGE: quay.io/jupyterhub/singleuser@sha256:2c952ea9a86a81994b6a5fbd9651e3c55c63008068ad1a27e559c4112d7bcaca
+    image: team-platform-singleuser:py312-py313-local
+    command: ["/usr/local/bin/platform-singleuser", "--version"]
+    environment:
+      PLATFORM_DEFAULT_KERNEL: python312
+      PLATFORM_PYTHON_EXECUTABLE: /opt/conda/envs/python312/bin/python
+      PATH: /opt/conda/envs/python312/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PLATFORM_KERNEL_CONTRACT: >-
+        {"schema_version":1,"python_version":"3.12.13","kernels":[{"name":"python3","display_name":"Python
+        3 (ipykernel)","language":"python","python_version":"3.13.14","executable":"/opt/conda/bin/python"},{"name":"python312","display_name":"Python
+        3.12 (platform)","language":"python","python_version":"3.12.13","executable":"/opt/conda/envs/python312/bin/python"}],"default_kernel":"python312"}
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+
+  snapshot-platform-database:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+    image: team-platform-backend:local
+    # Run as root in maintenance mode so database files are always readable
+    # regardless of host UID/GID variance in the mounted named volume.
+    user: "0:0"
+    command:
+      - python
+      - /opt/platform-maintenance/domain_test_database_snapshot.py
+      - snapshot
+      - --source
+      - /source/platform.db
+      - --output
+      - /snapshot/platform.sqlite
+      - --hold-seconds
+      - "300"
+    volumes:
+      - platform_data:/source:ro
+      - ./scripts/domain_test_database_snapshot.py:/opt/platform-maintenance/domain_test_database_snapshot.py:ro
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      disable: true
+    restart: "no"
+    logging: *bounded-logs
+
+  snapshot-jupyterhub-database:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+    image: team-platform-backend:local
+    # Run as root in maintenance mode so database files are always readable
+    # regardless of host UID/GID variance in the mounted named volume.
+    user: "0:0"
+    command:
+      - python
+      - /opt/platform-maintenance/domain_test_database_snapshot.py
+      - snapshot
+      - --source
+      - /source/jupyterhub.sqlite
+      - --output
+      - /snapshot/jupyterhub.sqlite
+      - --hold-seconds
+      - "300"
+    volumes:
+      - jupyterhub_data:/source:ro
+      - ./scripts/domain_test_database_snapshot.py:/opt/platform-maintenance/domain_test_database_snapshot.py:ro
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      disable: true
+    restart: "no"
+    logging: *bounded-logs
+
+  restore-platform-database:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+    image: team-platform-backend:local
+    user: "0:0"
+    command:
+      - python
+      - /opt/platform-maintenance/domain_test_database_snapshot.py
+      - restore
+      - --source
+      - /restore/input.sqlite
+      - --destination
+      - /source/platform.db
+      - --owner-uid
+      - "999"
+      - --owner-gid
+      - "999"
+    volumes:
+      - platform_data:/source
+      - ./scripts/domain_test_database_snapshot.py:/opt/platform-maintenance/domain_test_database_snapshot.py:ro
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    healthcheck:
+      disable: true
+    restart: "no"
+    logging: *bounded-logs
+
+  restore-jupyterhub-database:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+    image: team-platform-backend:local
+    user: "0:0"
+    command:
+      - python
+      - /opt/platform-maintenance/domain_test_database_snapshot.py
+      - restore
+      - --source
+      - /restore/input.sqlite
+      - --destination
+      - /source/jupyterhub.sqlite
+      - --owner-uid
+      - "10001"
+      - --owner-gid
+      - "10001"
+    volumes:
+      - jupyterhub_data:/source
+      - ./scripts/domain_test_database_snapshot.py:/opt/platform-maintenance/domain_test_database_snapshot.py:ro
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    healthcheck:
+      disable: true
+    restart: "no"
+    logging: *bounded-logs
+
+  migration-preflight:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+    image: team-platform-backend:local
+    # Root execution in maintenance preflight avoids edge-case read failures when the
+    # live platform DB mount is owned by a different UID/GID.
+    user: "0:0"
+    environment:
+      PLATFORM_DATABASE_URL: sqlite:////tmp/platform-profile-preflight.db
+      PLATFORM_PORTAL_ORIGIN: http://platform.localhost:8080
+      PLATFORM_INSECURE_LOCAL_DEV: "true"
+      PLATFORM_COOKIE_SECURE: "false"
+      PLATFORM_ALLOW_INSECURE_DEV_SECRETS: "true"
+      PLATFORM_ENFORCE_SAFE_SQLITE: "false"
+      PLATFORM_MAX_WORKSPACES_PER_USER: "5"
+      PLATFORM_MAX_ACTIVE_WORKSPACES: "15"
+      PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
+      PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+      JUPYTERHUB_PUBLIC_URL: http://hub.localhost:8080
+      JUPYTERHUB_USER_DOMAIN: hub.localhost
+      JUPYTERHUB_OAUTH_REDIRECT_URI: http://platform.localhost:8080/api/v1/auth/callback
+    command:
+      - python
+      - /opt/platform/backend/preflight_profile_import.py
+      - --policy
+      - /etc/platform/profiles.local-dev.json
+      - --source
+      - /var/lib/platform/platform.db
+    volumes:
+      - platform_data:/var/lib/platform:ro
+      - platform_data:/source:ro
+      - ./scripts/domain_test_database_snapshot.py:/opt/platform-maintenance/domain_test_database_snapshot.py:ro
+      - ./scripts/preflight_profile_import.py:/opt/platform/backend/preflight_profile_import.py:ro
+      - ./scripts/check-domain-test-idle.py:/opt/platform-maintenance/check-domain-test-idle.py:ro
+      - ./infra/jupyterhub/profiles.local-dev.json:/etc/platform/profiles.local-dev.json:ro
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      disable: true
+    restart: "no"
+    logging: *bounded-logs
+
+  migrate:
+    <<: *backend-base
+    command: ["python", "-m", "app.migrate", "upgrade", "head"]
+    restart: "no"
+
+  bootstrap-profile:
+    <<: *backend-base
+    command:
+      - python
+      - -m
+      - app.admin
+      - import-profiles
+      - --policy
+      - /etc/platform/profiles.local-dev.json
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    <<: *backend-base
+    command:
+      - uvicorn
+      - app.main:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+    depends_on:
+      bootstrap-profile:
+        condition: service_completed_successfully
+    networks:
+      - edge
+      - control
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).read()"
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+
+  worker:
+    <<: *backend-base
+    environment:
+      <<: *backend-environment
+      # The only cross-user Hub credential is mounted into the non-HTTP worker.
+      # API/frontend/migration containers never receive this file or value.
+      JUPYTERHUB_ADMIN_LIFECYCLE_TOKEN_FILE: /run/platform-secrets/admin_lifecycle_token
+    volumes:
+      - platform_data:/var/lib/platform
+      - ./secrets/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
+      - ./secrets/token_encryption_key:/run/platform-secrets/token_encryption_key:ro
+      - ./secrets/session_hash_key:/run/platform-secrets/session_hash_key:ro
+      - ./secrets/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
+      - ./secrets/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
+      - ./.runtime:/runtime:ro
+      - ./infra/jupyterhub/profiles.local-dev.json:/etc/platform/profiles.local-dev.json:ro
+    command: ["python", "-m", "app.worker", "--poll-seconds", "1"]
+    # This process has no HTTP listener; inheriting the API image healthcheck
+    # would mark a healthy worker unhealthy. Durable-operation liveness is an
+    # explicit production monitoring gate, not a fake local HTTP probe.
+    healthcheck:
+      disable: true
+    depends_on:
+      bootstrap-profile:
+        condition: service_completed_successfully
+      jupyterhub:
+        condition: service_healthy
+    restart: unless-stopped
+
+  reconciler:
+    build:
+      context: ./backend
+    image: team-platform-backend:local
+    environment:
+      PLATFORM_DATABASE_URL: sqlite:////var/lib/platform/platform.db
+      PLATFORM_ENFORCE_SAFE_SQLITE: "false"
+      JUPYTERHUB_INTERNAL_URL: http://jupyterhub:8081
+      JUPYTERHUB_RECONCILER_TOKEN_FILE: /run/platform-secrets/reconciler_token
+      PLATFORM_RECONCILIATION_INTERVAL_SECONDS: "5"
+      PLATFORM_RECONCILIATION_FRESHNESS_SECONDS: "30"
+    volumes:
+      - platform_data:/var/lib/platform
+      - ./secrets/reconciler_token:/run/platform-secrets/reconciler_token:ro
+    command: ["python", "-m", "app.reconciler"]
+    # Dedicated read-only-Hub process. It receives neither the admin lifecycle
+    # credential nor portal OAuth/session/environment-encryption secrets.
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.reconciler", "--healthcheck"]
+      # Importing the full backend dependency graph takes ~8 seconds on the
+      # target host. Keep the heartbeat TTL authoritative while allowing the
+      # probe process enough time to start under load.
+      interval: 10s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      bootstrap-profile:
+        condition: service_completed_successfully
+      jupyterhub:
+        condition: service_healthy
+    networks:
+      - control
+    group_add:
+      - ${PLATFORM_SECRET_GID:?Run bash scripts/init-local.sh first}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *bounded-logs
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    image: team-platform-frontend:local
+    networks:
+      - edge
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=8m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    logging: *bounded-logs
+
+  egress-proxy:
+    build:
+      context: ./infra/egress-proxy
+      args:
+        SQUID_BASE_IMAGE: ubuntu/squid:6.6-24.04_edge
+        ALLOW_MUTABLE_BASE_IMAGE: "true"
+    image: team-platform-egress-proxy:local
+    user: "13:13"
+    volumes:
+      - ./infra/egress-proxy/approved-domains.local-dev.txt:/etc/squid/approved-domains.txt:ro
+    networks:
+      jupyter:
+        ipv4_address: 172.30.0.20
+      egress-out:
+        ipv4_address: 172.24.0.2
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+      - /run:rw,noexec,nosuid,nodev,size=8m
+      - /var/log/squid:rw,noexec,nosuid,nodev,size=16m
+      - /var/spool/squid:rw,noexec,nosuid,nodev,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'test -s /tmp/squid.pid && kill -0 "$$(cat /tmp/squid.pid)" && squid -k check'
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 6
+    logging: *bounded-logs
+
+  jupyterhub:
+    build:
+      context: ./infra/jupyterhub
+      args:
+        JUPYTERHUB_BASE_IMAGE: quay.io/jupyterhub/jupyterhub:5.5.0
+        ALLOW_MUTABLE_BASE_IMAGE: "true"
+    image: team-platform-jupyterhub:local
+    environment:
+      PLATFORM_ENV: local-dev
+      ALLOW_UNSAFE_LOCAL_DEV: "true"
+      JUPYTERHUB_PROFILE_ALLOWLIST_FILE: /etc/platform/profiles.local-dev.json
+      JUPYTERHUB_ADMIN_USERS: ${PLATFORM_ADMIN_USERNAME:-platform-admin}
+      JUPYTERHUB_BLOCKED_USERS_FILE: /etc/platform/blocked-users.json
+      NATIVE_ENABLE_SIGNUP: ${NATIVE_ENABLE_SIGNUP:-true}
+      JUPYTERHUB_BIND_URL: http://:8000
+      JUPYTERHUB_HUB_BIND_URL: http://0.0.0.0:8081
+      # Dynamic single-user containers use this literal reserved IP so they do
+      # not need Docker's embedded DNS. Their resolver is intentionally
+      # blackholed; external names are resolved only by Squid.
+      JUPYTERHUB_HUB_CONNECT_URL: http://172.30.0.10:8081
+      JUPYTERHUB_SUBDOMAIN_HOST: http://hub.localhost:8080
+      PLATFORM_OAUTH_REDIRECT_URI: http://platform.localhost:8080/api/v1/auth/callback
+      # This bridge is owned by Compose. Its isolated gateway removes the host
+      # route while ICC remains enabled for Hub/single-user/Squid traffic, so
+      # local and domain-test operation never need host firewall mutations.
+      JUPYTER_NETWORK_NAME: platform-jupyter-compose-local
+      JUPYTER_NETWORK_POLICY_MODE: compose-internal-trusted-v1
+      JUPYTER_NETWORK_SUBNET: 172.30.0.0/24
+      JUPYTER_NETWORK_DYNAMIC_IP_RANGE: 172.30.0.128/25
+      JUPYTER_STORAGE_POLICY_MODE: docker-volume-unlimited-v1
+      JUPYTER_EGRESS_PROXY_URL: http://172.30.0.20:3128
+      JUPYTER_SINGLEUSER_COMMAND: /opt/conda/bin/jupyterhub-singleuser
+      JUPYTERHUB_CONCURRENT_SPAWN_LIMIT: "3"
+      PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
+      PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+      SPAWN_VALIDATOR_CONSUME_URL: http://api:8000/internal/v1/spawn-authorizations/consume
+      SPAWN_VALIDATOR_CHECK_URL: http://api:8000/internal/v1/spawn-authorizations/check
+      SPAWN_VALIDATOR_TIMEOUT_SECONDS: "5"
+      PLATFORM_WEB_PROVISIONING_ENABLED: "true"
+      PLATFORM_WORKSPACE_DELETION_ENABLED: "true"
+      PLATFORM_PROVISIONING_CLAIM_URL: http://api:8000/internal/v1/user-provisioning/claim
+      PLATFORM_PROVISIONING_COMPLETE_URL: http://api:8000/internal/v1/user-provisioning/complete
+      PLATFORM_PROVISIONING_FAIL_URL: http://api:8000/internal/v1/user-provisioning/fail
+      PLATFORM_DELETION_CLAIM_URL: http://api:8000/internal/v1/workspace-deletions/claim
+      PLATFORM_DELETION_COMPLETE_URL: http://api:8000/internal/v1/workspace-deletions/complete
+      PLATFORM_DELETION_FAIL_URL: http://api:8000/internal/v1/workspace-deletions/fail
+      PLATFORM_PROVISIONING_POLL_SECONDS: "2"
+      PLATFORM_PROVISIONING_HTTP_TIMEOUT_SECONDS: "5"
+      PLATFORM_LOCAL_PROJECT_ID_START: "10000"
+      PLATFORM_LOCAL_PROVISIONING_STATE_DIR: /srv/jupyterhub/local-provisioning
+      JUPYTERHUB_COOKIE_SECRET_FILE: /run/platform-secrets/jupyterhub_cookie_secret
+      CONFIGPROXY_AUTH_TOKEN_FILE: /run/platform-secrets/configproxy_auth_token
+      PLATFORM_OAUTH_CLIENT_SECRET_FILE: /run/platform-secrets/oauth_client_secret
+      PLATFORM_RECONCILER_TOKEN_FILE: /run/platform-secrets/reconciler_token
+      PLATFORM_ADMIN_LIFECYCLE_TOKEN_FILE: /run/platform-secrets/admin_lifecycle_token
+      SPAWN_VALIDATOR_HMAC_KEY_FILE: /run/platform-secrets/spawn_hmac_key
+      JUPYTERHUB_DB_URL: sqlite:////srv/jupyterhub/jupyterhub.sqlite
+    volumes:
+      - jupyterhub_data:/srv/jupyterhub
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./secrets/jupyterhub_cookie_secret:/run/platform-secrets/jupyterhub_cookie_secret:ro
+      - ./secrets/configproxy_auth_token:/run/platform-secrets/configproxy_auth_token:ro
+      - ./secrets/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
+      - ./secrets/reconciler_token:/run/platform-secrets/reconciler_token:ro
+      - ./secrets/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
+      - ./secrets/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
+      - ./infra/jupyterhub/profiles.local-dev.json:/etc/platform/profiles.local-dev.json:ro
+      - ./infra/jupyterhub/blocked-users.example.json:/etc/platform/blocked-users.json:ro
+      # Shared with the host CLI allocator so mixed web/CLI retries reuse the
+      # same project-ID blocks and manifests instead of creating split-brain state.
+      - ./.runtime:/srv/jupyterhub/local-provisioning:rw
+    group_add:
+      - ${DOCKER_GID:?Run bash scripts/init-local.sh first}
+      - ${PLATFORM_SECRET_GID:?Run bash scripts/init-local.sh first}
+    depends_on:
+      singleuser-image:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+    networks:
+      edge: {}
+      control: {}
+      jupyter:
+        ipv4_address: 172.30.0.10
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/hub/health', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+    logging: *bounded-logs
+
+  gateway:
+    build:
+      context: ./gateway
+    image: team-platform-gateway:local
+    ports:
+      # Local OAuth origins, redirects and wildcard-host routing are one exact
+      # contract; changing only the published port would break that contract.
+      - 127.0.0.1:8080:8080
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+      jupyterhub:
+        condition: service_healthy
+    networks:
+      - edge
+      - ingress
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=8m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    logging: *bounded-logs
+
+volumes:
+  platform_data:
+  jupyterhub_data:
+
+networks:
+  # Docker Engine does not publish ports for a container attached only to an
+  # --internal bridge. This ingress bridge is attached solely to the loopback-
+  # published gateway; API, Hub and frontend remain on internal networks.
+  ingress:
+  edge:
+    internal: true
+  control:
+    internal: true
+  egress-out:
+    ipam:
+      config:
+        # Deliberately differs from the retired host-firewall profile's
+        # 172.23/16 so stale, operator-owned DOCKER-USER rules do not select the
+        # new proxy by source address.
+        - subnet: 172.24.0.0/16
+  jupyter:
+    # Trusted-team execution boundary. `internal` blocks direct external
+    # routing and Docker 28's isolated gateway leaves no bridge address through
+    # which user code could reach host services. ICC must stay enabled because
+    # the Hub and the allowlisted egress proxy share this bridge with every
+    # single-user container. This intentionally does not provide user-to-user
+    # network isolation; private/shared volume mounts remain the data boundary.
+    name: platform-jupyter-compose-local
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+    labels:
+      platform.managed: "true"
+      platform.kind: jupyter-execution
+      platform.network.policy: compose-internal-trusted-v1
+    ipam:
+      config:
+        # Deliberately differs from the retired external bridge's 172.31/24.
+        # The old network and any stale host rules can remain untouched.
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25

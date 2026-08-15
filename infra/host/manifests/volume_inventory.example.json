@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "shared": {
+    "volume_name": "jupyter-shared",
+    "path": "/srv/platform-userdata/shared",
+    "project_id": 9000,
+    "hard_limit_bytes": 10737418240,
+    "gid": 100
+  },
+  "users": [
+    {
+      "user_id": "00000000-0000-4000-8000-000000000001",
+      "username": "alice",
+      "uid": 1000,
+      "gid": 100,
+      "slots": [
+        {
+          "slot_id": "00000000-0000-4000-8000-000000000011",
+          "slot_number": 1,
+          "volume_name": "jupyter-user-alice-slot-1",
+          "path": "/srv/platform-userdata/private/alice/slot-1",
+          "project_id": 10000,
+          "hard_limit_bytes": 5368709120
+        }
+      ]
+    }
+  ],
+  "inventory_sha256": "sha256:RECOMPUTED_BY_PROVISIONER"
+}

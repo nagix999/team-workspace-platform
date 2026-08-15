@@ -1,0 +1,20 @@
+{
+  "hmac_v1_consume": {
+    "key_ascii": "0123456789abcdef0123456789abcdef",
+    "timestamp": "1800000000",
+    "nonce": "test-nonce-0000000000000001",
+    "method": "POST",
+    "path": "/internal/v1/spawn-authorizations/consume",
+    "body": {
+      "schema_version": 1,
+      "username": "alice",
+      "server_name": "ws-0123456789abcdef0123456789abcdef",
+      "profile_id": "python-local",
+      "profile_version": 1,
+      "spawn_ticket": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-"
+    },
+    "canonical_body": "{\"profile_id\":\"python-local\",\"profile_version\":1,\"schema_version\":1,\"server_name\":\"ws-0123456789abcdef0123456789abcdef\",\"spawn_ticket\":\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-\",\"username\":\"alice\"}",
+    "content_sha256": "ac75c69aaec12519a08f8c1a27fe93b83cb32c7df2e9eb2a2fb0becd6a0257c1",
+    "signature_hex": "c96ef3643f4620a96e7fc5ac27bbf7e61483c398878baa79198b15086ccc8208"
+  }
+}
