@@ -91,7 +91,10 @@ DELETION_SERVICE_ENV_NAMES = (
     "PLATFORM_DELETION_COMPLETE_URL",
     "PLATFORM_DELETION_FAIL_URL",
 )
-MANAGED_SERVICE_OPTIONAL_ENV_NAMES = ("ALLOW_UNSAFE_DOMAIN_TEST",)
+MANAGED_SERVICE_OPTIONAL_ENV_NAMES = (
+    "ALLOW_UNSAFE_DOMAIN_TEST",
+    "PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED",
+)
 
 
 class AgentError(RuntimeError):
@@ -142,6 +145,8 @@ def managed_service_environment(source: Mapping[str, str]) -> dict[str, str]:
     for name in MANAGED_SERVICE_OPTIONAL_ENV_NAMES:
         value = source.get(name, "").strip()
         if value:
+            if value not in {"true", "false"}:
+                raise AgentError(f"managed-service flag {name} must be true or false")
             environment[name] = value
     return environment
 
@@ -575,6 +580,11 @@ def build_agent_from_env() -> tuple[LocalProvisionerAgent, float]:
             unsafe_local_dev=os.environ.get("ALLOW_UNSAFE_LOCAL_DEV") == "true",
             unsafe_domain_test=(os.environ.get("ALLOW_UNSAFE_DOMAIN_TEST") == "true"),
             enabled=provisioning_enabled,
+            production_docker_volume=(
+                os.environ.get("PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED")
+                == "true"
+            ),
+            storage_policy_mode=os.environ.get("JUPYTER_STORAGE_POLICY_MODE", ""),
         )
         validate_workspace_deletion_mode(
             enabled=deletion_enabled,
@@ -617,6 +627,7 @@ def build_agent_from_env() -> tuple[LocalProvisionerAgent, float]:
         profile_policy=profile_policy,
         state_dir=state_dir,
         project_id_start=project_id_start,
+        production_manifest=mode.production,
     )
     # Reconcile the shared root on every managed-agent start, including upgrades
     # where all users are already ACTIVE and no new provisioning job will run.

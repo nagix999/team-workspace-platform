@@ -16,7 +16,7 @@ case "${minimum_validity}" in
     ''|*[!0-9]*) fail "PLATFORM_TLS_MIN_VALIDITY_SECONDS must be a non-negative integer" ;;
 esac
 
-for command_name in awk cat openssl nginx stat sed tr; do
+for command_name in awk cat cp grep openssl nginx stat sed tr; do
     command -v "${command_name}" >/dev/null 2>&1 \
         || fail "required command is unavailable: ${command_name}"
 done
@@ -33,9 +33,52 @@ test "${gateway_mode}" = "${baked_mode}" \
 
 case "${gateway_mode}" in
     production)
-        portal_san='DNS:platform.example.com'
-        hub_san='DNS:hub.example.net'
-        wildcard_hub_san='DNS:*.hub.example.net'
+        portal_host="${PLATFORM_PORTAL_HOST:-}"
+        hub_host="${PLATFORM_HUB_HOST:-}"
+        user_domain="${PLATFORM_USER_DOMAIN:-}"
+        validate_dns_host() {
+            value="$1"
+            label="$2"
+            test -n "${value}" && test "${value}" = "$(printf '%s' "${value}" | tr '[:upper:]' '[:lower:]')" \
+                || fail "${label} must be a non-empty canonical lowercase DNS name"
+            printf '%s\n' "${value}" | awk -F. '
+                NF < 2 || length($0) > 253 { exit 1 }
+                {
+                    for (part = 1; part <= NF; part++) {
+                        if ($part !~ /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/) exit 1
+                    }
+                }
+            ' || fail "${label} must be a canonical DNS name"
+        }
+        validate_dns_host "${portal_host}" PLATFORM_PORTAL_HOST
+        validate_dns_host "${hub_host}" PLATFORM_HUB_HOST
+        validate_dns_host "${user_domain}" PLATFORM_USER_DOMAIN
+        test "${portal_host}" != "${hub_host}" \
+            || fail "portal and JupyterHub hosts must be different"
+        case "${hub_host}" in
+            "${user_domain}"|*."${user_domain}") ;;
+            *) fail "PLATFORM_HUB_HOST must equal or be below PLATFORM_USER_DOMAIN" ;;
+        esac
+        portal_san="DNS:${portal_host}"
+        hub_san="DNS:${hub_host}"
+        wildcard_hub_san="DNS:*.${user_domain}"
+        user_domain_regex="$(printf '%s' "${user_domain}" | sed 's/\./\\./g')"
+        awk \
+            -v portal_host="${portal_host}" \
+            -v hub_host="${hub_host}" \
+            -v user_domain="${user_domain}" \
+            -v user_domain_regex="${user_domain_regex}" '
+                {
+                    gsub(/__PORTAL_HOST__/, portal_host)
+                    gsub(/__HUB_HOST__/, hub_host)
+                    gsub(/__USER_DOMAIN_REGEX__/, user_domain_regex)
+                    gsub(/__USER_DOMAIN__/, user_domain)
+                    print
+                }
+            ' /etc/platform-gateway/server.conf.template > /tmp/platform-server.conf
+        if grep -q '__[A-Z_][A-Z_]*__' /tmp/platform-server.conf; then
+            fail "production Gateway template contains an unresolved placeholder"
+        fi
         cidr_path="${PLATFORM_INGRESS_CIDRS_PATH:-/run/platform-ingress/company-vpn-cidrs.txt}"
         test -f "${cidr_path}" && test -s "${cidr_path}" && test -r "${cidr_path}" \
             || fail "production company/VPN CIDR allowlist is missing, empty, or unreadable"
@@ -75,6 +118,7 @@ case "${gateway_mode}" in
         portal_san='DNS:platform.workspace.test'
         hub_san='DNS:hub.workspace.test'
         wildcard_hub_san='DNS:*.hub.workspace.test'
+        cp /etc/platform-gateway/server.conf.template /tmp/platform-server.conf
         ;;
     *) fail "PLATFORM_GATEWAY_MODE must be production or domain-test" ;;
 esac

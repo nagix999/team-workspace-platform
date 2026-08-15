@@ -11,10 +11,9 @@ Jupyter WebSocket을 배포 전에 한 호스트에서 연습하기 위한 **로
 443이 이미 사용 중이면 서비스를 우회 포트로 띄우지 말고 점유 프로세스를 확인한다.
 
 중요: `platform.workspace.test`과 `*.hub.workspace.test`은 같은 registrable domain에
-속한다. 따라서 이 모드는 기능 검증만 허용하며
-[ADR-0004](../docs/adr/0004-single-host-compose.md)의 portal/user-content 분리 출시 gate를
-충족하지 않는다. 실제 운영은 별도 user-content 도메인을 확보하거나 해당 ADR을 변경하는
-명시적 위험 승인 전까지 **BLOCK**이다.
+속한다. 따라서 이 모드는 기능 검증만 허용한다. 실제 `cyberailabs.team` 운영도 같은
+registrable domain을 사용하지만, 그 범위와 보완 통제는
+[ADR-0009](../docs/adr/0009-cyberailabs-production-domain.md)에서 명시적으로 승인했다.
 
 인증서는 격리된 테스트 브라우저/호스트가 신뢰하는 로컬 CA가 서명해야 하며 leaf SAN은
 정확히 다음 세 항목을 포함해야 한다.
@@ -73,52 +72,32 @@ TLS handshake 거절이다.
 
 ## Production TLS gateway
 
-`production.conf`는 문서용 예시 backend `192.0.2.10:3030`에서 TLS를 종료하고 예시 VIP
-`198.51.100.10:443`이 DNAT-only로 전달한다는 계약이다. 두 주소는 실제 배포에 사용할
-수 없는 RFC 문서용 예약 주소이므로 반드시 조직의 값으로 교체한다. upstream에는 외부 Host,
-`https`, port `443`, 그리고 새로 만든 client IP header만 전달한다. Hub upload 한도는
+내부 서버에 코드를 배치한 이후의 DNS/VIP, 공인 인증서, secret, 최초 계정, 검증·갱신과
+복구 순서는 [운영 서버 전체 배포 가이드](../docs/operations/production-deployment-ko.md)를
+따른다.
+
+`production.conf`는 환경변수로 받은 exact host 세 개를 시작 시 렌더링한다. 이 저장소의
+standalone `compose.production.yaml`은 다음 계약으로 고정돼 있다.
+
+- `platform.cyberailabs.team`: Portal/API
+- `cyberailabs.team`: JupyterHub
+- `*.cyberailabs.team`: 사용자 서버
+- VIP `123.214.65.254:443` → production host `10.155.1.24:3030` TCP 전달
+
+upstream에는 외부 Host, `https`, port `443`, 검증된 client IP만 전달한다. Hub upload 한도는
 2 GiB이며 body를 disk에 모두 buffering하지 않고 WebSocket/장기 연결 timeout은 1시간이다.
+운영 구성은 `compose.yaml` 또는 `compose.domain-test.yaml`과 합치지 않는 독립 stack이다.
 
-실제 운영 Compose는 아직 제공하지 않는다. 현재 루트 `compose.yaml`은 mutable image,
-local profile과 unsafe health 예외를 포함하므로 여기에 ingress overlay만 얹어 외부로
-공개해서는 안 된다. 완전한 production base, Nginx 회사/VPN CIDR allowlist와 VIP ACL, 운영
-profile/quota/health/secrets, 인증서 자동 갱신 및 rollback gate가 먼저 필요하다.
-
-완전한 production base가 만들어질 때 Gateway service가 만족해야 할 핵심 형태는
-다음과 같다. 아래 조각만 현재 local Compose에 합쳐 실행하면 안 된다.
-
-```yaml
-build:
-  context: ./gateway
-  dockerfile: Dockerfile.production
-  args:
-    GATEWAY_BASE_IMAGE: nginx@sha256:<reviewed-64-hex-digest>
-ports:
-  - 192.0.2.10:3030:3030
-environment:
-  PLATFORM_GATEWAY_MODE: production
-volumes:
-  - type: bind
-    source: <absolute-fullchain-path>
-    target: /run/platform-tls/tls.crt
-    read_only: true
-    bind: {create_host_path: false}
-  - type: bind
-    source: <absolute-private-key-path>
-    target: /run/platform-tls/tls.key
-    read_only: true
-    bind: {create_host_path: false}
-  - type: bind
-    source: <absolute-reviewed-cidr-file>
-    target: /run/platform-ingress/company-vpn-cidrs.txt
-    read_only: true
-    bind: {create_host_path: false}
+```bash
+make production-init
+# .env.production의 TLS/CIDR 경로와 GID를 검토
+make production-preflight
+make production-up
 ```
 
-API의 `FORWARDED_ALLOW_IPS`에는 production edge network에서 Gateway에 배정한 단 하나의
-고정 IP를 넣는다. 예시 VIP 흐름은 `198.51.100.10:443 -> 192.0.2.10:3030`이며 TLS
-passthrough/DNAT-only로 전달하고 SNAT하지 않아야 `$remote_addr` 기반 회사/VPN
-allowlist와 감사 IP가 일치한다.
+API의 `FORWARDED_ALLOW_IPS`에는 production edge network의 Gateway 고정 IP
+`172.38.0.10` 하나만 들어간다. VIP는 TLS passthrough/DNAT-only로 전달하고 가능하면
+SNAT하지 않아야 `$remote_addr` 기반 회사/VPN allowlist와 감사 IP가 일치한다.
 
 운영 시작 시에는 별도 read-only 파일
 `/run/platform-ingress/company-vpn-cidrs.txt`도 필수다. 주석/빈 줄 외에는 검토한 IPv4

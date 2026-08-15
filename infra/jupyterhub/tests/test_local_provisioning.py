@@ -67,6 +67,7 @@ class FakeDockerEngine:
             "Driver": "local",
             "Options": None,
             "Labels": labels.copy(),
+            "Mountpoint": f"/var/lib/docker/volumes/{name}/_data",
         }
 
     def initialize_volume(self, **values) -> None:
@@ -160,6 +161,39 @@ class LocalDockerProvisionerTests(unittest.TestCase):
                     username="alice",
                     slot=slot,
                 ),
+            )
+
+    def test_production_manifest_binds_exact_docker_mount_inventory(self) -> None:
+        engine = FakeDockerEngine()
+        user_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            provisioner = LocalDockerProvisioner(
+                engine=engine,
+                profile_policy=self.policy,
+                state_dir=Path(directory),
+                production_manifest=True,
+            )
+            manifest = provisioner.provision(user_id=user_id, username="alice")
+
+        self.assertEqual(
+            set(manifest),
+            {
+                "schema_version",
+                "inventory_sha256",
+                "user_id",
+                "username",
+                "uid",
+                "gid",
+                "slots",
+            },
+        )
+        self.assertNotIn("unsafe_local_dev", manifest)
+        self.assertRegex(manifest["inventory_sha256"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(len({slot["path"] for slot in manifest["slots"]}), 5)
+        for slot in manifest["slots"]:
+            self.assertEqual(
+                slot["path"],
+                f"/var/lib/docker/volumes/{slot['volume_name']}/_data",
             )
 
     def test_existing_volume_with_extra_or_conflicting_policy_fails_closed(
@@ -661,6 +695,36 @@ class LocalProvisionerAgentTests(unittest.TestCase):
         self.assertEqual(environment["ALLOW_UNSAFE_DOMAIN_TEST"], "true")
         self.assertNotIn("UNRELATED_UNSAFE_FLAG", environment)
 
+    def test_production_volume_capability_is_forwarded_without_secret_values(
+        self,
+    ) -> None:
+        source = {
+            name: "configured"
+            for name in (
+                *MANAGED_SERVICE_ENV_NAMES,
+                *PROVISIONING_SERVICE_ENV_NAMES,
+                *DELETION_SERVICE_ENV_NAMES,
+            )
+        }
+        source.update(
+            {
+                "PLATFORM_ENV": "production",
+                "ALLOW_UNSAFE_LOCAL_DEV": "false",
+                "PLATFORM_WEB_PROVISIONING_ENABLED": "true",
+                "PLATFORM_WORKSPACE_DELETION_ENABLED": "true",
+                "PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED": "true",
+                "SPAWN_VALIDATOR_HMAC_KEY": "must-not-be-forwarded",
+            }
+        )
+
+        environment = managed_service_environment(source)
+
+        self.assertEqual(
+            environment["PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED"],
+            "true",
+        )
+        self.assertNotIn("SPAWN_VALIDATOR_HMAC_KEY", environment)
+
     def test_managed_service_environment_fails_closed_when_a_key_is_missing(
         self,
     ) -> None:
@@ -679,15 +743,22 @@ class LocalProvisionerAgentTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "FAIL_URL"):
             managed_service_environment(source)
 
-    def test_production_configuration_rejects_web_provisioning_flag_early(self) -> None:
+    def test_production_configuration_requires_explicit_volume_capability(self) -> None:
         with self.assertRaisesRegex(
-            RuntimeError, "forbidden outside an explicit local test mode"
+            RuntimeError, "reviewed production Docker-volume mode"
         ):
             validate_web_provisioning_mode(
                 platform_env="production",
                 unsafe_local_dev=False,
                 enabled=True,
             )
+        validate_web_provisioning_mode(
+            platform_env="production",
+            unsafe_local_dev=False,
+            enabled=True,
+            production_docker_volume=True,
+            storage_policy_mode="docker-volume-unlimited-v1",
+        )
 
     def test_domain_test_web_provisioning_requires_its_own_flag(self) -> None:
         validate_web_provisioning_mode(

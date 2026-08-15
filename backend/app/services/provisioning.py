@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -552,6 +553,15 @@ def activate_user_from_manifest(
                 or raw_path in production_paths
             ):
                 raise ProvisioningManifestError("private volume path is invalid")
+            if (
+                settings.production_docker_volume_provisioning
+                and settings.storage_policy_mode == "docker-volume-unlimited-v1"
+                and raw_path
+                != f"/var/lib/docker/volumes/{slot.get('volume_name')}/_data"
+            ):
+                raise ProvisioningManifestError(
+                    "private volume path does not match the Docker volume identity"
+                )
             production_paths.add(raw_path)
         number = slot["slot_number"]
         if isinstance(number, bool) or not isinstance(number, int):
@@ -646,6 +656,26 @@ def activate_user_from_manifest(
         raise ProvisioningManifestError(
             "quota project IDs must be one contiguous supported block"
         )
+
+    if not is_local_manifest:
+        canonical_inventory = json.dumps(
+            {
+                "user_id": manifest["user_id"],
+                "username": manifest["username"],
+                "uid": manifest["uid"],
+                "gid": manifest["gid"],
+                "slots": slots,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        expected_inventory_digest = (
+            "sha256:" + hashlib.sha256(canonical_inventory).hexdigest()
+        )
+        if manifest["inventory_sha256"] != expected_inventory_digest:
+            raise ProvisioningManifestError(
+                "provisioner inventory digest does not match its contents"
+            )
 
     db.flush()
     provisioned = db.scalars(

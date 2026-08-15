@@ -133,6 +133,125 @@ class DomainTestComposeContractTests(unittest.TestCase):
         self.assertEqual(reconciler["cap_drop"], ["ALL"])
         self.assertTrue(reconciler["read_only"])
 
+    @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is unavailable")
+    def test_production_compose_is_standalone_and_exactly_published(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "PLATFORM_GATEWAY_BIND_IP": "10.155.1.24",
+                "PLATFORM_TLS_CERT_FILE": "/tmp/fullchain.pem",
+                "PLATFORM_TLS_KEY_FILE": "/tmp/privkey.pem",
+                "PLATFORM_INGRESS_CIDRS_FILE": "/tmp/ingress-cidrs.txt",
+                "PLATFORM_TLS_GID": "1000",
+                "DOCKER_GID": "999",
+                "PLATFORM_SECRET_GID": "1000",
+            }
+        )
+        result = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                "compose.production.yaml",
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=ROOT,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        config = json.loads(result.stdout)
+        gateway = config["services"]["gateway"]
+        self.assertEqual(
+            gateway["ports"],
+            [
+                {
+                    "mode": "ingress",
+                    "host_ip": "10.155.1.24",
+                    "target": 3030,
+                    "published": "3030",
+                    "protocol": "tcp",
+                }
+            ],
+        )
+        self.assertEqual(
+            gateway["environment"]["PLATFORM_HUB_HOST"], "cyberailabs.team"
+        )
+        self.assertEqual(
+            gateway["environment"]["PLATFORM_PORTAL_HOST"],
+            "platform.cyberailabs.team",
+        )
+        api = config["services"]["api"]["environment"]
+        self.assertEqual(api["PLATFORM_INSECURE_LOCAL_DEV"], "false")
+        self.assertEqual(api["PLATFORM_DOMAIN_TEST"], "false")
+        self.assertEqual(api["PLATFORM_ALLOW_SAME_SITE_USER_CONTENT"], "true")
+        self.assertEqual(api["FORWARDED_ALLOW_IPS"], "172.38.0.10")
+        hub = config["services"]["jupyterhub"]["environment"]
+        self.assertEqual(hub["PLATFORM_ENV"], "production")
+        self.assertEqual(hub["JUPYTERHUB_SUBDOMAIN_HOST"], "https://cyberailabs.team")
+        self.assertEqual(
+            hub["PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED"],
+            "true",
+        )
+        published_services = {
+            name for name, service in config["services"].items() if service.get("ports")
+        }
+        self.assertEqual(published_services, {"gateway"})
+
+
+class ProductionTransitionContractTests(unittest.TestCase):
+    def test_candidate_policy_backup_and_migration_order_is_fail_closed(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        start_body = script.split("start() {", 1)[1].split("\nstop() {", 1)[0]
+
+        self.assertIn("profiles.candidate.json", script)
+        self.assertIn("validate_database_inventory", script)
+        self.assertIn("production_database_is_idle", script)
+        self.assertIn("--context production", script)
+        self.assertIn("PRODUCTION_FRESH_DATABASES=true", script)
+        self.assertNotIn("down -v", script)
+        self.assertNotIn("sudo ", script)
+        self.assertNotIn("firewall", script)
+        self.assertLess(
+            script.index("snapshot_existing_databases"),
+            script.index("migration_started=true"),
+        )
+        self.assertLess(
+            script.index("migration_started=true"),
+            script.index('--promote "${candidate_policy_file}"'),
+        )
+        self.assertLess(
+            script.index('--promote "${candidate_policy_file}"'),
+            script.index("compose run --rm --no-deps migrate"),
+        )
+        self.assertLess(
+            script.index("compose run --rm --no-deps migrate"),
+            script.index("compose up -d --build --wait"),
+        )
+        self.assertLess(
+            start_body.index(
+                "compose stop gateway worker reconciler api jupyterhub frontend egress-proxy"
+            ),
+            start_body.index("production_database_is_idle"),
+        )
+        self.assertLess(
+            start_body.index("production_database_is_idle"),
+            start_body.index("snapshot_existing_databases"),
+        )
+
+    def test_fresh_failure_removes_only_exact_production_database_volumes(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        self.assertIn('"${PRODUCTION_COMPOSE_PROJECT_NAME}_platform_data"', script)
+        self.assertIn('"${PRODUCTION_COMPOSE_PROJECT_NAME}_jupyterhub_data"', script)
+        self.assertIn('docker volume rm "${fresh_volume}"', script)
+        self.assertIn('rm -f -- "${policy_file}"', script)
+        self.assertIn("image_identity team-workspace-backend:production", script)
+        self.assertIn("image_identity team-workspace-jupyterhub:production", script)
+        self.assertNotIn("platform.db:999:999", script)
+
 
 class NginxContractTests(unittest.TestCase):
     def test_domain_test_and_production_fail_closed(self) -> None:
@@ -194,6 +313,12 @@ class NginxContractTests(unittest.TestCase):
         self.assertNotIn("$args", safe_body)
         self.assertIn("production company/VPN CIDR allowlist", entrypoint)
         self.assertIn("DNS:*.hub.workspace.test", entrypoint)
+        self.assertIn("PLATFORM_PORTAL_HOST", entrypoint)
+        self.assertIn("PLATFORM_HUB_HOST", entrypoint)
+        self.assertIn("PLATFORM_USER_DOMAIN", entrypoint)
+        self.assertIn("include /tmp/platform-server.conf", main_config)
+        self.assertNotIn("platform.example.com", production)
+        self.assertNotIn("hub.example.net", production)
 
     def test_build_and_runtime_modes_are_fail_closed_and_coupled(self) -> None:
         dockerfile = (GATEWAY / "Dockerfile.production").read_text(encoding="utf-8")
@@ -344,13 +469,17 @@ class IdleDatabaseGateTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
-    def run_gate(self) -> subprocess.CompletedProcess[str]:
+    def run_gate(
+        self, context: str = "domain-test"
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
                 sys.executable,
                 str(ROOT / "scripts/check-domain-test-idle.py"),
                 "--database",
                 str(self.database),
+                "--context",
+                context,
             ],
             capture_output=True,
             text=True,
@@ -358,6 +487,13 @@ class IdleDatabaseGateTests(unittest.TestCase):
 
     def test_idle_database_passes(self) -> None:
         self.assertEqual(self.run_gate().returncode, 0)
+
+    def test_production_context_is_visible_to_the_operator(self) -> None:
+        result = self.run_gate("production")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("production idle check using:", result.stderr)
+        self.assertIn("production idle check passed", result.stdout)
 
     def test_pending_operation_fails(self) -> None:
         connection = sqlite3.connect(self.database)

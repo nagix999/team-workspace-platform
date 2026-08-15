@@ -29,23 +29,46 @@ def _current_runtime_profiles(db: Session) -> list[WorkspaceProfile]:
 
 
 def ensure_default_offers(db: Session) -> None:
-    existing_ids = set(db.scalars(select(WorkspaceProfileOffer.id)).all())
+    existing = {
+        offer.id: offer for offer in db.scalars(select(WorkspaceProfileOffer)).all()
+    }
     now = datetime.utcnow()
     for profile in _current_runtime_profiles(db):
-        if profile.id in existing_ids:
-            continue
-        db.add(
-            WorkspaceProfileOffer(
-                id=profile.id,
-                row_version=1,
-                name=profile.name[:80],
-                runtime_profile_id=profile.id,
-                runtime_profile_version=profile.version,
-                enabled=True,
-                created_at=now,
-                updated_at=now,
+        offer = existing.get(profile.id)
+        if offer is not None:
+            # Bootstrap-created default offers follow the newest immutable
+            # runtime version.  Administrator-created offers retain their exact
+            # binding and must be changed explicitly through the admin API.
+            current_runtime = db.get(
+                WorkspaceProfile,
+                (offer.runtime_profile_id, offer.runtime_profile_version),
             )
+            if (
+                offer.created_by_user_id is None
+                and current_runtime is not None
+                and (not current_runtime.enabled or not current_runtime.selectable)
+                and (
+                    offer.runtime_profile_id != profile.id
+                    or offer.runtime_profile_version != profile.version
+                )
+            ):
+                offer.runtime_profile_id = profile.id
+                offer.runtime_profile_version = profile.version
+                offer.row_version += 1
+                offer.updated_at = now
+            continue
+        offer = WorkspaceProfileOffer(
+            id=profile.id,
+            row_version=1,
+            name=profile.name[:80],
+            runtime_profile_id=profile.id,
+            runtime_profile_version=profile.version,
+            enabled=True,
+            created_at=now,
+            updated_at=now,
         )
+        db.add(offer)
+        existing[offer.id] = offer
 
 
 def runtime_template_dict(profile: WorkspaceProfile) -> dict[str, object]:

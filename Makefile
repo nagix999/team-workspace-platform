@@ -1,4 +1,4 @@
-.PHONY: init-local legacy-host-network-create legacy-host-firewall-apply build up down logs ps list-users provision-user profile-matrix-check profile-image-check profile-deploy domain-test-tls domain-test-preflight domain-test-up domain-test-down domain-test-restore test-backend test-infra test-gateway test-frontend test config
+.PHONY: init-local production-init production-preflight production-up production-down production-ps production-bootstrap-admin production-create-user production-restore legacy-host-network-create legacy-host-firewall-apply build up down logs ps list-users provision-user profile-matrix-check profile-image-check profile-deploy domain-test-tls domain-test-preflight domain-test-up domain-test-down domain-test-restore test-backend test-infra test-gateway test-frontend test config
 
 LOCAL_PROJECT_ID_START ?= 10000
 # Comma-separated usernames for domain-test checks. Keep defaults minimal so
@@ -7,6 +7,31 @@ USERS ?= platform-admin
 
 init-local:
 	bash scripts/init-local.sh
+
+production-init:
+	bash scripts/init-production.sh
+
+production-preflight:
+	bash scripts/production.sh preflight
+
+production-up:
+	bash scripts/production.sh up
+
+production-down:
+	bash scripts/production.sh down
+
+production-ps:
+	bash scripts/production.sh ps
+
+production-bootstrap-admin:
+	PRODUCTION_REQUIRE_EMPTY=true bash scripts/production.sh create-user
+
+production-create-user:
+	@test -n "$(USERNAME)" || (echo "USERNAME is required" >&2; exit 2)
+	PRODUCTION_TARGET_USERNAME="$(USERNAME)" PRODUCTION_REQUIRE_EMPTY=false bash scripts/production.sh create-user
+
+production-restore:
+	PRODUCTION_BACKUP_DIR="$(BACKUP)" bash scripts/production.sh restore
 
 # Retained only for deployments that explicitly accept the older host-managed,
 # ICC-disabled execution network. The default Compose stack never invokes these

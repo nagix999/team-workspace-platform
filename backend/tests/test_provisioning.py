@@ -24,6 +24,10 @@ from app.models import (
 )
 from app.security import internal_signature
 from app.services.profile_offers import ensure_default_offers
+from app.services.provisioning import (
+    ProvisioningManifestError,
+    activate_user_from_manifest,
+)
 from app.services.resource_policy import get_resource_policy
 
 from conftest import login
@@ -169,6 +173,24 @@ def _manifest(user_id: str, username: str) -> dict:
     }
 
 
+def _production_manifest(user_id: str, username: str) -> dict:
+    value = _manifest(user_id, username)
+    value.pop("unsafe_local_dev")
+    for slot in value["slots"]:
+        slot["path"] = f"/var/lib/docker/volumes/{slot['volume_name']}/_data"
+    inventory = {
+        key: value[key] for key in ("user_id", "username", "uid", "gid", "slots")
+    }
+    canonical = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return {
+        "schema_version": 1,
+        "inventory_sha256": "sha256:" + hashlib.sha256(canonical).hexdigest(),
+        **inventory,
+    }
+
+
 def test_public_request_is_feature_gated_and_csrf_protected(app_env):
     _app, hub, client = app_env
     me, *_ = login(client, hub, "alice")
@@ -189,8 +211,77 @@ def test_public_request_is_feature_gated_and_csrf_protected(app_env):
 
 def test_web_provisioning_cannot_be_enabled_in_production(settings):
     production = replace(settings, web_provisioning_enabled=True)
-    with pytest.raises(RuntimeError, match="restricted to an explicit local test mode"):
+    with pytest.raises(RuntimeError, match="explicit Docker-volume capability"):
         production.validate()
+
+    replace(
+        production,
+        production_docker_volume_provisioning=True,
+        storage_policy_mode="docker-volume-unlimited-v1",
+    ).validate()
+
+
+def test_production_docker_manifest_binds_digest_and_exact_mountpoints(
+    provisioning_env,
+):
+    app, hub, client = provisioning_env
+    me, *_ = login(client, hub, "alice")
+    production = replace(
+        app.state.settings,
+        production_docker_volume_provisioning=True,
+        storage_policy_mode="docker-volume-unlimited-v1",
+    )
+    user_id = me["user"]["id"]
+    manifest = _production_manifest(user_id, "alice")
+    with app.state.session_factory() as db:
+        user = db.get(User, user_id)
+        assert user is not None
+        activate_user_from_manifest(
+            db, settings=production, user=user, manifest=manifest
+        )
+        db.commit()
+    with app.state.session_factory() as db:
+        assert db.get(User, user_id).status == "ACTIVE"
+        assert db.scalar(select(func.count()).select_from(WorkspaceVolumeSlot)) == 5
+
+
+@pytest.mark.parametrize("tamper", ["digest", "path"])
+def test_production_docker_manifest_tampering_is_rejected(provisioning_env, tamper):
+    app, hub, client = provisioning_env
+    me, *_ = login(client, hub, "alice")
+    production = replace(
+        app.state.settings,
+        production_docker_volume_provisioning=True,
+        storage_policy_mode="docker-volume-unlimited-v1",
+    )
+    user_id = me["user"]["id"]
+    manifest = _production_manifest(user_id, "alice")
+    if tamper == "digest":
+        manifest["inventory_sha256"] = "sha256:" + "0" * 64
+    else:
+        manifest["slots"][0]["path"] = "/var/lib/docker/volumes/wrong/_data"
+        inventory = {
+            key: manifest[key] for key in ("user_id", "username", "uid", "gid", "slots")
+        }
+        manifest["inventory_sha256"] = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+        )
+    with app.state.session_factory() as db:
+        user = db.get(User, user_id)
+        assert user is not None
+        with pytest.raises(ProvisioningManifestError):
+            activate_user_from_manifest(
+                db, settings=production, user=user, manifest=manifest
+            )
+        db.rollback()
+    with app.state.session_factory() as db:
+        assert db.get(User, user_id).status == "PROVISIONING"
+        assert db.scalar(select(func.count()).select_from(WorkspaceVolumeSlot)) == 0
 
 
 def test_internal_hmac_key_requires_32_bytes(settings):

@@ -181,6 +181,52 @@ class UserProvisioningManifest(BaseModel):
         return value
 
 
+class ProductionUserProvisioningSlotManifest(UserProvisioningSlotManifest):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    path: str = Field(
+        min_length=1,
+        max_length=4096,
+        pattern=r"^/(?:[^/\x00]+/)*[^/\x00]+$",
+    )
+
+
+class ProductionUserProvisioningManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[1]
+    inventory_sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    user_id: str = Field(
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    username: str = Field(
+        min_length=1,
+        max_length=32,
+        pattern=r"^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+    )
+    uid: int = Field(gt=0)
+    gid: int = Field(gt=0)
+    slots: list[ProductionUserProvisioningSlotManifest] = Field(
+        min_length=5, max_length=5
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def schema_version_is_exact_integer(cls, value: object) -> object:
+        if type(value) is not int or value != 1:
+            raise ValueError("schema_version must be the integer 1")
+        return value
+
+    @field_validator("username")
+    @classmethod
+    def username_has_no_double_hyphen(cls, value: str) -> str:
+        if "--" in value:
+            raise ValueError("username must not contain consecutive hyphens")
+        return value
+
+
 class UserProvisioningCompleteRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -196,7 +242,7 @@ class UserProvisioningCompleteRequest(BaseModel):
         pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     )
     attempt_no: int = Field(gt=0)
-    manifest: UserProvisioningManifest
+    manifest: UserProvisioningManifest | ProductionUserProvisioningManifest
 
     @field_validator("schema_version", mode="before")
     @classmethod

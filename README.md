@@ -5,11 +5,11 @@
 Compose를 결합해 소규모 팀이 하나의 Linux 호스트에서 개발환경을 일관되게 제공하는 것을
 목표로 합니다.
 
-> **현재 상태: v0.1.0 Technical Preview**
+> **현재 상태: v0.1.1 Technical Preview**
 >
-> 로컬 통합환경과 운영 전 검증 도구를 제공하지만, 그대로 인터넷에 공개할 수 있는 완성형
-> 운영 배포본은 아닙니다. 실제 운영 전에는 이 문서의 [운영 준비 조건](#운영-준비-조건)을
-> 반드시 확인하세요.
+> 로컬 통합환경과 `cyberailabs.team` 단일 호스트 운영 구성을 함께 제공합니다. 운영 구성도
+> 조직의 TLS 인증서, 접근 CIDR, VIP/NAT와 백업 책임을 대신하지 않으므로 실제 공개 전에는
+> 이 문서의 [운영 준비 조건](#운영-준비-조건)을 반드시 확인하세요.
 
 ## 왜 이 프로젝트를 만들었나
 
@@ -217,10 +217,12 @@ package/Git 목적지만 dual-homed egress proxy를 통해 접근합니다.
 east-west 격리는 제공하지 않습니다. 상호 불신 사용자나 민감 workload가 들어오면
 Kubernetes 전환이 필요합니다.
 
-브라우저에서는 portal과 사용자 실행 콘텐츠를 서로 다른 registrable domain으로 분리하고
-Hub 사용자별 wildcard subdomain, TLS와 `__Host-` cookie를 사용해야 합니다. 같은 사이트에
-portal과 사용자 코드를 함께 배치하면 사용자 Notebook JavaScript가 portal origin을 공격할
-수 있으므로 별도 위험 승인 없이는 운영 공개하지 않습니다.
+가장 강한 브라우저 격리는 portal과 사용자 실행 콘텐츠를 서로 다른 registrable domain으로
+분리하는 방식입니다. 이 저장소의 `cyberailabs.team` 운영 구성은 부서 전용·상호 신뢰 팀이라는
+전제 아래 같은 registrable domain 사용을 [ADR-0009](docs/adr/0009-cyberailabs-production-domain.md)로
+명시 승인했습니다. 포털은 `platform.cyberailabs.team`, Hub는 apex, 사용자 서버는
+`<username>.cyberailabs.team`으로 origin을 분리하고 `__Host-` cookie와 exact Origin/CSRF를
+유지하지만, 별도 registrable domain보다 공급망/Notebook JavaScript 방어 심도가 낮습니다.
 
 자세한 위협 모델은 [MVP 아키텍처](docs/architecture/jupyterhub-mvp.md)와
 [ADR-0006](docs/adr/0006-trusted-network-shared-storage.md)을 참고하세요.
@@ -353,6 +355,59 @@ make domain-test-down
 
 상세 인증서·Host·복구 계약은 [Gateway 문서](gateway/README.md)를 참고하세요.
 
+## cyberailabs.team 운영 배포
+
+코드를 내부 운영 서버로 옮긴 뒤의 설치, DNS/VIP, 공인 인증서 발급, 최초 관리자·사용자
+생성, 검증, 갱신, backup과 장애 복구 절차는
+[운영 서버 전체 배포 가이드](docs/operations/production-deployment-ko.md)를 기준으로 합니다.
+기존 `10.155.1.24` 운영 서버에서 새 Git release를 적용할 때는
+[Git 업데이트 후 운영 적용 절차](docs/operations/production-update-after-git-ko.md)를 사용합니다.
+
+운영 URL은 다음으로 고정합니다.
+
+- 포털/API: `https://platform.cyberailabs.team`
+- JupyterHub: `https://cyberailabs.team`
+- 사용자 서버: `https://<username>.cyberailabs.team`
+
+HostingKR 권한 DNS에는 apex(`@`/빈 이름), `platform`, `*` A record가 모두
+`123.214.65.254`를 가리켜야 합니다. VIP는 TLS를 종료하지 않고 TCP/443을 production host의
+`10.155.1.24:3030`으로 전달합니다. Gateway만 이 host port를 publish하며 플랫폼은 운영
+host의 방화벽 규칙을 설치하거나 변경하지 않습니다. 상위 VIP/네트워크 ACL은 별도입니다.
+
+인증서 leaf SAN은 정확히 `cyberailabs.team`, `platform.cyberailabs.team`,
+`*.cyberailabs.team`을 포함해야 합니다. wildcard 발급은 DNS-01이 필요합니다. HostingKR에서
+수동 발급한다면 `_acme-challenge` TXT 갱신과 만료 전 갱신을 운영 일정으로 관리하고,
+가능하면 DNS API가 있는 별도 challenge zone을 CNAME 위임해 자동화합니다.
+
+production host에서만 다음 순서로 실행합니다.
+
+```bash
+make production-init
+# .env.production의 인증서/키/CIDR 파일 경로와 TLS GID를 검토
+make production-preflight
+make production-up
+make production-ps
+```
+
+`production-preflight`는 host가 `10.155.1.24`를 실제 보유하는지, TLS SAN·키·유효기간,
+source CIDR allowlist, 실행 중 workspace/다른 local stack 부재, immutable base와 모든 profile
+image 계약을 확인합니다. single-user image는 해당 host에서 빌드한 exact Docker image ID로
+고정하며, 새 image 배포 때 이전 runtime version을 정책에 남겨 기존 중지 환경도 재시작할 수
+있게 합니다.
+
+기존 production DB가 있으면 `production-up`은 writer를 중지하고 두 SQLite DB를 online backup
+bundle로 검증한 뒤 migration/profile import를 실행합니다. DB 변경 뒤 실패하면 자동으로
+오래된 container를 억지 재기동하지 않고 복구 명령을 출력합니다.
+
+```bash
+make production-restore BACKUP=/absolute/path/to/verified-backup-bundle
+```
+
+접근 CIDR 파일은 회사/VPN의 실제 source IPv4 CIDR만 한 줄에 하나씩 기록합니다.
+`0.0.0.0/0`과 빈 파일은 거부됩니다. VIP가 source NAT를 한다면 Gateway에는 사용자 대신 NAT
+주소가 보이므로, source-IP 보존 또는 정확한 SNAT 주소 allowlist를 네트워크 담당자와 먼저
+확인해야 합니다.
+
 ## 자주 사용하는 명령
 
 | 명령 | 설명 |
@@ -366,6 +421,11 @@ make domain-test-down
 | `make profile-deploy` | profile과 관련 제어면의 안전한 배포 |
 | `make domain-test-preflight` | HTTPS 도메인 전환 사전검사 |
 | `make domain-test-up` | backup 후 domain-test 전환 |
+| `make production-init` | 운영 전용 secret/runtime/.env 초기화 |
+| `make production-preflight` | 운영 host·TLS·CIDR·image·idle 사전검사 |
+| `make production-up` / `make production-down` | backup 포함 운영 stack 시작 / 종료 |
+| `make production-bootstrap-admin` | fresh 운영 DB의 최초 관리자 계정 생성 |
+| `make production-create-user USERNAME=alice` | signup을 열지 않고 승인 사용자 생성 |
 
 ## 저장소 구조
 
@@ -384,7 +444,8 @@ make domain-test-down
 │   ├── architecture/        # 전체 아키텍처와 위협 모델
 │   └── adr/                 # 주요 설계 결정 기록
 ├── compose.yaml             # loopback 로컬 통합 구성
-└── compose.domain-test.yaml # HTTPS 도메인 사전검증 overlay
+├── compose.domain-test.yaml # HTTPS 도메인 사전검증 overlay
+└── compose.production.yaml  # cyberailabs.team 단일 호스트 운영 구성
 ```
 
 ## 검증
@@ -410,10 +471,10 @@ make test
 
 ## 운영 준비 조건
 
-현재 `compose.yaml`은 loopback 로컬 통합용입니다. 운영 공개 전 최소한 다음 항목을 별도로
-설계·검증해야 합니다.
+`compose.yaml`은 loopback 로컬 통합용이고 `compose.production.yaml`은 별도의 운영
+stack입니다. 운영 공개 전 최소한 다음 항목을 실제 조직 환경에서 검증해야 합니다.
 
-- portal과 user-content를 분리한 DNS, wildcard TLS, HTTPS-only `__Host-` cookie
+- ADR-0009의 DNS apex/portal/wildcard, wildcard TLS, HTTPS-only `__Host-` cookie
 - digest-pinned image와 dependency·취약점 검토 및 SBOM
 - 실제 host 사양에 맞춘 CPU/RAM/동시 실행 부하 시험
 - host disk·inode 모니터링, control-plane 예약 공간과 용량 고갈 대응
@@ -431,14 +492,17 @@ make test
 - [백엔드 계약](backend/README.md)
 - [인프라·JupyterHub 계약](infra/README.md)
 - [Gateway와 TLS](gateway/README.md)
+- [운영 서버 전체 배포 가이드](docs/operations/production-deployment-ko.md)
 - [ADR-0001: JupyterHub 제어면](docs/adr/0001-jupyterhub-control-plane.md)
 - [ADR-0006: 신뢰 팀 네트워크와 공유 저장공간](docs/adr/0006-trusted-network-shared-storage.md)
 - [ADR-0007: 관리자·환경변수·삭제](docs/adr/0007-admin-runtime-and-environment-management.md)
 - [ADR-0008: 파생 자원 프로필·중지 상태 생성](docs/adr/0008-derived-resource-profiles-and-stopped-creation.md)
+- [ADR-0009: cyberailabs.team 운영 도메인](docs/adr/0009-cyberailabs-production-domain.md)
 
 ## 버전 정책
 
-`v0.1.0`은 단일 호스트 로컬 통합과 핵심 관리 기능을 검증하는 첫 공개 preview입니다.
+`v0.1.0`은 단일 호스트 로컬 통합과 핵심 관리 기능을 검증한 첫 공개 preview이고,
+`v0.1.1`은 `cyberailabs.team` 운영 배포 계약과 안전한 Git 업데이트 절차를 추가합니다.
 `0.x` 기간에는 API, migration과 운영 절차가 호환성 없이 변경될 수 있습니다. runtime profile
 같은 실행 정책은 기존 row를 직접 수정하지 않고 새 version으로 추가하는 원칙을 유지합니다.
 

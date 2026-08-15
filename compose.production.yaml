@@ -1,0 +1,489 @@
+# Standalone single-host production stack.  Do not combine this file with
+# compose.yaml or compose.domain-test.yaml.
+name: ${PRODUCTION_COMPOSE_PROJECT_NAME:-team-workspace-production}
+
+x-logs: &bounded-logs
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+x-backend-environment: &backend-environment
+  PLATFORM_DATABASE_URL: sqlite:////var/lib/platform/platform.db
+  PLATFORM_PORTAL_ORIGIN: https://platform.cyberailabs.team
+  PLATFORM_INSECURE_LOCAL_DEV: "false"
+  PLATFORM_DOMAIN_TEST: "false"
+  PLATFORM_COOKIE_SECURE: "true"
+  PLATFORM_ENFORCE_SAFE_SQLITE: "true"
+  PLATFORM_EXECUTION_HOST_HEALTHY: "true"
+  PLATFORM_MAX_WORKSPACES_PER_USER: "5"
+  PLATFORM_MAX_ACTIVE_WORKSPACES: "15"
+  PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
+  PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+  PLATFORM_RECONCILIATION_FRESHNESS_SECONDS: "30"
+  PLATFORM_WEB_PROVISIONING_ENABLED: "true"
+  PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED: "true"
+  PLATFORM_STORAGE_POLICY_MODE: docker-volume-unlimited-v1
+  PLATFORM_WORKSPACE_DELETION_ENABLED: "true"
+  PLATFORM_PROVISIONING_LEASE_SECONDS: "300"
+  PLATFORM_PROVISIONING_MAX_ATTEMPTS: "3"
+  PLATFORM_ADMIN_USERNAMES: ${PLATFORM_ADMIN_USERNAME:-platform-admin}
+  PLATFORM_PORTAL_SECURITY_DOMAIN: cyberailabs.team
+  JUPYTERHUB_USER_SECURITY_DOMAIN: cyberailabs.team
+  # Explicitly accepted for this one-domain department deployment.  Host-only
+  # __Host- cookies, exact Origin/CSRF validation and per-user subdomains remain
+  # mandatory, but this is weaker than two registrable domains.
+  PLATFORM_ALLOW_SAME_SITE_USER_CONTENT: "true"
+  JUPYTERHUB_INTERNAL_URL: http://jupyterhub:8081
+  JUPYTERHUB_PUBLIC_URL: https://cyberailabs.team
+  JUPYTERHUB_USER_DOMAIN: cyberailabs.team
+  JUPYTERHUB_OAUTH_CLIENT_ID: service-platform-api
+  JUPYTERHUB_OAUTH_REDIRECT_URI: https://platform.cyberailabs.team/api/v1/auth/callback
+  JUPYTERHUB_OAUTH_CLIENT_SECRET_FILE: /run/platform-secrets/oauth_client_secret
+  PLATFORM_TOKEN_ENCRYPTION_KEY_FILE: /run/platform-secrets/token_encryption_key
+  PLATFORM_TOKEN_ENCRYPTION_KEY_ID: production-v1
+  PLATFORM_SESSION_HASH_KEY_FILE: /run/platform-secrets/session_hash_key
+  PLATFORM_INTERNAL_HMAC_KEY_FILE: /run/platform-secrets/spawn_hmac_key
+
+x-backend-volumes: &backend-volumes
+  - platform_data:/var/lib/platform
+  - ./secrets/production/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
+  - ./secrets/production/token_encryption_key:/run/platform-secrets/token_encryption_key:ro
+  - ./secrets/production/session_hash_key:/run/platform-secrets/session_hash_key:ro
+  - ./secrets/production/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
+  - ./.runtime/production/profiles.json:/etc/platform/profiles.production.json:ro
+
+x-backend-base: &backend-base
+  build:
+    context: ./backend
+  image: team-workspace-backend:production
+  environment: *backend-environment
+  volumes: *backend-volumes
+  networks:
+    - control
+  group_add:
+    - ${PLATFORM_SECRET_GID:?Run make production-init first}
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: *bounded-logs
+
+services:
+  native-user-admin:
+    profiles: [operator]
+    build:
+      context: ./infra/jupyterhub
+      args:
+        JUPYTERHUB_BASE_IMAGE: quay.io/jupyterhub/jupyterhub@sha256:f91ed45a0d2333de2ed9f5d708ad6f18a2fb79547526fbaaa19e88fd44fcab71
+        ALLOW_MUTABLE_BASE_IMAGE: "false"
+    image: team-workspace-jupyterhub:production
+    entrypoint: ["python", "/etc/jupyterhub/native_user_admin.py"]
+    command:
+      - --database
+      - /srv/jupyterhub/jupyterhub.sqlite
+      - --username
+      - ${PRODUCTION_NATIVE_USERNAME:-platform-admin}
+      - --admin-username
+      - ${PLATFORM_ADMIN_USERNAME:-platform-admin}
+    volumes:
+      - jupyterhub_data:/srv/jupyterhub
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+
+  singleuser-image:
+    build:
+      context: ./infra/singleuser
+      args:
+        SINGLEUSER_BASE_IMAGE: quay.io/jupyterhub/singleuser@sha256:2c952ea9a86a81994b6a5fbd9651e3c55c63008068ad1a27e559c4112d7bcaca
+    image: team-workspace-singleuser:production-current
+    command: ["/usr/local/bin/platform-singleuser", "--version"]
+    environment:
+      PLATFORM_DEFAULT_KERNEL: python312
+      PLATFORM_PYTHON_EXECUTABLE: /opt/conda/envs/python312/bin/python
+      PATH: /opt/conda/envs/python312/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PLATFORM_KERNEL_CONTRACT: >-
+        {"schema_version":1,"python_version":"3.12.13","kernels":[{"name":"python3","display_name":"Python 3 (ipykernel)","language":"python","python_version":"3.13.14","executable":"/opt/conda/bin/python"},{"name":"python312","display_name":"Python 3.12 (platform)","language":"python","python_version":"3.12.13","executable":"/opt/conda/envs/python312/bin/python"}],"default_kernel":"python312"}
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+
+  migrate:
+    <<: *backend-base
+    command: ["python", "-m", "app.migrate", "upgrade", "head"]
+    restart: "no"
+
+  bootstrap-profile:
+    <<: *backend-base
+    command:
+      - python
+      - -m
+      - app.admin
+      - import-profiles
+      - --policy
+      - /etc/platform/profiles.production.json
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    <<: *backend-base
+    command:
+      - uvicorn
+      - app.main:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --forwarded-allow-ips
+      - 172.38.0.10
+    environment:
+      <<: *backend-environment
+      FORWARDED_ALLOW_IPS: 172.38.0.10
+    depends_on:
+      bootstrap-profile:
+        condition: service_completed_successfully
+    networks:
+      - edge
+      - control
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      start_period: 15s
+      retries: 9
+
+  worker:
+    <<: *backend-base
+    environment:
+      <<: *backend-environment
+      JUPYTERHUB_ADMIN_LIFECYCLE_TOKEN_FILE: /run/platform-secrets/admin_lifecycle_token
+    volumes:
+      - platform_data:/var/lib/platform
+      - ./secrets/production/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
+      - ./secrets/production/token_encryption_key:/run/platform-secrets/token_encryption_key:ro
+      - ./secrets/production/session_hash_key:/run/platform-secrets/session_hash_key:ro
+      - ./secrets/production/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
+      - ./secrets/production/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
+      - ./.runtime/production/profiles.json:/etc/platform/profiles.production.json:ro
+    command: ["python", "-m", "app.worker", "--poll-seconds", "1"]
+    healthcheck:
+      disable: true
+    depends_on:
+      bootstrap-profile:
+        condition: service_completed_successfully
+      jupyterhub:
+        condition: service_healthy
+    restart: unless-stopped
+
+  reconciler:
+    build:
+      context: ./backend
+    image: team-workspace-backend:production
+    environment:
+      PLATFORM_DATABASE_URL: sqlite:////var/lib/platform/platform.db
+      PLATFORM_ENFORCE_SAFE_SQLITE: "true"
+      JUPYTERHUB_INTERNAL_URL: http://jupyterhub:8081
+      JUPYTERHUB_RECONCILER_TOKEN_FILE: /run/platform-secrets/reconciler_token
+      PLATFORM_RECONCILIATION_INTERVAL_SECONDS: "5"
+      PLATFORM_RECONCILIATION_FRESHNESS_SECONDS: "30"
+    volumes:
+      - platform_data:/var/lib/platform
+      - ./secrets/production/reconciler_token:/run/platform-secrets/reconciler_token:ro
+    command: ["python", "-m", "app.reconciler"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.reconciler", "--healthcheck"]
+      interval: 10s
+      timeout: 15s
+      start_period: 30s
+      retries: 3
+    depends_on:
+      bootstrap-profile:
+        condition: service_completed_successfully
+      jupyterhub:
+        condition: service_healthy
+    networks:
+      - control
+    group_add:
+      - ${PLATFORM_SECRET_GID:?Run make production-init first}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *bounded-logs
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.production
+    image: team-workspace-frontend:production
+    networks:
+      - edge
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=8m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+    logging: *bounded-logs
+
+  egress-proxy:
+    build:
+      context: ./infra/egress-proxy
+      args:
+        SQUID_BASE_IMAGE: ubuntu/squid@sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c
+        ALLOW_MUTABLE_BASE_IMAGE: "false"
+    image: team-workspace-egress-proxy:production
+    user: "13:13"
+    volumes:
+      - ./infra/egress-proxy/approved-domains.production.txt:/etc/squid/approved-domains.txt:ro
+    networks:
+      jupyter:
+        ipv4_address: 172.40.0.20
+      egress-out:
+        ipv4_address: 172.34.0.2
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+      - /run:rw,noexec,nosuid,nodev,size=8m
+      - /var/log/squid:rw,noexec,nosuid,nodev,size=16m
+      - /var/spool/squid:rw,noexec,nosuid,nodev,size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/squid.pid && kill -0 \"$$(cat /tmp/squid.pid)\" && squid -k check"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 6
+    logging: *bounded-logs
+
+  jupyterhub:
+    build:
+      context: ./infra/jupyterhub
+      args:
+        JUPYTERHUB_BASE_IMAGE: quay.io/jupyterhub/jupyterhub@sha256:f91ed45a0d2333de2ed9f5d708ad6f18a2fb79547526fbaaa19e88fd44fcab71
+        ALLOW_MUTABLE_BASE_IMAGE: "false"
+    image: team-workspace-jupyterhub:production
+    environment:
+      PLATFORM_ENV: production
+      ALLOW_UNSAFE_LOCAL_DEV: "false"
+      ALLOW_UNSAFE_DOMAIN_TEST: "false"
+      JUPYTERHUB_PROFILE_ALLOWLIST_FILE: /etc/platform/profiles.production.json
+      JUPYTERHUB_ADMIN_USERS: ${PLATFORM_ADMIN_USERNAME:-platform-admin}
+      JUPYTERHUB_BLOCKED_USERS_FILE: /etc/platform/blocked-users.json
+      NATIVE_ENABLE_SIGNUP: "false"
+      JUPYTERHUB_BIND_URL: http://:8000
+      JUPYTERHUB_HUB_BIND_URL: http://0.0.0.0:8081
+      JUPYTERHUB_HUB_CONNECT_URL: http://172.40.0.10:8081
+      JUPYTERHUB_SUBDOMAIN_HOST: https://cyberailabs.team
+      PLATFORM_OAUTH_REDIRECT_URI: https://platform.cyberailabs.team/api/v1/auth/callback
+      JUPYTER_NETWORK_NAME: platform-jupyter-compose-production
+      JUPYTER_NETWORK_POLICY_MODE: compose-internal-trusted-v1
+      JUPYTER_NETWORK_SUBNET: 172.40.0.0/24
+      JUPYTER_NETWORK_DYNAMIC_IP_RANGE: 172.40.0.128/25
+      JUPYTER_STORAGE_POLICY_MODE: docker-volume-unlimited-v1
+      JUPYTER_EGRESS_PROXY_URL: http://172.40.0.20:3128
+      JUPYTER_SINGLEUSER_COMMAND: /opt/conda/bin/jupyterhub-singleuser
+      JUPYTERHUB_CONCURRENT_SPAWN_LIMIT: "3"
+      PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
+      PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+      SPAWN_VALIDATOR_CONSUME_URL: http://api:8000/internal/v1/spawn-authorizations/consume
+      SPAWN_VALIDATOR_CHECK_URL: http://api:8000/internal/v1/spawn-authorizations/check
+      SPAWN_VALIDATOR_TIMEOUT_SECONDS: "5"
+      PLATFORM_WEB_PROVISIONING_ENABLED: "true"
+      PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED: "true"
+      PLATFORM_WORKSPACE_DELETION_ENABLED: "true"
+      PLATFORM_PROVISIONING_CLAIM_URL: http://api:8000/internal/v1/user-provisioning/claim
+      PLATFORM_PROVISIONING_COMPLETE_URL: http://api:8000/internal/v1/user-provisioning/complete
+      PLATFORM_PROVISIONING_FAIL_URL: http://api:8000/internal/v1/user-provisioning/fail
+      PLATFORM_DELETION_CLAIM_URL: http://api:8000/internal/v1/workspace-deletions/claim
+      PLATFORM_DELETION_COMPLETE_URL: http://api:8000/internal/v1/workspace-deletions/complete
+      PLATFORM_DELETION_FAIL_URL: http://api:8000/internal/v1/workspace-deletions/fail
+      PLATFORM_PROVISIONING_POLL_SECONDS: "2"
+      PLATFORM_PROVISIONING_HTTP_TIMEOUT_SECONDS: "5"
+      PLATFORM_LOCAL_PROJECT_ID_START: "10000"
+      PLATFORM_LOCAL_PROVISIONING_STATE_DIR: /srv/jupyterhub/local-provisioning
+      JUPYTERHUB_COOKIE_SECRET_FILE: /run/platform-secrets/jupyterhub_cookie_secret
+      CONFIGPROXY_AUTH_TOKEN_FILE: /run/platform-secrets/configproxy_auth_token
+      PLATFORM_OAUTH_CLIENT_SECRET_FILE: /run/platform-secrets/oauth_client_secret
+      PLATFORM_RECONCILER_TOKEN_FILE: /run/platform-secrets/reconciler_token
+      PLATFORM_ADMIN_LIFECYCLE_TOKEN_FILE: /run/platform-secrets/admin_lifecycle_token
+      SPAWN_VALIDATOR_HMAC_KEY_FILE: /run/platform-secrets/spawn_hmac_key
+      JUPYTERHUB_DB_URL: sqlite:////srv/jupyterhub/jupyterhub.sqlite
+    volumes:
+      - jupyterhub_data:/srv/jupyterhub
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./secrets/production/jupyterhub_cookie_secret:/run/platform-secrets/jupyterhub_cookie_secret:ro
+      - ./secrets/production/configproxy_auth_token:/run/platform-secrets/configproxy_auth_token:ro
+      - ./secrets/production/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
+      - ./secrets/production/reconciler_token:/run/platform-secrets/reconciler_token:ro
+      - ./secrets/production/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
+      - ./secrets/production/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
+      - ./.runtime/production/profiles.json:/etc/platform/profiles.production.json:ro
+      - ./infra/jupyterhub/blocked-users.production.json:/etc/platform/blocked-users.json:ro
+      - ./.runtime/production:/srv/jupyterhub/local-provisioning:rw
+    group_add:
+      - ${DOCKER_GID:?Run make production-init first}
+      - ${PLATFORM_SECRET_GID:?Run make production-init first}
+    depends_on:
+      singleuser-image:
+        condition: service_completed_successfully
+      api:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+    networks:
+      edge: {}
+      control: {}
+      jupyter:
+        ipv4_address: 172.40.0.10
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/hub/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 12
+    logging: *bounded-logs
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile.production
+      args:
+        GATEWAY_BASE_IMAGE: nginx@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
+        GATEWAY_SERVER_CONFIG: production.conf
+        ALLOW_MUTABLE_BASE_IMAGE: "false"
+    image: team-workspace-gateway:production
+    ports:
+      - ${PLATFORM_GATEWAY_BIND_IP:?Set the backend host IP}:3030:3030
+    volumes:
+      - type: bind
+        source: ${PLATFORM_TLS_CERT_FILE:?Set the absolute fullchain path}
+        target: /run/platform-tls/tls.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PLATFORM_TLS_KEY_FILE:?Set the absolute private-key path}
+        target: /run/platform-tls/tls.key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${PLATFORM_INGRESS_CIDRS_FILE:?Set the reviewed CIDR file path}
+        target: /run/platform-ingress/company-vpn-cidrs.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    group_add:
+      - ${PLATFORM_TLS_GID:?Set the read-only certificate group GID}
+    environment:
+      PLATFORM_GATEWAY_MODE: production
+      PLATFORM_PORTAL_HOST: platform.cyberailabs.team
+      PLATFORM_HUB_HOST: cyberailabs.team
+      PLATFORM_USER_DOMAIN: cyberailabs.team
+      PLATFORM_TLS_MIN_VALIDITY_SECONDS: "86400"
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+      jupyterhub:
+        condition: service_healthy
+    networks:
+      edge:
+        ipv4_address: 172.38.0.10
+      ingress: {}
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,nodev,size=32m
+      - /var/run:rw,noexec,nosuid,nodev,size=8m
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    logging: *bounded-logs
+
+volumes:
+  platform_data:
+  jupyterhub_data:
+
+networks:
+  ingress: {}
+  edge:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.38.0.0/24
+  control:
+    internal: true
+  egress-out:
+    ipam:
+      config:
+        - subnet: 172.34.0.0/16
+  jupyter:
+    name: platform-jupyter-compose-production
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+    labels:
+      platform.managed: "true"
+      platform.kind: jupyter-execution
+      platform.network.policy: compose-internal-trusted-v1
+    ipam:
+      config:
+        - subnet: 172.40.0.0/24
+          ip_range: 172.40.0.128/25

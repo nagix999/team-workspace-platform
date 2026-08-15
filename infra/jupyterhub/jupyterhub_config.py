@@ -150,6 +150,10 @@ unsafe_local_runtime = runtime_mode.unsafe_local_runtime
 web_provisioning_enabled = boolean_env(
     "PLATFORM_WEB_PROVISIONING_ENABLED", default=False
 )
+production_docker_volume_provisioning = boolean_env(
+    "PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED", default=False
+)
+storage_policy_mode = required_env("JUPYTER_STORAGE_POLICY_MODE")
 workspace_deletion_enabled = boolean_env(
     "PLATFORM_WORKSPACE_DELETION_ENABLED", default=False
 )
@@ -158,6 +162,8 @@ validate_web_provisioning_mode(
     unsafe_local_dev=unsafe_local_dev,
     unsafe_domain_test=unsafe_domain_test,
     enabled=web_provisioning_enabled,
+    production_docker_volume=production_docker_volume_provisioning,
+    storage_policy_mode=storage_policy_mode,
 )
 
 profile_file = required_env("JUPYTERHUB_PROFILE_ALLOWLIST_FILE")
@@ -239,7 +245,6 @@ if network_policy_mode not in {
     raise RuntimeError("JUPYTER_NETWORK_POLICY_MODE is unsupported")
 network_subnet = required_env("JUPYTER_NETWORK_SUBNET")
 network_dynamic_ip_range = required_env("JUPYTER_NETWORK_DYNAMIC_IP_RANGE")
-storage_policy_mode = required_env("JUPYTER_STORAGE_POLICY_MODE")
 try:
     validate_workspace_deletion_mode(
         enabled=workspace_deletion_enabled,
