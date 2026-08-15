@@ -64,7 +64,7 @@ PYTHON_VERSION_RE = re.compile(
     r"^(?:[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 )
 VOLUME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
-DIGEST_IMAGE_RE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
+IMMUTABLE_IMAGE_RE = re.compile(r"^(?:\S+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PYTHON_EXECUTABLE_RE = re.compile(
     r"^/opt/conda(?:/envs/[a-z][a-z0-9_-]{0,63})?/bin/python$"
@@ -250,10 +250,12 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
                 or any(char.isspace() for char in image)
             ):
                 raise ValueError("profile image is invalid")
-            if not settings.unsafe_local_runtime and not DIGEST_IMAGE_RE.fullmatch(
+            if not settings.unsafe_local_runtime and not IMMUTABLE_IMAGE_RE.fullmatch(
                 image
             ):
-                raise ValueError("production profile image must be digest pinned")
+                raise ValueError(
+                    "production profile image must be a registry digest or exact local image ID"
+                )
             cpu_limit = raw["cpu_limit"]
             if isinstance(cpu_limit, bool) or not isinstance(cpu_limit, (int, float)):
                 raise ValueError("profile cpu_limit must be numeric")

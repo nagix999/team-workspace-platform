@@ -54,7 +54,7 @@ LEGACY_EXECUTION_FIELDS = tuple(
 V2_EXECUTION_FIELDS = tuple(sorted(V2_PROFILE_KEYS - PROFILE_METADATA_KEYS))
 PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 VOLUME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
-DIGEST_IMAGE_RE = re.compile(r"^\S+@sha256:[0-9a-f]{64}$")
+IMMUTABLE_IMAGE_RE = re.compile(r"^(?:\S+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PYTHON_VERSION_RE = re.compile(
     r"^(?:[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
@@ -409,8 +409,10 @@ def load_profile_policy(
         image = profile["image"]
         if not isinstance(image, str) or not image or any(ch.isspace() for ch in image):
             raise ProfilePolicyError(f"{where}.image is invalid")
-        if not allow_unsafe_images and not DIGEST_IMAGE_RE.fullmatch(image):
-            raise ProfilePolicyError(f"{where}.image must be pinned by sha256 digest")
+        if not allow_unsafe_images and not IMMUTABLE_IMAGE_RE.fullmatch(image):
+            raise ProfilePolicyError(
+                f"{where}.image must be a registry digest or exact local image ID"
+            )
 
         digest = profile["config_digest"]
         if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):

@@ -2,14 +2,15 @@
 
 Only deterministic named volumes from :mod:`local_volume_policy` are accepted.
 No image, command, mount path, network, or Docker option comes from a web request.
-User provisioning stays behind the explicit unsafe local-test gate. The deletion
-path may run in production only behind its separate policy flag and exact
-``docker-volume-unlimited-v1`` contract. The Docker daemon socket remains a
-host-root-equivalent capability in both cases.
+User provisioning may run either behind the explicit unsafe local-test gate or
+the reviewed production ``docker-volume-unlimited-v1`` capability. The deletion
+path uses its own flag and the same exact storage contract. The Docker daemon
+socket remains a host-root-equivalent capability in both cases.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -235,12 +236,45 @@ class LocalDockerProvisioner:
         profile_policy: dict[str, Any],
         state_dir: Path,
         project_id_start: int = DEFAULT_PROJECT_ID_START,
+        production_manifest: bool = False,
     ) -> None:
         self.engine = engine
         self.profile_policy = profile_policy
         self.runtime = local_profile_runtime(profile_policy)
         self.state_dir = state_dir
         self.project_id_start = project_id_start
+        self.production_manifest = production_manifest
+
+    def _production_manifest(self, local_manifest: dict[str, Any]) -> dict[str, Any]:
+        slots: list[dict[str, Any]] = []
+        paths: set[str] = set()
+        for local_slot in local_manifest["slots"]:
+            inspected = self.engine.inspect_volume(local_slot["volume_name"])
+            path = inspected.get("Mountpoint") if inspected is not None else None
+            if (
+                not isinstance(path, str)
+                or not path.startswith("/")
+                or ".." in Path(path).parts
+                or path in paths
+            ):
+                raise RuntimeError("production Docker volume mountpoint is invalid")
+            paths.add(path)
+            slots.append({**local_slot, "path": path})
+        inventory = {
+            "user_id": local_manifest["user_id"],
+            "username": local_manifest["username"],
+            "uid": local_manifest["uid"],
+            "gid": local_manifest["gid"],
+            "slots": slots,
+        }
+        canonical = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        return {
+            "schema_version": 1,
+            "inventory_sha256": "sha256:" + hashlib.sha256(canonical).hexdigest(),
+            **inventory,
+        }
 
     def ensure_shared_volume(self) -> None:
         """Create/reconcile the one team volume before any user job is claimed."""
@@ -311,8 +345,13 @@ class LocalDockerProvisioner:
 
         # The manifest becomes visible to the API/host CLI only after all five
         # volumes and their root metadata have completed successfully.
-        atomic_json(output, manifest)
-        return manifest
+        result = (
+            self._production_manifest(manifest)
+            if self.production_manifest
+            else manifest
+        )
+        atomic_json(output, result)
+        return result
 
     def _deletion_checkpoint(self, workspace_id: str) -> Path:
         return self.state_dir / f"local-deletion-{workspace_id}.json"

@@ -2,7 +2,7 @@
 # default exists only so Docker can parse FROM; the RUN guard fails unless the
 # explicit local-development escape hatch is set.
 ARG JUPYTERHUB_BASE_IMAGE=quay.io/jupyterhub/jupyterhub:5.5.0
-FROM ${JUPYTERHUB_BASE_IMAGE}
+FROM ${JUPYTERHUB_BASE_IMAGE} AS runtime
 
 ARG JUPYTERHUB_BASE_IMAGE
 ARG ALLOW_MUTABLE_BASE_IMAGE=false
@@ -24,10 +24,14 @@ RUN python -m pip install --no-cache-dir -r /tmp/platform-jupyterhub-requirement
       --create-home --shell /usr/sbin/nologin jupyterhub \
  && install -d -o 10001 -g 10001 -m 0700 /srv/jupyterhub
 
-COPY --chown=10001:10001 jupyterhub_config.py nativeauth_compat.py oauth_log_policy.py rbac_policy.py spawn_guard.py platform_spawner.py profile_policy.py public_url_policy.py local_volume_policy.py local_docker_provisioner.py local_provisioner_agent.py /etc/jupyterhub/
+COPY --chown=10001:10001 jupyterhub_config.py native_user_admin.py nativeauth_compat.py oauth_log_policy.py rbac_policy.py spawn_guard.py platform_spawner.py profile_policy.py public_url_policy.py local_volume_policy.py local_docker_provisioner.py local_provisioner_agent.py /etc/jupyterhub/
 
 USER 10001:10001
 WORKDIR /srv/jupyterhub
 
 EXPOSE 8000 8081
 ENTRYPOINT ["jupyterhub", "-f", "/etc/jupyterhub/jupyterhub_config.py"]
+
+FROM runtime AS test
+
+FROM runtime AS final

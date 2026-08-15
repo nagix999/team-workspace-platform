@@ -5,6 +5,8 @@ import ast
 import hashlib
 import hmac
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -34,6 +36,7 @@ from profile_image_check import (  # noqa: E402
     docker_verification_command,
 )
 from generate_local_profile_matrix import generate_document  # noqa: E402
+from generate_production_profile_policy import generate_policy  # noqa: E402
 from rbac_policy import (  # noqa: E402
     PLATFORM_ADMIN_LIFECYCLE_SERVICE,
     PLATFORM_API_SERVICE,
@@ -46,6 +49,129 @@ import spawn_guard  # noqa: E402
 
 
 class ProfilePolicyTests(unittest.TestCase):
+    def test_production_policy_accepts_exact_local_image_id(self) -> None:
+        document = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        policy = generate_policy(
+            template=document,
+            image_id="sha256:" + "a" * 64,
+            shared_volume_name="jupyter-shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "production.json"
+            path.write_text(json.dumps(policy), encoding="utf-8")
+            loaded = load_profile_policy(path)
+
+        self.assertEqual(len(loaded["profiles"]), 18)
+        self.assertEqual(
+            {profile["image"] for profile in loaded["profiles"].values()},
+            {"sha256:" + "a" * 64},
+        )
+
+    def test_production_policy_generation_retains_old_runtime_versions(self) -> None:
+        document = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        first = generate_policy(
+            template=document,
+            image_id="sha256:" + "a" * 64,
+            shared_volume_name="jupyter-shared",
+        )
+        second = generate_policy(
+            template=document,
+            image_id="sha256:" + "b" * 64,
+            shared_volume_name="jupyter-shared",
+            previous=first,
+        )
+
+        self.assertEqual(len(second["profiles"]), 36)
+        for profile_id in {row["id"] for row in first["profiles"]}:
+            versions = [row for row in second["profiles"] if row["id"] == profile_id]
+            self.assertEqual([row["version"] for row in versions], [1, 2])
+            self.assertFalse(versions[0]["selectable"])
+            self.assertTrue(versions[0]["enabled"])
+            self.assertTrue(versions[1]["selectable"])
+
+    def test_production_policy_generation_is_idempotent_for_same_image(self) -> None:
+        document = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        first = generate_policy(
+            template=document,
+            image_id="sha256:" + "a" * 64,
+            shared_volume_name="jupyter-shared",
+        )
+        repeated = generate_policy(
+            template=document,
+            image_id="sha256:" + "a" * 64,
+            shared_volume_name="jupyter-shared",
+            previous=first,
+        )
+
+        self.assertEqual(repeated, first)
+
+    def test_production_policy_candidate_is_atomically_promoted(self) -> None:
+        document = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        candidate = generate_policy(
+            template=document,
+            image_id="sha256:" + "a" * 64,
+            shared_volume_name="jupyter-shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            candidate_path = Path(directory) / "candidate.json"
+            output_path = Path(directory) / "profiles.json"
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "generate_production_profile_policy.py"),
+                    "--promote",
+                    str(candidate_path),
+                    "--output",
+                    str(output_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(json.loads(output_path.read_text()), candidate)
+            self.assertEqual(os.stat(output_path).st_mode & 0o777, 0o640)
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+
+    def test_production_policy_write_preserves_shared_setgid_parent(self) -> None:
+        document = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        candidate = generate_policy(
+            template=document,
+            image_id="sha256:" + "a" * 64,
+            shared_volume_name="jupyter-shared",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "shared-state"
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o2770)
+            candidate_path = Path(directory) / "candidate.json"
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "generate_production_profile_policy.py"),
+                    "--promote",
+                    str(candidate_path),
+                    "--output",
+                    str(parent / "profiles.json"),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(os.stat(parent).st_mode & 0o7777, 0o2770)
+            self.assertEqual(os.stat(parent / "profiles.json").st_mode & 0o777, 0o640)
+
     def test_singleuser_runtime_restores_profile_path_and_health_interpreter(
         self,
     ) -> None:

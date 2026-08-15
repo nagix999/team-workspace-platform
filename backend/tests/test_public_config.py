@@ -72,6 +72,20 @@ def test_same_site_user_content_is_a_fail_closed_production_gate(settings):
     replace(same_site, allow_same_site_user_content=True).validate()
 
 
+def test_hub_may_use_the_declared_security_domain_apex(settings):
+    apex = replace(
+        settings,
+        portal_origin="https://platform.cyberailabs.team",
+        hub_public_url="https://cyberailabs.team",
+        hub_user_domain="cyberailabs.team",
+        oauth_redirect_uri=("https://platform.cyberailabs.team/api/v1/auth/callback"),
+        portal_security_domain="cyberailabs.team",
+        hub_user_security_domain="cyberailabs.team",
+        allow_same_site_user_content=True,
+    )
+    apex.validate()
+
+
 def test_https_domain_test_keeps_browser_security_and_local_provisioning(settings):
     domain_test = replace(
         settings,

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import sqlite3
 import sys
-from pathlib import Path
-import shutil
 import tempfile
+from pathlib import Path
 
 
 REQUIRED_TABLES = {
@@ -69,7 +69,16 @@ def _looks_like_platform_db(conn: sqlite3.Connection) -> bool:
         return False
     tables = {r[0] for r in row}
     has_core = REQUIRED_TABLES.issubset(tables)
-    has_compat_user = bool(({"operations", "workspaces", "users"} <= tables) or ("operations" in tables and "workspaces" in tables and ("user_provisioning_jobs" in tables or "provisioning_requests" in tables)))
+    has_compat_user = bool(
+        ({"operations", "workspaces", "users"} <= tables)
+        or (
+            "operations" in tables
+            and "workspaces" in tables
+            and (
+                "user_provisioning_jobs" in tables or "provisioning_requests" in tables
+            )
+        )
+    )
     return bool(has_core and has_compat_user)
 
 
@@ -78,7 +87,9 @@ def _sqlite_probe(path: Path) -> sqlite3.Connection | None:
     candidates: list[Path] = [path]
 
     try:
-        with tempfile.TemporaryDirectory(prefix="platform-domain-test-idle-") as temp_root:
+        with tempfile.TemporaryDirectory(
+            prefix="platform-domain-test-idle-"
+        ) as temp_root:
             copied = Path(temp_root) / path.name
             shutil.copy2(path, copied)
             candidates.append(copied)
@@ -112,7 +123,14 @@ def _sqlite_probe(path: Path) -> sqlite3.Connection | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument(
+        "--context",
+        choices=("domain-test", "production"),
+        default="domain-test",
+        help="operator-facing label for this read-only maintenance gate",
+    )
     args = parser.parse_args()
+    check_label = f"{args.context} idle check"
 
     candidate_paths = [
         args.database,
@@ -153,7 +171,9 @@ def main() -> int:
                 # To avoid false-positives from probing unrelated DBs,
                 # refuse fallback when an explicit path was provided.
                 if path == explicit_path:
-                    raise sqlite3.Error("explicit platform database has unexpected schema")
+                    raise sqlite3.Error(
+                        "explicit platform database has unexpected schema"
+                    )
                 continue
             resolved_path = path
             break
@@ -167,7 +187,10 @@ def main() -> int:
             continue
 
     if connection is None:
-        print("domain-test idle check: platform database is missing or unreadable", file=sys.stderr)
+        print(
+            f"{check_label}: platform database is missing or unreadable",
+            file=sys.stderr,
+        )
         print(f"checked: {attempted}", file=sys.stderr)
         if last_error is not None:
             print(f"details: {last_error}", file=sys.stderr)
@@ -175,7 +198,7 @@ def main() -> int:
 
     # Keep this explicit for operator visibility when the maintenance container
     # path convention differs.
-    print(f"domain-test idle check using: {resolved_path}", file=sys.stderr)
+    print(f"{check_label} using: {resolved_path}", file=sys.stderr)
 
     try:
         operations = connection.execute(
@@ -235,13 +258,13 @@ def main() -> int:
             else []
         )
     except sqlite3.Error as exc:
-        print(f"domain-test idle check failed: {exc}", file=sys.stderr)
+        print(f"{check_label} failed: {exc}", file=sys.stderr)
         return 1
     finally:
         connection.close()
 
     if not operations and not workspaces and not provisioning and not deletions:
-        print("domain-test idle check passed")
+        print(f"{check_label} passed")
         return 0
 
     for operation_id, operation_type, status in operations:

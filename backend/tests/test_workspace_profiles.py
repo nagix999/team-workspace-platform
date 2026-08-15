@@ -163,6 +163,25 @@ def test_existing_offer_remains_pinned_when_new_runtime_version_is_imported(app_
     assert "provider_options_json" not in workspace
 
 
+def test_bootstrap_offer_moves_when_its_old_runtime_is_retired(app_env):
+    app, hub, client = app_env
+    login(client, hub, "alice")
+    provision(app, "alice")
+    _add_profile(app, profile_id="python-standard", version=2)
+    with app.state.session_factory() as db:
+        old = db.get(WorkspaceProfile, ("python-standard", 1))
+        offer = db.get(WorkspaceProfileOffer, "python-standard")
+        assert old is not None and offer is not None
+        old.selectable = False
+        original_version = offer.row_version
+        ensure_default_offers(db)
+        db.commit()
+
+        assert offer.runtime_profile_id == "python-standard"
+        assert offer.runtime_profile_version == 2
+        assert offer.row_version == original_version + 1
+
+
 def test_catalog_discloses_a_numeric_disk_limit_only_when_enforced(app_env):
     app, hub, client = app_env
     login(client, hub, "alice")

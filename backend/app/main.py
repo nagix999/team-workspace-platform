@@ -132,7 +132,7 @@ def create_app(
 
     app = FastAPI(
         title="Team Development Platform API",
-        version="0.1.0",
+        version="0.1.1",
         lifespan=lifespan,
     )
     app.state.settings = settings

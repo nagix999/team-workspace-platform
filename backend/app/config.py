@@ -157,6 +157,8 @@ class Settings:
     lifecycle_timeout_seconds: int = 15 * 60
     reconciliation_freshness_seconds: int = 30
     web_provisioning_enabled: bool = False
+    production_docker_volume_provisioning: bool = False
+    storage_policy_mode: str = ""
     provisioning_lease_seconds: int = 5 * 60
     provisioning_max_attempts: int = 3
     hub_progress_sample_seconds: float = 1.0
@@ -252,6 +254,10 @@ class Settings:
             web_provisioning_enabled=_bool_env(
                 "PLATFORM_WEB_PROVISIONING_ENABLED", False
             ),
+            production_docker_volume_provisioning=_bool_env(
+                "PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED", False
+            ),
+            storage_policy_mode=os.getenv("PLATFORM_STORAGE_POLICY_MODE", "").strip(),
             provisioning_lease_seconds=_int_env(
                 "PLATFORM_PROVISIONING_LEASE_SECONDS", 5 * 60
             ),
@@ -365,9 +371,11 @@ class Settings:
                 self.hub_user_security_domain,
                 name="JUPYTERHUB_USER_SECURITY_DOMAIN",
             )
-            if not portal_host.endswith(f".{portal_site}") or not hub_host.endswith(
-                f".{hub_site}"
-            ):
+            portal_in_site = portal_host == portal_site or portal_host.endswith(
+                f".{portal_site}"
+            )
+            hub_in_site = hub_host == hub_site or hub_host.endswith(f".{hub_site}")
+            if not portal_in_site or not hub_in_site:
                 raise RuntimeError(
                     "public hosts must be below their declared security domains"
                 )
@@ -401,10 +409,19 @@ class Settings:
             raise RuntimeError(
                 "PLATFORM_RECONCILIATION_FRESHNESS_SECONDS must be between 5 and 300"
             )
-        if self.web_provisioning_enabled and not self.unsafe_local_runtime:
+        if self.production_docker_volume_provisioning and self.unsafe_local_runtime:
             raise RuntimeError(
-                "web self-service provisioning is restricted to an explicit local test mode"
+                "production Docker-volume provisioning is forbidden in local test modes"
             )
+        if self.web_provisioning_enabled and not self.unsafe_local_runtime:
+            if not self.production_docker_volume_provisioning:
+                raise RuntimeError(
+                    "production web provisioning requires its explicit Docker-volume capability flag"
+                )
+            if self.storage_policy_mode != "docker-volume-unlimited-v1":
+                raise RuntimeError(
+                    "production web provisioning requires docker-volume-unlimited-v1 storage"
+                )
         if self.provisioning_lease_seconds <= 0:
             raise RuntimeError(
                 "PLATFORM_PROVISIONING_LEASE_SECONDS must be greater than 0"

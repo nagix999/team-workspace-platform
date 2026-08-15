@@ -1,5 +1,5 @@
 ARG SQUID_BASE_IMAGE=ubuntu/squid:latest
-FROM ${SQUID_BASE_IMAGE}
+FROM ${SQUID_BASE_IMAGE} AS runtime
 
 ARG SQUID_BASE_IMAGE
 ARG ALLOW_MUTABLE_BASE_IMAGE=false
@@ -15,3 +15,7 @@ RUN image="${SQUID_BASE_IMAGE}"; digest="${image##*@sha256:}"; \
 COPY squid.conf /etc/squid/squid.conf
 
 EXPOSE 3128
+
+FROM runtime AS test
+
+FROM runtime AS final

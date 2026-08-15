@@ -34,6 +34,8 @@ def validate_web_provisioning_mode(
     unsafe_local_dev: bool,
     unsafe_domain_test: bool = False,
     enabled: bool,
+    production_docker_volume: bool = False,
+    storage_policy_mode: str = "",
 ) -> None:
     explicitly_local = (
         platform_env == "local-dev"
@@ -44,9 +46,20 @@ def validate_web_provisioning_mode(
         and unsafe_local_dev is False
         and unsafe_domain_test is True
     )
-    if enabled and not explicitly_local:
+    explicitly_production = (
+        platform_env == "production"
+        and unsafe_local_dev is False
+        and unsafe_domain_test is False
+        and production_docker_volume is True
+        and storage_policy_mode == "docker-volume-unlimited-v1"
+    )
+    if production_docker_volume and platform_env != "production":
         raise RuntimeError(
-            "PLATFORM_WEB_PROVISIONING_ENABLED is forbidden outside an explicit local test mode"
+            "production Docker-volume provisioning is forbidden in local test modes"
+        )
+    if enabled and not (explicitly_local or explicitly_production):
+        raise RuntimeError(
+            "PLATFORM_WEB_PROVISIONING_ENABLED requires an explicit local test mode or reviewed production Docker-volume mode"
         )
 
 

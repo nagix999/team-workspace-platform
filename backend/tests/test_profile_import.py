@@ -568,8 +568,14 @@ def test_import_uses_exact_production_image_and_kernel_version_contract(
         profile["image"] = image
         profile["config_digest"] = _profile_digest(profile)
         _write_policy(policy_path, schema_version=2, profiles=[profile])
-        with pytest.raises(ValueError, match="must be digest pinned"):
+        with pytest.raises(ValueError, match="registry digest or exact local image ID"):
             import_profiles(production, str(policy_path))
+
+    profile = _extended_profile()
+    profile["image"] = "sha256:" + "b" * 64
+    profile["config_digest"] = _profile_digest(profile)
+    _write_policy(policy_path, schema_version=2, profiles=[profile])
+    import_profiles(production, str(policy_path))
 
     profile = _extended_profile()
     profile["kernels"][0]["executable"] = "/usr/bin/python3"  # type: ignore[index]

@@ -10,6 +10,8 @@
 > 2026-08-11 이후 exact workspace volume의 자동 wipe/recreate 절차는
 > [ADR-0007](0007-admin-runtime-and-environment-management.md)이 아래 수동 삭제 결정을
 > 대체한다.
+> `cyberailabs.team`의 DNS/TLS/origin과 같은 registrable domain 위험 승인은
+> [ADR-0009](0009-cyberailabs-production-domain.md)이 이 문서의 해당 출시 gate를 구체화한다.
 
 ## 맥락
 
@@ -62,9 +64,11 @@ root-owned host health unit은 boot와 Docker restart 뒤 storage driver, XFS `p
 DockerSpawner가 container 안에서 host daemon을 사용하려면 JupyterHub가 Docker API에 접근해야 한다. raw Docker socket은 사실상 host root급 권한이다.
 
 - long-running service 중 socket은 `jupyterhub` container에만 mount한다. host one-shot provisioner는 제한된 관리 실행 중에만 필요한 권한을 사용한다.
-- 명시적 `local-dev`에서는 웹 self-service volume 준비 agent를 별도 socket 보유
+- 명시적 `local-dev` 또는 ADR-0009의 exact production Docker-volume mode에서는 웹
+  self-service volume 준비 agent를 별도 socket 보유
   container로 만들지 않고 JupyterHub managed service로 실행한다. API/worker에는 socket을
-  추가하지 않으며, 운영 모드에서 해당 feature flag가 켜지면 설정 검증에 실패한다.
+  추가하지 않으며, production에서는 별도 capability flag와 unlimited named-volume 정책이
+  동시에 없으면 설정 검증에 실패한다.
 - api, worker, frontend와 사용자 container에는 socket을 절대 전달하지 않는다.
 - 사용자 입력으로 image, volume, host path, network, privileged/capability 옵션을 만들지 않는다.
 - 이 host에는 다른 부서의 민감 workload와 장기 credential을 함께 두지 않는다.
