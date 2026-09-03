@@ -137,10 +137,12 @@ production_network_contract() {
 validate_gateway_health() {
   curl --fail --silent --show-error \
     --connect-to platform.cyberailabs.team:443:"${PLATFORM_GATEWAY_BIND_IP}":3030 \
-    https://platform.cyberailabs.team/healthz >/dev/null
+    https://platform.cyberailabs.team/healthz >/dev/null \
+    || return 1
   curl --fail --silent --show-error \
     --connect-to cyberailabs.team:443:"${PLATFORM_GATEWAY_BIND_IP}":3030 \
-    https://cyberailabs.team/healthz >/dev/null
+    https://cyberailabs.team/healthz >/dev/null \
+    || return 1
 }
 
 stop_gateway_fail_closed() {
@@ -183,22 +185,122 @@ require_running_control_plane() {
   done
 }
 
+running_healthy_service_id() {
+  local service="$1" container_id state health
+  container_id="$(compose ps --status running -q "${service}" 2>/dev/null)" \
+    || return 1
+  [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ ]] || return 1
+  IFS='|' read -r state health < <(
+    docker inspect --format \
+      '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+      "${container_id}" 2>/dev/null
+  ) || return 1
+  [[ "${state}" == running && "${health}" == healthy ]] \
+    || return 1
+  printf '%s\n' "${container_id}"
+}
+
+stop_existing_container_checked() {
+  local label="$1" container_id="$2" running
+  running="$(docker inspect --format '{{.State.Running}}' "${container_id}" 2>/dev/null)" \
+    || return 1
+  [[ "${running}" == true || "${running}" == false ]] || return 1
+  if [[ "${running}" == false ]]; then
+    return 0
+  fi
+  docker stop "${container_id}" >/dev/null \
+    || { echo >&2 "production: could not stop existing ${label} container"; return 1; }
+  running="$(docker inspect --format '{{.State.Running}}' "${container_id}" 2>/dev/null)" \
+    || return 1
+  [[ "${running}" == false ]] \
+    || { echo >&2 "production: existing ${label} container is still running"; return 1; }
+}
+
+start_existing_container_checked() {
+  local label="$1" container_id="$2" attempt state health
+  state="$(docker inspect --format '{{.State.Status}}' "${container_id}" 2>/dev/null)" \
+    || return 1
+  case "${state}" in
+    running) ;;
+    created|exited)
+      docker start "${container_id}" >/dev/null \
+        || { echo >&2 "production: could not start existing ${label} container"; return 1; }
+      ;;
+    *)
+      echo >&2 "production: existing ${label} container cannot be started from state ${state}"
+      return 1
+      ;;
+  esac
+  for ((attempt = 0; attempt < 90; attempt++)); do
+    IFS='|' read -r state health < <(
+      docker inspect --format \
+        '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+        "${container_id}" 2>/dev/null
+    ) || return 1
+    if [[ "${state}" == running && "${health}" == healthy ]]; then
+      return 0
+    fi
+    if [[ "${state}" == exited || "${state}" == dead || "${health}" == unhealthy ]]; then
+      echo >&2 "production: existing ${label} container failed while starting"
+      return 1
+    fi
+    sleep 2
+  done
+  echo >&2 "production: existing ${label} container did not become healthy"
+  return 1
+}
+
 restart_account_control_plane_checked() {
-  if ! compose up -d --wait jupyterhub reconciler worker >/dev/null; then
-    echo >&2 "production: account-administration control-plane restart failed"
-    stop_gateway_fail_closed \
-      || echo >&2 "production: CRITICAL: gateway stopped state could not be verified"
+  local api_id="$1" hub_id="$2" reconciler_id="$3" worker_id="$4" gateway_id="$5"
+  if ! start_existing_container_checked api "${api_id}" \
+    || ! start_existing_container_checked jupyterhub "${hub_id}" \
+    || ! start_existing_container_checked reconciler "${reconciler_id}" \
+    || ! start_existing_container_checked worker "${worker_id}"
+  then
+    echo >&2 "production: existing account-administration control plane did not restart"
+    stop_existing_container_checked gateway "${gateway_id}" >/dev/null 2>&1 || true
     return 1
   fi
   if ! production_network_contract validate \
     --probe-image team-workspace-backend:production
   then
     echo >&2 "production: account-administration network validation failed"
-    stop_gateway_fail_closed \
-      || echo >&2 "production: CRITICAL: gateway stopped state could not be verified"
+    stop_existing_container_checked gateway "${gateway_id}" >/dev/null 2>&1 || true
     return 1
   fi
-  start_gateway_checked
+  if ! start_existing_container_checked gateway "${gateway_id}" \
+    || ! validate_gateway_health
+  then
+    stop_existing_container_checked gateway "${gateway_id}" >/dev/null 2>&1 \
+      || echo >&2 "production: CRITICAL: existing gateway stopped state could not be verified"
+    echo >&2 "production: existing gateway did not restart safely"
+    return 1
+  fi
+}
+
+recover_after_user_admin_failure() {
+  local status="$1" account_action="$2" account_tool_succeeded="$3"
+  local api_id="$4" hub_id="$5" reconciler_id="$6" worker_id="$7" gateway_id="$8"
+  trap - EXIT
+  if [[ "${account_tool_succeeded}" == true ]]; then
+    if [[ "${account_action}" == reset-admin-password ]]; then
+      echo >&2 "production: the administrator password hash was committed; do not repeat the reset solely because runtime recovery failed"
+    else
+      echo >&2 "production: the account tool completed; review its result before repeating it after runtime recovery failure"
+    fi
+  fi
+  if restart_account_control_plane_checked \
+    "${api_id}" \
+    "${hub_id}" \
+    "${reconciler_id}" \
+    "${worker_id}" \
+    "${gateway_id}"
+  then
+    echo >&2 "production: original control plane was restored after the account command failed"
+  else
+    echo >&2 "production: control-plane restart after account administration failed"
+  fi
+  exit "${status}"
 }
 
 validate_host_contract() {
@@ -397,10 +499,22 @@ snapshot_existing_databases() {
   PRODUCTION_FRESH_DATABASES=false
   [[ "${present}" == 2 ]] || die "only one production database volume exists; refusing split-brain startup"
   bundle_name="production-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-  bundle="$(python3 scripts/domain_test_database_snapshot.py prepare --parent "${backup_parent}" --name "${bundle_name}")"
-  snapshot_one "${platform_volume}" platform.db platform.sqlite "${bundle}"
-  snapshot_one "${hub_volume}" jupyterhub.sqlite jupyterhub.sqlite "${bundle}"
-  python3 scripts/domain_test_database_snapshot.py finalize --bundle "${bundle}" >/dev/null
+  if ! bundle="$(python3 scripts/domain_test_database_snapshot.py prepare --parent "${backup_parent}" --name "${bundle_name}")"; then
+    echo >&2 "production: could not prepare the database backup bundle"
+    return 1
+  fi
+  if ! snapshot_one "${platform_volume}" platform.db platform.sqlite "${bundle}"; then
+    echo >&2 "production: Platform database snapshot failed"
+    return 1
+  fi
+  if ! snapshot_one "${hub_volume}" jupyterhub.sqlite jupyterhub.sqlite "${bundle}"; then
+    echo >&2 "production: JupyterHub database snapshot failed"
+    return 1
+  fi
+  if ! python3 scripts/domain_test_database_snapshot.py finalize --bundle "${bundle}" >/dev/null; then
+    echo >&2 "production: database backup finalization failed"
+    return 1
+  fi
   echo "production database backup: ${bundle}"
   PRODUCTION_LAST_BACKUP="${bundle}"
 }
@@ -573,15 +687,29 @@ recreate_gateway() {
 }
 
 create_user() {
-  local require_empty_flag=()
+  local account_action="${1:-create}"
+  local service current_id account_recovery_trap
+  local -a require_empty_flag=() reset_password_flag=()
+  local -A original_ids=()
   acquire_operator_lock
   load_environment
   validate_host_contract
+  : "${PLATFORM_ADMIN_USERNAME:?Set PLATFORM_ADMIN_USERNAME in .env.production}"
   require_idle
   validate_database_inventory
-  if [[ "${PRODUCTION_REQUIRE_EMPTY:-false}" == "true" && -z "${PRODUCTION_TARGET_USERNAME:-}" ]]; then
-    PRODUCTION_TARGET_USERNAME="${PLATFORM_ADMIN_USERNAME}"
-  fi
+  case "${account_action}" in
+    create)
+      if [[ "${PRODUCTION_REQUIRE_EMPTY:-false}" == "true" && -z "${PRODUCTION_TARGET_USERNAME:-}" ]]; then
+        PRODUCTION_TARGET_USERNAME="${PLATFORM_ADMIN_USERNAME}"
+      fi
+      ;;
+    reset-admin-password)
+      PRODUCTION_REQUIRE_EMPTY=false
+      PRODUCTION_TARGET_USERNAME="${PLATFORM_ADMIN_USERNAME}"
+      reset_password_flag+=(--reset-admin-password)
+      ;;
+    *) die "unsupported account-administration action" ;;
+  esac
   : "${PRODUCTION_TARGET_USERNAME:?Set the exact production username}"
   [[ "${PRODUCTION_TARGET_USERNAME}" =~ ^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$ ]] \
     && [[ "${PRODUCTION_TARGET_USERNAME}" != *--* ]] \
@@ -594,30 +722,78 @@ create_user() {
     || die "only the configured admin can be the initial account"
   production_network_contract validate \
     --probe-image team-workspace-backend:production
+  for service in gateway api frontend egress-proxy jupyterhub worker reconciler; do
+    original_ids["${service}"]="$(running_healthy_service_id "${service}")" \
+      || die "production service ${service} must be running and healthy before account administration"
+  done
+  compose --profile operator build native-user-admin
+  for service in gateway api frontend egress-proxy jupyterhub worker reconciler; do
+    current_id="$(running_healthy_service_id "${service}")" \
+      || die "production service ${service} changed state while preparing account administration"
+    [[ "${current_id}" == "${original_ids[${service}]}" ]] \
+      || die "production service ${service} was replaced while preparing account administration"
+  done
 
-  stop_gateway_or_die
-  restart_after_user_admin() {
-    status=$?
-    trap - EXIT
-    restart_account_control_plane_checked \
-      || echo >&2 "production: control-plane restart after account administration failed"
-    exit "${status}"
-  }
-  trap restart_after_user_admin EXIT
-  compose stop worker reconciler jupyterhub >/dev/null \
-    || die "could not stop the account-administration control plane"
+  printf -v account_recovery_trap \
+    'recover_after_user_admin_failure "$?" %q %q %q %q %q %q %q' \
+    "${account_action}" \
+    false \
+    "${original_ids[api]}" \
+    "${original_ids[jupyterhub]}" \
+    "${original_ids[reconciler]}" \
+    "${original_ids[worker]}" \
+    "${original_ids[gateway]}"
+  trap "${account_recovery_trap}" EXIT
+  stop_existing_container_checked gateway "${original_ids[gateway]}" \
+    || die "could not stop the existing public gateway"
+  require_idle
+  if ! stop_existing_container_checked api "${original_ids[api]}" \
+    || ! stop_existing_container_checked worker "${original_ids[worker]}" \
+    || ! stop_existing_container_checked reconciler "${original_ids[reconciler]}" \
+    || ! stop_existing_container_checked jupyterhub "${original_ids[jupyterhub]}"
+  then
+    die "could not stop the account-administration control plane"
+  fi
+  require_idle
+  production_database_is_idle \
+    || die "finish every lifecycle/provisioning/deletion job before account administration"
   snapshot_existing_databases \
     || die "database snapshot failed before account administration"
+  [[ "${PRODUCTION_FRESH_DATABASES}" == false && -n "${PRODUCTION_LAST_BACKUP:-}" ]] \
+    || die "account administration requires an existing verified database backup"
+  python3 scripts/domain_test_database_snapshot.py verify \
+    --bundle "${PRODUCTION_LAST_BACKUP}" >/dev/null \
+    || die "account-administration database backup verification failed"
   [[ "${PRODUCTION_REQUIRE_EMPTY:-false}" != "true" ]] || require_empty_flag+=(--require-empty)
   compose --profile operator run --rm --no-deps native-user-admin \
     --database /srv/jupyterhub/jupyterhub.sqlite \
     --username "${PRODUCTION_TARGET_USERNAME}" \
     --admin-username "${PLATFORM_ADMIN_USERNAME}" \
-    "${require_empty_flag[@]}"
-  trap - EXIT
+    "${require_empty_flag[@]}" \
+    "${reset_password_flag[@]}"
+  printf -v account_recovery_trap \
+    'recover_after_user_admin_failure "$?" %q %q %q %q %q %q %q' \
+    "${account_action}" \
+    true \
+    "${original_ids[api]}" \
+    "${original_ids[jupyterhub]}" \
+    "${original_ids[reconciler]}" \
+    "${original_ids[worker]}" \
+    "${original_ids[gateway]}"
+  trap "${account_recovery_trap}" EXIT
   restart_account_control_plane_checked \
+    "${original_ids[api]}" \
+    "${original_ids[jupyterhub]}" \
+    "${original_ids[reconciler]}" \
+    "${original_ids[worker]}" \
+    "${original_ids[gateway]}" \
     || die "control-plane restart after account administration failed"
-  echo "production account is ready: ${PRODUCTION_TARGET_USERNAME}"
+  trap - EXIT
+  if [[ "${account_action}" == reset-admin-password ]]; then
+    echo "production administrator password was reset: ${PRODUCTION_TARGET_USERNAME}"
+  else
+    echo "production account command completed: ${PRODUCTION_TARGET_USERNAME}"
+  fi
 }
 
 offline_quiesce() {
@@ -716,8 +892,9 @@ case "${1:-}" in
   logs) logs ;;
   recreate-gateway) recreate_gateway ;;
   create-user) create_user ;;
+  reset-admin-password) create_user reset-admin-password ;;
   offline-quiesce-dry-run) offline_quiesce dry-run ;;
   offline-quiesce) offline_quiesce apply ;;
   restore) restore ;;
-  *) die "usage: scripts/production.sh preflight|up|down|ps|logs|recreate-gateway|create-user|offline-quiesce-dry-run|offline-quiesce|restore" ;;
+  *) die "usage: scripts/production.sh preflight|up|down|ps|logs|recreate-gateway|create-user|reset-admin-password|offline-quiesce-dry-run|offline-quiesce|restore" ;;
 esac

@@ -1,4 +1,4 @@
-.PHONY: init-local production-init production-preflight production-up production-down production-ps production-logs production-recreate-gateway production-bootstrap-admin production-create-user production-offline-quiesce-dry-run production-offline-quiesce production-restore legacy-host-network-create legacy-host-firewall-apply build up down logs ps list-users provision-user profile-matrix-check profile-image-check profile-deploy domain-test-tls domain-test-preflight domain-test-up domain-test-down domain-test-restore test-backend test-infra test-gateway test-frontend test config
+.PHONY: init-local production-init production-preflight production-up production-down production-ps production-logs production-recreate-gateway production-bootstrap-admin production-create-user production-reset-admin-password production-offline-quiesce-dry-run production-offline-quiesce production-restore legacy-host-network-create legacy-host-firewall-apply build up down logs ps list-users provision-user profile-matrix-check profile-image-check profile-deploy domain-test-tls domain-test-preflight domain-test-up domain-test-down domain-test-restore test-backend test-infra test-gateway test-frontend test config
 
 LOCAL_PROJECT_ID_START ?= 10000
 # Comma-separated usernames for domain-test checks. Keep defaults minimal so
@@ -35,6 +35,9 @@ production-bootstrap-admin:
 production-create-user:
 	@test -n "$(USERNAME)" || (echo "USERNAME is required" >&2; exit 2)
 	PRODUCTION_TARGET_USERNAME="$(USERNAME)" PRODUCTION_REQUIRE_EMPTY=false bash scripts/production.sh create-user
+
+production-reset-admin-password:
+	bash scripts/production.sh reset-admin-password
 
 production-offline-quiesce-dry-run:
 	bash scripts/production.sh offline-quiesce-dry-run
