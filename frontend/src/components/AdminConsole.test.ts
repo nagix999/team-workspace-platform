@@ -5,6 +5,7 @@ import type { Operation, OperationStatus } from "../api/types";
 import {
   AdminOperationSummary,
   adminOperationNeedsPolling,
+  adminWorkspaceLifecycleControls,
   adminWorkspaceOperationNeedsPolling,
   availableResourceSelection,
 } from "./AdminConsole";
@@ -81,5 +82,37 @@ describe("AdminConsole operation polling", () => {
       2000,
     ]);
     expect(availableResourceSelection([500], [1000])).toEqual([]);
+  });
+
+  it.each(["NOT_FOUND", "STOPPED", "FAILED"] as const)(
+    "lets an administrator stop stale RUNNING intent observed as %s",
+    (observedState) => {
+      expect(adminWorkspaceLifecycleControls({
+        desiredState: "RUNNING",
+        observedState,
+        stale: true,
+      }, {
+        busy: false,
+        operationPending: false,
+        deletionPending: false,
+      })).toMatchObject({
+        running: false,
+        canStart: false,
+        canStop: true,
+        lifecycleBusy: false,
+      });
+    },
+  );
+
+  it("keeps an intent-recovery stop locked while another operation is pending", () => {
+    expect(adminWorkspaceLifecycleControls({
+      desiredState: "RUNNING",
+      observedState: "STOPPED",
+      stale: true,
+    }, {
+      busy: false,
+      operationPending: true,
+      deletionPending: false,
+    }).lifecycleBusy).toBe(true);
   });
 });

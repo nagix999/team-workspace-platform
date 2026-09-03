@@ -5,7 +5,7 @@
 Compose를 결합해 소규모 팀이 하나의 Linux 호스트에서 개발환경을 일관되게 제공하는 것을
 목표로 합니다.
 
-> **현재 상태: v0.1.1 Technical Preview**
+> **현재 상태: v0.1.2 Technical Preview**
 >
 > 로컬 통합환경과 `cyberailabs.team` 단일 호스트 운영 구성을 함께 제공합니다. 운영 구성도
 > 조직의 TLS 인증서, 접근 CIDR, VIP/NAT와 백업 책임을 대신하지 않으므로 실제 공개 전에는
@@ -362,6 +362,8 @@ make domain-test-down
 [운영 서버 전체 배포 가이드](docs/operations/production-deployment-ko.md)를 기준으로 합니다.
 기존 `10.155.1.24` 운영 서버에서 새 Git release를 적용할 때는
 [Git 업데이트 후 운영 적용 절차](docs/operations/production-update-after-git-ko.md)를 사용합니다.
+운영 container만 모두 삭제되어 DB의 실행 의도가 남은 경우도 같은 문서의 offline quiesce
+복구 절차를 따르며, DB나 workspace volume을 직접 수정하거나 삭제하지 않습니다.
 
 운영 URL은 다음으로 고정합니다.
 
@@ -503,6 +505,8 @@ stack입니다. 운영 공개 전 최소한 다음 항목을 실제 조직 환�
 
 `v0.1.0`은 단일 호스트 로컬 통합과 핵심 관리 기능을 검증한 첫 공개 preview이고,
 `v0.1.1`은 `cyberailabs.team` 운영 배포 계약과 안전한 Git 업데이트 절차를 추가합니다.
+`v0.1.2`는 운영 container가 모두 사라진 경우를 위한 백업·감사 기반 offline 복구,
+실행 의도 불일치 상태의 UI 복구 동작과 검증된 SQLite runtime을 추가합니다.
 `0.x` 기간에는 API, migration과 운영 절차가 호환성 없이 변경될 수 있습니다. runtime profile
 같은 실행 정책은 기존 row를 직접 수정하지 않고 새 version으로 추가하는 원칙을 유지합니다.
 

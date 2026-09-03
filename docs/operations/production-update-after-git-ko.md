@@ -207,3 +207,76 @@ make production-up
 
 로그나 장애 티켓에 `.env.production`, secret, TLS 개인키, 환경변수 값, OAuth query를 첨부하지
 않는다.
+
+## 8. 모든 container를 이미 삭제한 경우
+
+운영자가 production Compose container와 single-user container를 모두 수동 삭제했지만 Docker
+volume은 남아 있는 경우에는 일반 `production-up`을 바로 반복하지 않는다. DB에
+`desired=RUNNING`, `observed=STOPPED` 같은 실행 의도가 남아 있으면 idle gate가 배포를 막는 것이
+정상이다. 이 절차는 **container만 전부 없어졌다는 사실을 확인한 비상 복구 전용**이며 평상시
+workspace 중지 수단이 아니다.
+
+먼저 volume을 삭제하지 말고 이름과 존재 여부를 확인한다.
+
+```bash
+docker volume inspect \
+  team-workspace-production_platform_data \
+  team-workspace-production_jupyterhub_data
+```
+
+`.env.production`에서 `PRODUCTION_COMPOSE_PROJECT_NAME`을 바꿨다면 위 이름의
+`team-workspace-production` 부분도 그 값으로 바꾼다. private workspace와 `jupyter-shared`
+volume 역시 그대로 둔다. 두 DB volume 중 하나만 없거나, `docker ps -a`에 production/static 또는
+single-user container가 하나라도 남아 있으면 아래 명령을 실행하지 말고 상태를 먼저 조사한다.
+복구 명령은 container를 대신 삭제하지 않고 fail closed한다.
+
+변경 대상만 읽는 dry-run을 실행한다.
+
+```bash
+make production-offline-quiesce-dry-run
+```
+
+출력된 workspace ID와 대상 개수를 운영 장애 기록에 남긴다. 예를 들어 정확히 1개가 대상이면
+그 개수를 명시해 적용한다.
+
+```bash
+make production-offline-quiesce EXPECTED_COUNT=1
+```
+
+적용 명령은 다음 순서를 자동으로 강제한다.
+
+1. 다른 production 작업과 겹치지 않도록 nonblocking operator lock을 획득한다.
+2. production Compose container와 모든 `platform.kind=jupyter-singleuser` container가 실행/중지
+   상태를 막론하고 0개인지 확인한다.
+3. Platform/Hub DB volume이 정확히 한 쌍이며, 이름이나 label과 무관하게 두 DB volume을
+   mount한 container도 0개인지 확인한다.
+4. 두 SQLite DB를 online-backup API로 복제하고 manifest와 digest가 있는 하나의 finalized backup
+   bundle로 검증한다.
+5. application-aware maintenance CLI를 다시 dry-run한다.
+6. container 부재를 다시 확인하고 dry-run 대상 수가 `EXPECTED_COUNT`와 정확히 같을 때만 하나의
+   DB transaction으로 실행 의도를 중지 상태로 수렴시킨다.
+7. 배포 idle gate가 통과하는지 새 snapshot으로 확인한다.
+
+운영자는 raw SQL을 실행하지 않으며 maintenance CLI만 검증된 단일 transaction으로 DB를
+변경한다. CLI는 대상 workspace의 private/shared volume을 mount하거나 삭제하지 않는다. 적용
+결과와 함께 출력되는 `production database backup` 절대 경로를 보존한다.
+예상 개수가 다르면 transaction은 적용되지 않으므로 새 dry-run 결과를 조사한 뒤 운영자가 개수를
+다시 승인해야 한다.
+
+성공한 뒤에만 정상 배포 절차로 돌아간다.
+
+```bash
+make production-preflight
+make production-up
+make production-ps
+```
+
+복구 적용 뒤 검증이 실패하면 `production-up`을 반복하기 전에 출력된 backup과 감사 이벤트를
+확인한다. 검증된 backup으로 되돌려야 할 때만 다음을 사용한다.
+
+```bash
+make production-restore BACKUP=/absolute/path/to/production-backup-bundle
+```
+
+이 상황에서도 `docker compose down -v`, `docker volume prune`, raw `sqlite3 UPDATE`는 사용하지
+않는다.

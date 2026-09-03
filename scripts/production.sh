@@ -13,6 +13,7 @@ readonly candidate_policy_file="${project_dir}/.runtime/production/profiles.cand
 readonly template_file="${project_dir}/infra/jupyterhub/profiles.local-dev.json"
 readonly production_runtime_dir="${project_dir}/.runtime/production"
 readonly backup_parent="${project_dir}/.runtime/production/backups"
+readonly operator_lock_file="${project_dir}/.runtime/production/operator.lock"
 
 die() { echo >&2 "production: $*"; exit 1; }
 
@@ -37,6 +38,14 @@ load_environment() {
 
 compose() {
   docker compose --env-file "${env_file}" -f "${compose_file}" "$@"
+}
+
+acquire_operator_lock() {
+  mkdir -p -- "${production_runtime_dir}"
+  command -v flock >/dev/null || die "flock is required for production operations"
+  exec {production_operator_lock_fd}>"${operator_lock_file}"
+  flock -n "${production_operator_lock_fd}" \
+    || die "another production operation is already running"
 }
 
 require_regular_file() {
@@ -88,6 +97,35 @@ require_idle() {
     echo >&2 "${foreign}"
     die "another Compose stack is running; stop the local/domain-test stack before production deployment"
   }
+}
+
+require_offline_recovery_state() {
+  local production_containers singleuser_containers volume_name volume_users
+  production_containers="$(docker ps --all \
+    --filter "label=com.docker.compose.project=${PRODUCTION_COMPOSE_PROJECT_NAME}" \
+    --format '{{.ID}} {{.Names}}')"
+  singleuser_containers="$(docker ps --all \
+    --filter label=platform.kind=jupyter-singleuser \
+    --format '{{.ID}} {{.Names}}')"
+  if [[ -n "${production_containers}" ]]; then
+    echo >&2 "${production_containers}"
+    die "offline recovery requires every production Compose container to be absent"
+  fi
+  if [[ -n "${singleuser_containers}" ]]; then
+    echo >&2 "${singleuser_containers}"
+    die "offline recovery requires every single-user container to be absent"
+  fi
+  [[ "$(database_volume_count)" == 2 ]] \
+    || die "offline recovery requires the exact Platform and JupyterHub database volume pair"
+  while read -r volume_name; do
+    volume_users="$(docker ps --all \
+      --filter "volume=${volume_name}" \
+      --format '{{.ID}} {{.Names}}')"
+    if [[ -n "${volume_users}" ]]; then
+      echo >&2 "${volume_users}"
+      die "offline recovery requires no container to mount database volume ${volume_name}"
+    fi
+  done < <(database_volume_names)
 }
 
 prepare_images_and_policy() {
@@ -227,7 +265,7 @@ image_identity() {
   printf '%s\n' "${identity}"
 }
 
-preflight() {
+preflight_impl() {
   load_environment
   validate_host_contract
   require_idle
@@ -238,9 +276,15 @@ preflight() {
   echo "production preflight passed"
 }
 
+preflight() {
+  acquire_operator_lock
+  preflight_impl
+}
+
 start() {
   local policy_existed_before=false
-  preflight
+  acquire_operator_lock
+  preflight_impl
   [[ ! -e "${policy_file}" ]] || policy_existed_before=true
   mapfile -t old_running < <(compose ps --status running -q)
   compose stop gateway worker reconciler api jupyterhub frontend egress-proxy >/dev/null || true
@@ -294,6 +338,7 @@ start() {
 }
 
 stop() {
+  acquire_operator_lock
   load_environment
   require_idle
   compose down
@@ -301,6 +346,7 @@ stop() {
 
 create_user() {
   local require_empty_flag=()
+  acquire_operator_lock
   load_environment
   validate_host_contract
   require_idle
@@ -341,8 +387,56 @@ create_user() {
   echo "production account is ready: ${PRODUCTION_TARGET_USERNAME}"
 }
 
+offline_quiesce() {
+  local mode="$1" bundle_basename
+  acquire_operator_lock
+  load_environment
+  [[ "${mode}" == "dry-run" || "${mode}" == "apply" ]] \
+    || die "offline quiesce mode must be dry-run or apply"
+  if [[ "${mode}" == "apply" ]]; then
+    : "${PRODUCTION_EXPECTED_COUNT:?Set EXPECTED_COUNT to the exact dry-run count}"
+    [[ "${PRODUCTION_EXPECTED_COUNT}" =~ ^[1-9][0-9]*$ ]] \
+      || die "EXPECTED_COUNT must be a positive integer"
+  fi
+
+  require_offline_recovery_state
+  compose --profile operator build offline-maintenance
+  require_offline_recovery_state
+
+  if [[ "${mode}" == "dry-run" ]]; then
+    compose --profile operator run --rm --no-deps offline-maintenance \
+      quiesce-stopped-intent
+    echo "production offline quiesce dry-run completed; no database row was changed"
+    return 0
+  fi
+
+  snapshot_existing_databases
+  [[ "${PRODUCTION_FRESH_DATABASES}" == false && -n "${PRODUCTION_LAST_BACKUP:-}" ]] \
+    || die "offline recovery did not produce a database backup"
+  python3 scripts/domain_test_database_snapshot.py verify \
+    --bundle "${PRODUCTION_LAST_BACKUP}" >/dev/null
+  bundle_basename="$(basename -- "${PRODUCTION_LAST_BACKUP}")"
+
+  compose --profile operator run --rm --no-deps offline-maintenance \
+    quiesce-stopped-intent
+  require_offline_recovery_state
+  if ! compose --profile operator run --rm --no-deps offline-maintenance \
+    quiesce-stopped-intent \
+    --apply \
+    --expected-count "${PRODUCTION_EXPECTED_COUNT}" \
+    --backup-bundle-id "${bundle_basename}"
+  then
+    die "offline quiesce failed; inspect the transaction and preserve backup ${PRODUCTION_LAST_BACKUP}"
+  fi
+  production_database_is_idle \
+    || die "offline quiesce did not reach an idle database; preserve backup ${PRODUCTION_LAST_BACKUP}"
+  echo "production offline quiesce completed; database backup: ${PRODUCTION_LAST_BACKUP}"
+  echo "run make production-preflight and make production-up next"
+}
+
 restore() {
   local platform_identity hub_identity
+  acquire_operator_lock
   load_environment
   : "${PRODUCTION_BACKUP_DIR:?Set PRODUCTION_BACKUP_DIR to a verified backup bundle}"
   require_idle
@@ -385,6 +479,8 @@ case "${1:-}" in
   down) stop ;;
   ps) load_environment; compose ps ;;
   create-user) create_user ;;
+  offline-quiesce-dry-run) offline_quiesce dry-run ;;
+  offline-quiesce) offline_quiesce apply ;;
   restore) restore ;;
-  *) die "usage: scripts/production.sh preflight|up|down|ps|create-user|restore" ;;
+  *) die "usage: scripts/production.sh preflight|up|down|ps|create-user|offline-quiesce-dry-run|offline-quiesce|restore" ;;
 esac

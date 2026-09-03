@@ -153,6 +153,8 @@ class DomainTestComposeContractTests(unittest.TestCase):
                 "compose",
                 "-f",
                 "compose.production.yaml",
+                "--profile",
+                "operator",
                 "config",
                 "--format",
                 "json",
@@ -200,6 +202,24 @@ class DomainTestComposeContractTests(unittest.TestCase):
             name for name, service in config["services"].items() if service.get("ports")
         }
         self.assertEqual(published_services, {"gateway"})
+
+        maintenance = config["services"]["offline-maintenance"]
+        self.assertEqual(maintenance["profiles"], ["operator"])
+        self.assertEqual(
+            maintenance["entrypoint"], ["python", "-m", "app.offline_maintenance"]
+        )
+        self.assertEqual(maintenance["command"], ["quiesce-stopped-intent"])
+        self.assertEqual(maintenance["network_mode"], "none")
+        self.assertNotIn("ports", maintenance)
+        self.assertTrue(maintenance["read_only"])
+        self.assertEqual(maintenance["cap_drop"], ["ALL"])
+        self.assertEqual(
+            {
+                (mount["target"], mount.get("read_only", False))
+                for mount in maintenance["volumes"]
+            },
+            {("/var/lib/platform", False)},
+        )
 
 
 class ProductionTransitionContractTests(unittest.TestCase):
@@ -251,6 +271,69 @@ class ProductionTransitionContractTests(unittest.TestCase):
         self.assertIn("image_identity team-workspace-backend:production", script)
         self.assertIn("image_identity team-workspace-jupyterhub:production", script)
         self.assertNotIn("platform.db:999:999", script)
+
+    def test_offline_quiesce_is_backed_up_counted_and_fail_closed(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        body = script.split("offline_quiesce() {", 1)[1].split("\nrestore() {", 1)[0]
+
+        self.assertIn("PRODUCTION_EXPECTED_COUNT", body)
+        self.assertIn("snapshot_existing_databases", body)
+        self.assertIn("domain_test_database_snapshot.py verify", body)
+        self.assertIn("--backup-bundle-id", body)
+        self.assertIn("--expected-count", body)
+        self.assertIn("production_database_is_idle", body)
+        self.assertGreaterEqual(body.count("require_offline_recovery_state"), 3)
+        self.assertLess(
+            body.index("snapshot_existing_databases"),
+            body.index("--apply"),
+        )
+        self.assertLess(
+            body.rindex("require_offline_recovery_state"),
+            body.index("--apply"),
+        )
+        self.assertNotIn("docker rm", body)
+        self.assertNotIn("docker volume rm", body)
+
+    def test_offline_quiesce_requires_absent_containers_and_exact_db_pair(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        body = script.split("require_offline_recovery_state() {", 1)[1].split(
+            "\nprepare_images_and_policy() {", 1
+        )[0]
+
+        self.assertIn("docker ps --all", body)
+        self.assertIn(
+            "com.docker.compose.project=${PRODUCTION_COMPOSE_PROJECT_NAME}", body
+        )
+        self.assertIn("label=platform.kind=jupyter-singleuser", body)
+        self.assertIn('"$(database_volume_count)" == 2', body)
+        self.assertIn('--filter "volume=${volume_name}"', body)
+        self.assertIn("no container to mount database volume", body)
+
+    def test_mutating_production_commands_share_an_operator_lock(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        self.assertIn("flock -n", script)
+        preflight_body = script.split("preflight() {", 1)[1].split(
+            "\nstart() {", 1
+        )[0]
+        self.assertIn("acquire_operator_lock", preflight_body)
+        self.assertIn("preflight_impl", preflight_body)
+        for start_marker, end_marker in (
+            ("start() {", "\nstop() {"),
+            ("stop() {", "\ncreate_user() {"),
+            ("create_user() {", "\noffline_quiesce() {"),
+            ("offline_quiesce() {", "\nrestore() {"),
+            ("restore() {", '\ncase "${1:-}" in'),
+        ):
+            body = script.split(start_marker, 1)[1].split(end_marker, 1)[0]
+            self.assertIn("acquire_operator_lock", body)
+
+    def test_make_requires_explicit_offline_quiesce_count(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        target = makefile.split("production-offline-quiesce:", 1)[1].split(
+            "\nproduction-restore:", 1
+        )[0]
+        self.assertIn('test -n "$(EXPECTED_COUNT)"', target)
+        self.assertIn('PRODUCTION_EXPECTED_COUNT="$(EXPECTED_COUNT)"', target)
 
 
 class NginxContractTests(unittest.TestCase):

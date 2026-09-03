@@ -56,6 +56,27 @@ export function availableResourceSelection(
   return selected.filter((value) => allowed.has(value));
 }
 
+export function adminWorkspaceLifecycleControls(
+  workspace: Pick<Workspace, "desiredState" | "observedState" | "stale">,
+  locks: { busy: boolean; operationPending: boolean; deletionPending: boolean },
+) {
+  const lifecycleAvailable = workspace.desiredState !== "DELETED";
+  const intentRecoveryStop = lifecycleAvailable &&
+    workspace.desiredState === "RUNNING" &&
+    ["NOT_FOUND", "STOPPED", "FAILED"].includes(workspace.observedState);
+  return {
+    running: lifecycleAvailable && workspace.observedState === "RUNNING" && !workspace.stale,
+    canStart: lifecycleAvailable && workspace.desiredState !== "RUNNING" &&
+      ["NOT_FOUND", "STOPPED", "FAILED"].includes(workspace.observedState),
+    canStop: lifecycleAvailable && (
+      intentRecoveryStop || ["STARTING", "RUNNING", "UNKNOWN"].includes(workspace.observedState)
+    ),
+    lifecycleBusy: locks.busy || locks.operationPending || locks.deletionPending || (
+      workspace.stale && !intentRecoveryStop
+    ),
+  };
+}
+
 function adminOperationTypeLabel(operationType: string): string {
   const labels: Record<string, string> = {
     CREATE: "생성",
@@ -615,11 +636,12 @@ export function AdminConsole({
                     workspace.canRetryDelete && (
                       workspace.deletionStatus === "FAILED" || workspace.lastErrorCode === "AUTH_REQUIRED"
                     );
-                  const lifecycleAvailable = workspace.desiredState !== "DELETED";
-                  const running = lifecycleAvailable && workspace.observedState === "RUNNING" && !workspace.stale;
-                  const canStart = lifecycleAvailable && ["NOT_FOUND", "STOPPED", "FAILED"].includes(workspace.observedState);
-                  const canStop = lifecycleAvailable && ["STARTING", "RUNNING", "UNKNOWN"].includes(workspace.observedState);
-                  const lifecycleBusy = busy || operationPending || deletionPending || workspace.stale;
+                  const { running, canStart, canStop, lifecycleBusy } =
+                    adminWorkspaceLifecycleControls(workspace, {
+                      busy,
+                      operationPending,
+                      deletionPending,
+                    });
                   return (
                     <tr key={workspace.id}>
                       <td>
