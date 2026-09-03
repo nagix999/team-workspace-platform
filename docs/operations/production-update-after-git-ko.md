@@ -1,6 +1,6 @@
-# 10.155.1.24 운영 서버 Git 업데이트 절차
+# 운영 서버 Git 업데이트 절차
 
-이 문서는 이미 초기 설치가 끝난 `10.155.1.24` 단일 운영 서버에서 검토된 새 release를
+이 문서는 이미 초기 설치가 끝난 `<INTERNAL_SERVER_IP>` 단일 운영 서버에서 검토된 새 release를
 적용하는 절차다. DNS, VIP, 인증서, `.env.production`, secret과 Docker volume은 기존 값을
 보존한다. 처음 설치하는 서버라면 먼저
 [운영 서버 전체 배포 가이드](production-deployment-ko.md)를 따른다.
@@ -63,7 +63,7 @@ git diff --stat ORIG_HEAD HEAD
 git diff ORIG_HEAD HEAD -- \
   .env.production.example compose.production.yaml compose.production.docker27.yaml \
   scripts/init-production.sh scripts/production.sh scripts/validate_production_network.py \
-  backend/alembic infra/jupyterhub gateway
+  backend/alembic infra/host infra/jupyterhub infra/singleuser gateway
 ```
 
 배포 tag에는 최소한 `compose.production.yaml`, `compose.production.docker27.yaml`,
@@ -88,9 +88,11 @@ diff -u .env.production.example .env.production || true
 
 다음 값은 운영 계약과 일치해야 한다.
 
-- `PLATFORM_GATEWAY_BIND_IP=10.155.1.24`
+- `PLATFORM_GATEWAY_BIND_IP=<INTERNAL_SERVER_IP>`
 - TLS 인증서/개인키와 ingress CIDR 파일의 절대 경로
 - host 용량에 맞는 CPU/RAM hard ceiling
+- `PLATFORM_GPU_RUNTIME_CONFIG_FILE`: CPU-only면 `disabled`, GPU 사용 시 Git 밖의 검증된
+  절대경로
 - `PLATFORM_ADMIN_USERNAME`
 - Docker socket, secret, TLS 파일의 숫자 GID
 
@@ -112,8 +114,8 @@ set을 자동 선택한다. Base의 isolated 정의를 유지하면 기존 Engin
 option은 제자리에서 바꿀 수 없으므로 운영 Compose를 수동 주석 처리하거나 실행 중
 network를 삭제하지 않는다. 모든 운영 조작은 `make production-*`를 사용한다.
 
-`PLATFORM_PUBLIC_VIP` 설정은 필요하지 않다. 공인 `123.214.65.254:443`에서
-`10.155.1.24:3030`으로의 전달은 방화벽/VIP 장비의 L4 NAT 계약이며 애플리케이션은 공인 VIP를
+`PLATFORM_PUBLIC_VIP` 설정은 필요하지 않다. 공인 `<PUBLIC_VIP>:443`에서
+`<INTERNAL_SERVER_IP>:3030`으로의 전달은 방화벽/VIP 장비의 L4 NAT 계약이며 애플리케이션은 공인 VIP를
 bind하거나 라우팅 판단에 사용하지 않는다. 예전 `.env.production`에 해당 key가 남아 있다면
 혼동을 피하려고 제거한다.
 
@@ -129,8 +131,41 @@ stat -c '%a %u:%g %n' \
   /etc/team-workspace/tls/fullchain.pem \
   /etc/team-workspace/tls/privkey.pem \
   /etc/team-workspace/ingress-cidrs.txt
-ip -4 -o address show | grep -F '10.155.1.24/'
+ip -4 -o address show | grep -F '<INTERNAL_SERVER_IP>/'
 ```
+
+### 3.1 GPU 지원이 추가된 release로 올릴 때
+
+GPU는 upgrade의 필수 조건이 아니다. 기존 host에 GPU runtime을 아직 준비하지 않았다면 새 key를
+다음과 같이 추가한 채 CPU-only로 먼저 배포한다. 일반 Python 3.12/3.13 kernel은 이 상태에서
+계속 CPU 전용이다.
+
+```dotenv
+PLATFORM_GPU_RUNTIME_CONFIG_FILE=disabled
+```
+
+GPU를 함께 활성화하려면 [전체 배포 가이드의 NVIDIA GPU 절차](production-deployment-ko.md#81-선택-nvidia-gpu-runtime-활성화)를
+먼저 완료한다. 즉 host driver 설치와 reboot, NVIDIA Container Toolkit/Docker runtime 구성,
+정확한 물리 GPU UUID 하나를 담은 외부 policy 파일 생성까지 끝낸 다음 그 파일의 절대경로를
+설정한다. `nvidia-smi: command not found`인 상태에서 환경변수만 켜서는 안 된다.
+
+```bash
+nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader,nounits
+nvidia-ctk --version
+docker info --format '{{json .Runtimes}}'
+```
+
+기존 schema-v2 CPU profile은 원래 digest/image ID를 유지한 재시작 전용 history로 보존되고 새
+schema-v3 CPU profile이 선택 항목이 된다. GPU를 활성화하면 별도 Python 3.12/PyTorch CUDA
+image와 GPU profile도 추가된다. 기존 DB의 자원 정책은 안전하게 GPU budget 0으로 migration될
+수 있으므로 배포 후 관리자 **자원·커널 정책**에서 GPU 1개 선택을 명시적으로 활성화한다. 새
+DB는 검증된 host GPU가 있으면 초기 catalog에 CPU 0/GPU 1 선택을 함께 만든다.
+
+이미 이전 release에서 GPU를 사용했다면 `/etc/team-workspace/gpu-runtime.json` 같은 외부 policy와
+그 exact UUID를 계속 보존한다. Enabled GPU history가 있는데 새 release에서 설정을
+`disabled`로 바꾸면 preflight가 중단되는 것이 정상이다. 기존 GPU workspace를 재시작할 수 없는
+상태로 조용히 전환하지 않기 위한 보호다. GPU 폐기는 profile history와 workspace를 함께 다루는
+별도 검토 절차 없이 수행하지 않는다.
 
 ## 4. 사전검사와 실제 배포
 
@@ -139,6 +174,9 @@ make production-preflight
 ```
 
 이 단계는 host/TLS/CIDR, Docker volume 쌍, single-user image 계약, Compose/Nginx 설정을 검사한다.
+GPU가 활성화돼 있으면 별도 CUDA image를 빌드하고 정확한 UUID 하나를 주입해 driver/toolkit,
+PyTorch CUDA build와 실제 tensor 실행을 DB 변경 전에 검사한다. 첫 CUDA image build는 크고
+`download.pytorch.org` 접근이 필요해 CPU-only preflight보다 오래 걸릴 수 있다.
 기존 DB가 있으면 SQLite online snapshot을 이용해 다음 상태가 전부 비어 있는지도 확인한다.
 
 - 실행 중 workspace 또는 single-user container
@@ -171,18 +209,20 @@ make production-logs
 - `api`, `jupyterhub`, `reconciler`, `frontend`, `egress-proxy`, `gateway`가 healthy
 - `worker`가 healthy (PID 1 operation-worker liveness 검사)
 - `migrate`, `bootstrap-profile`, `singleuser-image`가 exit code 0
+- GPU 사용 시 `team-workspace-singleuser-cuda:production-current` image가 존재하고 preflight의
+  CUDA runtime report가 `status=passed`였음(CUDA image는 장기 실행 Compose service가 아님)
 - Gateway 이외의 host published port가 없음
-- Gateway가 정확히 `10.155.1.24:3030`을 publish
+- Gateway가 정확히 `<INTERNAL_SERVER_IP>:3030`을 publish
 - 반복 restart, migration error, profile digest error, OAuth/RBAC error가 없음
 
 서버 내부에서 Gateway까지 확인한다.
 
 ```bash
 curl --fail --silent --show-error \
-  --connect-to platform.cyberailabs.team:443:10.155.1.24:3030 \
+  --connect-to platform.cyberailabs.team:443:<INTERNAL_SERVER_IP>:3030 \
   https://platform.cyberailabs.team/healthz
 curl --fail --silent --show-error \
-  --connect-to cyberailabs.team:443:10.155.1.24:3030 \
+  --connect-to cyberailabs.team:443:<INTERNAL_SERVER_IP>:3030 \
   https://cyberailabs.team/healthz
 ```
 
@@ -202,15 +242,30 @@ ip -6 -o address show scope global dev "${bridge_name}"
 한다. 실제 workspace에서도
 host·사내망·metadata·direct IP/DNS egress가 실패하고 승인 proxy만 성공하는지 확인한다.
 
+`v0.1.6` 최초 적용에는 schema migration과 동적 정책용 volume/mount를 포함한 stack 재생성이
+필요하다. 이후 관리자 **내부 서비스 통신** 정책을 사용하는 배포에서는 규칙 CRUD나 적용
+재시도만으로 Squid가 무중단 reconfigure되며, 기존 desired/applied revision과 규칙을
+업데이트 전 기록한다. 업데이트 후 두 revision이 일치하는지, exact `/32 + TCP port` 요청만
+proxy를 통해 성공하는지, 같은 IP의 다른 port와 다른 사설 IP 및 direct 요청은 실패하는지
+확인한다. 운영 IP는 repository의 domain allowlist나 `.env`로 옮기지 않는다.
+
 그다음 실제 허용된 사내 PC에서 다음 smoke test를 수행한다.
 
 1. 포털 로그인과 명시적 로그아웃 후 재인증
-2. 관리자 메뉴, capacity와 감사 이벤트 조회
-3. 기존 중지 workspace 하나 시작
-4. JupyterLab, kernel, terminal, WebSocket 확인
-5. private `/home/jovyan/work`와 shared `/home/jovyan/shared` 확인
-6. 일반/secret 환경변수 변경 후 restart 안내와 재시작 적용 확인
-7. workspace 중지 및 테스트용 workspace 삭제 수렴 확인
+2. 로그인 완료 후 Hub의 exact `/hub/spawn` fallback이 포털 root로 `303` 응답하고 최종 화면이
+   `https://platform.cyberailabs.team/`인지 확인
+3. 포털의 **비밀번호 변경** 버튼이 exact Hub `/hub/change-password` self-service 화면으로
+   연결되고, 비밀번호 본문을 Platform API가 받지 않는지 확인
+4. 관리자 메뉴, capacity와 감사 이벤트 조회
+5. 기존 중지 workspace 하나 시작
+6. JupyterLab, kernel, terminal, WebSocket 확인
+7. 관리자 유휴 커널 정책 확인과 재시작한 테스트 환경의 idle/busy kernel 동작 확인
+8. private `/home/jovyan/work`와 shared `/home/jovyan/shared` 확인
+9. 일반/secret 환경변수 변경 후 restart 안내와 재시작 적용 확인
+10. workspace 중지 및 테스트용 workspace 삭제 수렴 확인
+11. GPU 사용 시 `python312-cuda` 환경에서 PyTorch `2.7.1+cu126`, CUDA 12.6,
+   `torch.cuda.is_available()`, device 수 1과 CUDA tensor 연산 확인; 동시 두 번째 GPU 환경은
+   첫 환경이 멈출 때까지 admission 거부 확인
 
 ## 6. 운영 계정 관리
 
@@ -271,6 +326,11 @@ DB migration/profile import 이후 실패하면 같은 명령을 무작정 반�
 `production database backup` 경로와 `restore with` 안내를 보존하고, 실패 시점과 DB revision을
 검토한 뒤 필요할 때만 복원한다.
 
+GPU preflight가 `nvidia-smi`, toolkit version, Docker `nvidia` runtime, GPU UUID 또는 CUDA tensor
+오류로 실패했다면 DB mutation 전 중단된 것이다. profile JSON이나 Compose를 우회 수정하지 말고
+host driver/toolkit과 외부 GPU policy의 실제 값을 맞춘 뒤 preflight를 다시 실행한다. GPU를 이미
+운영해 enabled GPU history가 있는 경우에는 설정을 `disabled`로 바꿔 오류를 숨길 수 없다.
+
 ```bash
 make production-restore BACKUP=/absolute/path/to/verified-backup-bundle
 make production-up
@@ -278,6 +338,10 @@ make production-up
 
 이 복원 명령은 Platform/Hub DB만 복원한다. secret, profile policy, private/shared volume까지
 영향을 받은 장애라면 같은 backup 세대의 자료를 함께 복원해야 한다.
+
+GPU schema/profile이 반영된 뒤 구버전 code만 checkout하는 rollback은 지원하지 않는다. 구버전으로
+돌아가야 한다면 upgrade 직전 backup의 두 DB와 동일 세대의
+`.runtime/production/profiles.json`을 함께 복원하고, GPU workspace volume은 삭제하지 않는다.
 
 로그나 장애 티켓에 `.env.production`, secret, TLS 개인키, 환경변수 값, OAuth query를 첨부하지
 않는다.

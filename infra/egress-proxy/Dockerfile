@@ -13,6 +13,20 @@ RUN image="${SQUID_BASE_IMAGE}"; digest="${image##*@sha256:}"; \
     esac
 
 COPY squid.conf /etc/squid/squid.conf
+COPY internal-services.bootstrap.txt /etc/squid/egress-internal-services.txt
+COPY immutable-platform-networks.txt /etc/squid/immutable-platform-networks.txt
+COPY render-internal-services.awk /usr/local/lib/platform/render-internal-services.awk
+COPY platform-squid-entrypoint /usr/local/bin/platform-squid-entrypoint
+COPY init-policy-volume /usr/local/bin/init-policy-volume
+
+RUN chmod 0555 /usr/local/bin/platform-squid-entrypoint && \
+    chmod 0555 /usr/local/bin/init-policy-volume && \
+    chmod 0444 /usr/local/lib/platform/render-internal-services.awk && \
+    chmod 0444 /etc/squid/egress-internal-services.txt \
+        /etc/squid/immutable-platform-networks.txt
+
+ENTRYPOINT ["/usr/local/bin/platform-squid-entrypoint"]
+CMD ["-f", "/etc/squid/squid.conf", "-NYC"]
 
 EXPOSE 3128
 

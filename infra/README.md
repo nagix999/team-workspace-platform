@@ -35,11 +35,81 @@ secret과 명시적인 network/storage policy mode를 확정해야 Hub가 시작
   이 문서의 kernel은 Jupyter kernelspec 의미이며 container가 공유하는 host Linux
   kernel version 선택을 의미하지 않는다. default kernelspec의 digest-bound executable
   directory는 terminal `PATH`의 첫 항목에도 고정한다.
-- profile policy schema v2는 `enabled`(기존 workspace 실행 허용)와 `selectable`(신규
-  catalog 노출)을 분리한다. `python_version`, kernelspec별 `name`, `display_name`,
+- profile policy schema v2부터 `enabled`(기존 workspace 실행 허용)와 `selectable`(신규
+  catalog 노출)을 분리하고, production schema v3는 CPU 또는 NVIDIA accelerator 계약을
+  명시한다. `python_version`, kernelspec별 `name`, `display_name`,
   `language`, `python_version`, `executable`, `default_kernel`, CPU/RAM/disk 및
-  `private_disk_quota_enforced`는 immutable config digest에 포함된다. legacy schema v1
-  실행값과 digest는 변경하지 않으며 v2 문서에서 legacy row는 selectable일 수 없다.
+  `private_disk_quota_enforced`와 accelerator metadata는 immutable config digest에 포함된다.
+  legacy schema v1/v2 실행값과 digest는 변경하지 않으며 v3 문서의 legacy row는
+  selectable일 수 없다.
+
+### NVIDIA CUDA single-user runtime
+
+`infra/singleuser/Dockerfile.cuda`는 CPU single-user image와 분리된 초기 GPU runtime이다.
+현재 검증 범위는 x86_64, Python 3.12.13, 단일 `python312-cuda` kernelspec, PyTorch
+2.7.1의 CUDA 12.6 wheel build(`2.7.1+cu126`)와 workspace당 물리 GPU 1개 독점 할당이다.
+MIG, 여러 GPU, time-slicing 및 사용자 CUDA extension compile용 `nvcc`는 지원하지
+않는다. CPU image에서 상속한 non-CUDA kernelspec은 제거하므로 GPU를 선택한
+사용자가 검증되지 않은 interpreter로 우회할 수 없다.
+
+PyTorch wheel은 [공식 이전 버전 목록](https://pytorch.org/get-started/previous-versions/)의
+x86_64 CPython 3.12 artifact URL과 SHA-256으로 고정한다. CUDA image의
+base도 image ID 또는 repository digest만 허용하며, 빌드 결과는 운영 profile에 넣기 전에
+다시 immutable ID/digest로 고정해야 한다. Docker build 단계의 metadata 검사는 GPU가 필요
+없지만, 운영 preflight는 새 image와 재시작 가능한 모든 enabled GPU history image를 실제
+GPU로 검사한다. 실제 workspace도 `PLATFORM_ACCELERATOR_CONTRACT`, 단일 물리 UUID인
+`PLATFORM_NVIDIA_GPU_DEVICE_IDS`, `NVIDIA_DRIVER_CAPABILITIES=compute,utility`를 검증하고
+`nvidia-smi`, CUDA 초기화, tensor matmul과 synchronize가 모두 성공해야 시작된다.
+
+```bash
+cpu_image_id="$(docker image inspect team-workspace-singleuser:production-current --format '{{.Id}}')"
+cpu_image_hex="${cpu_image_id#sha256:}"
+cpu_cuda_base="team-workspace-singleuser:cuda-base-${cpu_image_hex}"
+docker tag "${cpu_image_id}" "${cpu_cuda_base}"
+docker build --file infra/singleuser/Dockerfile.cuda \
+  --build-arg "CUDA_SINGLEUSER_BASE_IMAGE=${cpu_cuda_base}" \
+  --build-arg "CUDA_SINGLEUSER_BASE_IMAGE_ID=${cpu_image_id}" \
+  --tag team-workspace-singleuser-cuda:candidate \
+  infra/singleuser
+test "$(docker image inspect "${cpu_cuda_base}" --format '{{.Id}}')" = "${cpu_image_id}"
+docker image inspect team-workspace-singleuser-cuda:candidate --format '{{.Id}}'
+```
+
+raw local image ID는 BuildKit `FROM` 입력으로 직접 쓸 수 없으므로 full CPU image ID에서
+파생한 위 local tag를 사용한다. 운영 스크립트는 operator lock 안에서 tag가 build 직전과
+직후 모두 같은 ID인지 검사해야 한다. CUDA image label도 이 CPU base ID를 기록한다.
+
+GPU 운영 host에는 NVIDIA driver와 NVIDIA Container Toolkit이 설치되고 Docker `nvidia`
+runtime이 구성되어 있어야 한다. Toolkit 설정 명령은 host를 변경하므로
+[NVIDIA 공식 설치 절차](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)에
+따라 별도 작업 창에서 수행하고 Docker를 재시작한다. 이 저장소의 preflight 자체는 읽기
+전용이며 설치나 daemon 설정을 바꾸지 않는다. example을 보호된 운영 파일로 복사한 뒤
+exact driver/toolkit version 및 플랫폼에 할당할 물리 GPU UUID 하나를 채운다. Production
+script는 검증된 파일에서 이 UUID를 읽어 backend와 Hub의 trusted 설정에 동일하게 주입한다.
+ordinal(`0`)이나 MIG UUID로 대체하지 않는다.
+
+```bash
+sudo install -d -m 0750 -o root -g "$(id -gn)" /etc/team-workspace
+sudo install -m 0640 -o root -g "$(id -gn)" \
+  infra/host/gpu-runtime.production.example.json \
+  /etc/team-workspace/gpu-runtime.json
+nvidia-smi --query-gpu=uuid,driver_version --format=csv,noheader,nounits
+nvidia-ctk --version
+# /etc/team-workspace/gpu-runtime.json의 REPLACE_* 값을 실제 host 값으로 교체
+sudoedit /etc/team-workspace/gpu-runtime.json
+python3 infra/host/check_gpu_runtime.py \
+  --config /etc/team-workspace/gpu-runtime.json \
+  --print-device-id
+python3 infra/host/check_gpu_runtime.py \
+  --config /etc/team-workspace/gpu-runtime.json \
+  --image 'sha256:<production.sh가 방금 빌드한 CUDA image ID>'
+```
+
+preflight는 host `nvidia-smi` inventory, exact toolkit/driver version, Docker의 `nvidia`
+runtime, local immutable image identity를 확인한다. 이어 allowlist의 GPU UUID 하나만
+`--gpus device=<UUID>`로 노출한 격리 container에서 동일 PyTorch tensor probe를 실행한다.
+GPU가 없는 local/CPU-only 배포에서는 이 GPU 전용 검사를 실행하지 않는다. 반대로 GPU
+profile을 활성화할 운영 host에서는 실패를 무시하거나 metadata-only 검사로 대신하면 안 된다.
 
 `profiles.production.example.json`은 출시 차단 placeholder다. 검토한 값을 채운 뒤
 다음 명령으로 digest를 계산해 `config_digest`에 반영한다.
@@ -93,6 +163,29 @@ validator HMAC, default-server 거부, 5/15 quota, profile allowlist, volume lab
 항상 `True`다. unlimited storage mode는 local/production 모두 XFS health manifest와
 writable-layer `storage_opt=size`를 요구하지 않지만 exact volume identity/label/mount와
 single-user 내부 shared root 권한·쓰기 검증은 유지한다.
+
+### 유휴 커널 자동 정리
+
+관리자 정책의 `kernel_idle_timeout_seconds`는 worker가 workspace 시작마다 발급하는 일회성
+spawn authorization에 snapshot으로 저장한다. API의 consume/check 응답과 Hub의 exact-key
+검증을 통과한 값만 DockerSpawner argument로 변환된다. 허용값은 `0`(비활성) 또는
+`300..604800`초의 60초 배수이며, 사용자가 설정하는 `PLATFORM_*`/`JUPYTER_*` 환경변수와
+`user_options`로는 바꿀 수 없다.
+
+Hub는 managed/legacy single-user profile 모두에 다음 Jupyter Server 설정을 강제한다.
+
+- `MappingKernelManager.cull_idle_timeout=<서명된 값>`
+- `MappingKernelManager.cull_interval=60`
+- `MappingKernelManager.cull_busy=False`
+- `MappingKernelManager.cull_connected=True`
+
+따라서 Jupyter가 `busy`로 인식하는 셀 실행 중 kernel은 보호되고, 브라우저가 연결된 채 코드
+실행이 없는 idle kernel도 정리된다. Notebook과 private/shared volume은 유지되지만 kernel
+메모리 상태는 사라진다. 셀이 반환된 뒤 실행되는 background process는 busy 보호 대상이 아니다.
+이 기능은 single-user server/container, terminal 또는 kernel 밖 background process를
+종료하지 않으며 aggregate CPU/RAM 예약도 반환하지 않는다. 현재 상태 모델에서 server가
+스스로 사라지면 `desired=RUNNING`과 실제 상태가 어긋날 수 있으므로
+`ServerApp.shutdown_no_activity_timeout`이나 Hub 전체 idle-culler로 대체하지 않는다.
 
 ### Portal OAuth RBAC
 
@@ -395,6 +488,21 @@ IPv4/IPv6 대역을 거부한다. 사용자 container에는 외부 route가 없�
 연결하고 `egress-out`에는 proxy만 연결한다. 이 application-layer 경계보다 강한 egress나
 사용자별 network 격리가 필요하면 현재 신뢰 팀 전제와 Compose 방식을 재검토한다.
 
+관리자는 포털의 **내부 서비스 통신** 메뉴에서 사설 IPv4 `/32`와 TCP port의 exact tuple을
+관리할 수 있다. 정책은 Platform DB의 desired revision으로 저장되고 worker가 Docker socket
+없이 쓰기 방향이 분리된 `egress_policy_desired` volume에 atomic publish한다. proxy는 이
+volume을 read-only로 읽고, 적용 결과는 별도 `egress_policy_ack` volume에 기록한다. worker는
+ack volume을 read-only로만 읽는다. proxy 내부 watcher는 candidate 전체 설정을
+parse한 뒤 reconfigure하고 applied ack를 되돌려주므로 container 재시작이 필요 없다. 실패하면
+마지막 정상 정책이 유지되고 UI에서 desired/applied 불일치와 재시도를 확인할 수 있다.
+
+부팅 기본값은 image에 포함된 빈 deny-all이며 운영 IP는 repository, `.env`, domain allowlist에
+넣지 않는다. execution/control/edge/proxy subnet, loopback, metadata와 control port는 관리자도
+예외로 만들 수 없다. 같은 host 서비스를 허용할 때 해당 process는 `127.0.0.1`이 아니라
+host LAN 주소(또는 별도 검토한 `0.0.0.0`)에 bind해야 한다. reconfigure 전에 이미 열린
+HTTP/CONNECT 연결은 자동 종료가 보장되지 않으므로 즉시 차단 시에는 connection drain 또는
+egress proxy 재시작이 필요하다. 자세한 결정은 ADR-0012를 따른다.
+
 ## 검증
 
 네트워크 계약은 Linux의 실제 Docker Engine 27.1.2+에서 출시 spike를 수행해야 한다.
@@ -405,6 +513,7 @@ preflight 경고 대상으로 두고 가능한 경우 현재 지원되는 최신
 ```bash
 python3 -m unittest discover -s infra/jupyterhub/tests -v
 python3 -m unittest discover -s infra/host/tests -v
+python3 -m unittest discover -s infra/singleuser -p 'test_*.py' -v
 python3 -m py_compile infra/jupyterhub/*.py infra/host/*.py
 ```
 

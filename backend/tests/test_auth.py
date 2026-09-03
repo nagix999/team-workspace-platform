@@ -97,6 +97,50 @@ def test_logout_revokes_portal_session_and_requires_hub_cookie_logout(app_env):
     assert client.get("/api/v1/me").status_code == 401
 
 
+def test_password_change_link_requires_portal_session_and_targets_hub(app_env):
+    _app, hub, client = app_env
+
+    anonymous = client.get("/api/v1/auth/change-password", follow_redirects=False)
+    assert anonymous.status_code == 401
+
+    login(client, hub, "alice")
+    response = client.get("/api/v1/auth/change-password", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == (
+        "https://hub.example.net/hub/change-password"
+    )
+
+
+def test_login_callback_keeps_spa_next_and_rejects_external_redirects(app_env):
+    _app, hub, client = app_env
+
+    for index, (requested, expected) in enumerate(
+        (
+            ("/workspaces?view=mine", "/workspaces?view=mine"),
+            ("https://attacker.test/collect", "/"),
+            ("//attacker.test/collect", "/"),
+        )
+    ):
+        code = f"redirect-code-{index}"
+        hub.register_login("alice", code=code, token=f"redirect-token-{index}")
+        started = client.get(
+            "/api/v1/auth/login",
+            params={"redirect_path": requested},
+            follow_redirects=False,
+        )
+        state = parse_qs(urlsplit(started.headers["location"]).query)["state"][0]
+
+        callback = client.get(
+            "/api/v1/auth/callback",
+            params={"code": code, "state": state},
+            follow_redirects=False,
+        )
+
+        assert callback.status_code == 303
+        assert callback.headers["location"] == expected
+
+
 def test_local_http_uses_non_host_cookie_name(settings):
     local = settings.__class__(
         **{

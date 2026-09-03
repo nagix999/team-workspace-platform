@@ -6,7 +6,8 @@ against a local immutable profile allowlist, and applies only local policy value
 No image, mount path, command, or Docker option from user_options or the validator
 response is passed through to Docker. CPU and memory may be derived from an
 allowlisted runtime only after the signed response, digest, and local hard ceiling
-all match.
+all match. NVIDIA profiles additionally bind one signed workspace reservation to
+the operator-configured physical GPU UUID before emitting an exact DeviceRequest.
 """
 
 from __future__ import annotations
@@ -25,12 +26,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
-from docker.types import LogConfig
+from docker.types import DeviceRequest, LogConfig
 from tornado.httpclient import AsyncHTTPClient, HTTPClientError, HTTPRequest
 from tornado.web import HTTPError
 
 from profile_policy import (
     ProfilePolicyError,
+    accelerator_contract,
     derive_resource_profile,
     is_managed_runtime_profile,
     kernel_runtime_environment,
@@ -45,6 +47,7 @@ SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 VOLUME_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 ENVIRONMENT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 ENVIRONMENT_DIGEST_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
+NVIDIA_GPU_UUID_RE = re.compile(r"^GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 DOCKER_STABLE_VERSION_RE = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:\+[0-9A-Za-z][0-9A-Za-z._-]*|-[0-9][0-9A-Za-z._+~:-]*)?$"
@@ -55,6 +58,11 @@ MAX_ENVIRONMENT_VALUE_BYTES = 16 * 1024
 MAX_ENVIRONMENT_CANONICAL_BYTES = 64 * 1024
 MAX_VALIDATOR_RESPONSE_BYTES = 96 * 1024
 ENVIRONMENT_HMAC_DOMAIN = b"platform-spawn-environment-v1\0"
+NVIDIA_GPU_INVENTORY_DOMAIN = b"platform-nvidia-gpu-inventory-v1\0"
+KERNEL_IDLE_TIMEOUT_MIN_SECONDS = 5 * 60
+KERNEL_IDLE_TIMEOUT_MAX_SECONDS = 7 * 24 * 60 * 60
+KERNEL_IDLE_TIMEOUT_STEP_SECONDS = 60
+KERNEL_CULL_INTERVAL_SECONDS = 60
 
 # User values are inherited by the trusted single-user bootstrap and the Hub
 # OAuth server, not only by notebook kernels.  Keep startup, identity, loader,
@@ -108,6 +116,7 @@ RESERVED_ENVIRONMENT_PREFIXES = (
     "MAMBA_",
     "XDG_",
     "NB_",
+    "NVIDIA_",
     "CHOWN_",
     "GRANT_SUDO",
     "TMP",
@@ -149,6 +158,10 @@ AUTHORIZATION_KEYS = {
     "runtime_base_profile_config_digest",
     "cpu_limit_millicores",
     "memory_limit_bytes",
+    "kernel_idle_timeout_seconds",
+    "gpu_count",
+    "gpu_device_id",
+    "gpu_inventory_digest",
     "private_volume_slot_id",
     "private_volume_slot_number",
     "private_volume_name",
@@ -249,6 +262,7 @@ class GuardConfig:
     storage_policy_mode: str = LEGACY_XFS_QUOTA_STORAGE_POLICY
     max_cpu_millicores: int = 8_000
     max_memory_mb: int = 4_096
+    nvidia_gpu_device_id: str | None = None
 
 
 _config: GuardConfig | None = None
@@ -263,6 +277,49 @@ def _get_config() -> GuardConfig:
     if _config is None:
         raise SpawnGuardError("spawn guard is not configured")
     return _config
+
+
+def validate_nvidia_gpu_device_id(value: Any) -> str:
+    """Validate the operator-selected physical NVIDIA GPU identity.
+
+    An exact UUID, rather than a mutable ordinal such as ``0``, binds every
+    GPU workspace to the physical device reviewed during host preflight.
+    """
+
+    if not isinstance(value, str) or not NVIDIA_GPU_UUID_RE.fullmatch(value):
+        raise SpawnGuardError("NVIDIA GPU device policy is invalid")
+    return value
+
+
+def nvidia_gpu_inventory_digest(device_id: str) -> str:
+    """Bind a spawn authorization to the canonical local GPU inventory."""
+
+    device_id = validate_nvidia_gpu_device_id(device_id)
+    canonical = json.dumps(
+        {"schema_version": 1, "device_ids": [device_id]},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return (
+        "sha256:" + hashlib.sha256(NVIDIA_GPU_INVENTORY_DOMAIN + canonical).hexdigest()
+    )
+
+
+def _profile_nvidia_gpu_device_id(profile: dict[str, Any]) -> str | None:
+    try:
+        accelerator = accelerator_contract(profile)
+    except ProfilePolicyError:
+        raise SpawnGuardError("profile accelerator contract is invalid") from None
+    if accelerator is None or accelerator["kind"] == "none":
+        return None
+    if (
+        accelerator["kind"] != "nvidia"
+        or accelerator["count"] != 1
+        or accelerator["sharing"] != "exclusive"
+    ):
+        raise SpawnGuardError("profile accelerator contract is unsupported")
+    return validate_nvidia_gpu_device_id(_get_config().nvidia_gpu_device_id)
 
 
 def validate_storage_policy_configuration(
@@ -296,6 +353,22 @@ def _safe_id(value: Any, where: str) -> str:
 def _positive_int(value: Any, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise SpawnGuardError(f"{where} is invalid")
+    return value
+
+
+def _kernel_idle_timeout_seconds(value: Any) -> int:
+    """Validate the signed kernel-culling policy at the Hub trust boundary."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SpawnGuardError("kernel_idle_timeout_seconds is invalid")
+    if value == 0:
+        return value
+    if (
+        value < KERNEL_IDLE_TIMEOUT_MIN_SECONDS
+        or value > KERNEL_IDLE_TIMEOUT_MAX_SECONDS
+        or value % KERNEL_IDLE_TIMEOUT_STEP_SECONDS
+    ):
+        raise SpawnGuardError("kernel_idle_timeout_seconds is invalid")
     return value
 
 
@@ -782,6 +855,11 @@ def _validate_authorization(
         "memory_limit_bytes",
     ):
         _positive_int(authorization[field], field)
+    _kernel_idle_timeout_seconds(authorization["kernel_idle_timeout_seconds"])
+    if type(authorization["gpu_count"]) is not int or authorization[
+        "gpu_count"
+    ] not in {0, 1}:
+        raise SpawnGuardError("gpu_count is invalid")
 
     user_environment = validate_user_environment(
         authorization["environment"],
@@ -803,6 +881,21 @@ def _validate_authorization(
     profile = _authorized_runtime_profile(
         authorization, profile_id=profile_id, profile_version=profile_version
     )
+    nvidia_gpu_device_id = _profile_nvidia_gpu_device_id(profile)
+    if nvidia_gpu_device_id is None:
+        if (
+            authorization["gpu_count"] != 0
+            or authorization["gpu_device_id"] is not None
+            or authorization["gpu_inventory_digest"] is not None
+        ):
+            raise SpawnGuardError("CPU profile has an unexpected GPU binding")
+    elif (
+        authorization["gpu_count"] != 1
+        or authorization["gpu_device_id"] != nvidia_gpu_device_id
+        or authorization["gpu_inventory_digest"]
+        != nvidia_gpu_inventory_digest(nvidia_gpu_device_id)
+    ):
+        raise SpawnGuardError("GPU authorization does not match local inventory")
     for field in ("uid", "gid", "private_disk_hard_limit_bytes"):
         if authorization[field] != profile[field]:
             raise SpawnGuardError(f"authorized {field} does not match local profile")
@@ -849,6 +942,15 @@ def _apply_local_policy(
         if managed_runtime
         else [config.singleuser_command]
     )
+    idle_timeout_seconds = _kernel_idle_timeout_seconds(
+        authorization["kernel_idle_timeout_seconds"]
+    )
+    spawner.args = [
+        f"--MappingKernelManager.cull_idle_timeout={idle_timeout_seconds}",
+        f"--MappingKernelManager.cull_interval={KERNEL_CULL_INTERVAL_SECONDS}",
+        "--MappingKernelManager.cull_busy=False",
+        "--MappingKernelManager.cull_connected=True",
+    ]
     spawner.volumes = {
         authorization["private_volume_name"]: {
             "bind": profile["private_mount_path"],
@@ -884,6 +986,9 @@ def _apply_local_policy(
     }
     if managed_runtime:
         platform_environment.update(kernel_runtime_environment(profile))
+    nvidia_gpu_device_id = _profile_nvidia_gpu_device_id(profile)
+    if nvidia_gpu_device_id is not None:
+        platform_environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"] = nvidia_gpu_device_id
     if user_environment is None:
         user_environment = getattr(spawner, "_platform_user_environment", {})
     if not isinstance(user_environment, dict):
@@ -1155,6 +1260,18 @@ def extra_create_kwargs(spawner: Any) -> dict[str, Any]:
                 ).lower(),
             }
         )
+    try:
+        accelerator = accelerator_contract(profile)
+    except ProfilePolicyError:
+        raise SpawnGuardError("profile accelerator contract is invalid") from None
+    if accelerator is not None:
+        labels.update(
+            {
+                "platform.accelerator.kind": accelerator["kind"],
+                "platform.accelerator.count": str(accelerator["count"]),
+                "platform.accelerator.sharing": accelerator["sharing"],
+            }
+        )
     return {
         "user": f"{profile['uid']}:{profile['gid']}",
         "labels": labels,
@@ -1205,4 +1322,13 @@ def extra_host_config(spawner: Any) -> dict[str, Any]:
         and profile.get("private_disk_quota_enforced", False) is True
     ):
         result["storage_opt"] = {"size": str(profile["writable_layer_size_bytes"])}
+    nvidia_gpu_device_id = _profile_nvidia_gpu_device_id(profile)
+    if nvidia_gpu_device_id is not None:
+        result["device_requests"] = [
+            DeviceRequest(
+                driver="nvidia",
+                device_ids=[nvidia_gpu_device_id],
+                capabilities=[["gpu"]],
+            )
+        ]
     return result

@@ -12,6 +12,11 @@ const legacyWorkspace: Workspace = {
   kernelName: null,
   kernelDisplayName: null,
   pythonVersion: null,
+  acceleratorKind: null,
+  gpuCount: null,
+  cudaVersion: null,
+  gpuFramework: null,
+  gpuFrameworkVersion: null,
   cpuLimit: null,
   memoryLimitMb: null,
   privateDiskLimitMb: null,
@@ -84,6 +89,18 @@ describe("WorkspaceCard profile compatibility", () => {
     });
     expect(html).toContain("저장공간 하드 제한 1 GB");
     expect(html).not.toContain("하드 제한 미적용");
+  });
+
+  it("shows the immutable CUDA and framework contract for a GPU workspace", () => {
+    const html = render({
+      ...legacyWorkspace,
+      acceleratorKind: "nvidia",
+      gpuCount: 1,
+      cudaVersion: "12.6",
+      gpuFramework: "pytorch",
+      gpuFrameworkVersion: "2.7.1",
+    });
+    expect(html).toContain("NVIDIA GPU 1개 · CUDA 12.6 · PyTorch 2.7.1");
   });
 
   it("does not silently hide a malformed enforced quota", () => {

@@ -104,6 +104,11 @@ def test_profile_serialization_exposes_only_an_effective_disk_limit():
         kernel_name="python3",
         kernel_display_name="Python 3",
         python_version="3.12.11",
+        accelerator_kind="none",
+        gpu_count=0,
+        cuda_version=None,
+        gpu_framework=None,
+        gpu_framework_version=None,
         image_ref="example.invalid/singleuser@sha256:" + "d" * 64,
         cpu_limit="1.0",
         memory_limit_mb=1024,
@@ -116,9 +121,48 @@ def test_profile_serialization_exposes_only_an_effective_disk_limit():
         selectable=True,
     )
 
-    assert profile_dict(profile)["private_disk_limit_mb"] is None
+    serialized = profile_dict(profile)
+    assert serialized["private_disk_limit_mb"] is None
+    assert serialized["accelerator_kind"] == "none"
+    assert serialized["gpu_count"] == 0
+    assert serialized["cuda_version"] is None
+    assert serialized["gpu_framework"] is None
+    assert serialized["gpu_framework_version"] is None
     profile.private_disk_quota_enforced = True
     assert profile_dict(profile)["private_disk_limit_mb"] == 1024
+
+
+def test_profile_serialization_exposes_pinned_gpu_runtime_metadata():
+    profile = WorkspaceProfile(
+        id="python-gpu-serialization",
+        version=1,
+        name="Python GPU serialization",
+        kernel_name="python3",
+        kernel_display_name="Python 3 (CUDA)",
+        python_version="3.12.11",
+        accelerator_kind="nvidia",
+        gpu_count=1,
+        cuda_version="12.6",
+        gpu_framework="pytorch",
+        gpu_framework_version="2.7.1",
+        image_ref="example.invalid/singleuser-gpu@sha256:" + "d" * 64,
+        cpu_limit="4.0",
+        memory_limit_mb=8192,
+        pids_limit=512,
+        private_disk_limit_mb=None,
+        private_disk_quota_enforced=False,
+        provider_options_json="{}",
+        config_digest="sha256:" + "e" * 64,
+        enabled=True,
+        selectable=True,
+    )
+
+    serialized = profile_dict(profile)
+    assert serialized["accelerator_kind"] == "nvidia"
+    assert serialized["gpu_count"] == 1
+    assert serialized["cuda_version"] == "12.6"
+    assert serialized["gpu_framework"] == "pytorch"
+    assert serialized["gpu_framework_version"] == "2.7.1"
 
 
 def test_existing_offer_remains_pinned_when_new_runtime_version_is_imported(app_env):
@@ -135,6 +179,8 @@ def test_existing_offer_remains_pinned_when_new_runtime_version_is_imported(app_
     assert item["name"] == "Python standard"
     assert item["cpu_limit"] == "1.0"
     assert item["memory_limit_mb"] == 1024
+    assert item["accelerator_kind"] == "none"
+    assert item["gpu_count"] == 0
     with app.state.session_factory() as db:
         stored = db.get(WorkspaceProfile, ("python-standard", 2))
         assert stored is not None
@@ -157,6 +203,8 @@ def test_existing_offer_remains_pinned_when_new_runtime_version_is_imported(app_
     assert workspace["python_version"] == "3.12.0"
     assert workspace["cpu_limit"] == "1.0"
     assert workspace["memory_limit_mb"] == 1024
+    assert workspace["accelerator_kind"] == "none"
+    assert workspace["gpu_count"] == 0
     assert workspace["private_disk_limit_mb"] is None
     assert workspace["private_disk_quota_enforced"] is False
     assert "image_ref" not in workspace
@@ -398,9 +446,11 @@ def test_aggregate_resource_admission_and_capacity_envelope(resource_budget_env)
     assert capacity["global"] == {
         "active": 2,
         "limit": 15,
+        "kernel_idle_timeout_seconds": 3_600,
         "resources": {
             "cpu_millicores": {"reserved": 2_000, "limit": 2_000},
             "memory_mb": {"reserved": 2_048, "limit": 2_048},
+            "gpu_count": {"reserved": 0, "limit": 0},
         },
     }
 

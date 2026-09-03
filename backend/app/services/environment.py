@@ -62,6 +62,7 @@ _RESERVED_EXACT = {
 }
 _RESERVED_PREFIXES = (
     "PLATFORM_",
+    "NVIDIA_",
     "JUPYTER_",
     "JUPYTERHUB_",
     "JPY_",

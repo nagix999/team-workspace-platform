@@ -1,0 +1,83 @@
+# BuildKit cannot use a raw local config image ID in FROM. The production
+# orchestrator therefore creates this ID-derived local tag, verifies that it
+# resolves to the expected CPU image ID immediately before and after this build,
+# and passes both values here. The defaults are deliberately non-runnable.
+ARG CUDA_SINGLEUSER_BASE_IMAGE=team-workspace-singleuser:cuda-base-REPLACE_WITH_CPU_IMAGE_ID
+ARG CUDA_SINGLEUSER_BASE_IMAGE_ID=sha256:REPLACE_WITH_CPU_IMAGE_ID
+FROM ${CUDA_SINGLEUSER_BASE_IMAGE}
+ARG CUDA_SINGLEUSER_BASE_IMAGE
+ARG CUDA_SINGLEUSER_BASE_IMAGE_ID
+
+USER root
+
+# Bind the permitted local tag spelling to the full expected CPU config digest.
+# The final CUDA image must likewise be referenced by exact ID/digest.
+RUN set -eu; \
+    case "${CUDA_SINGLEUSER_BASE_IMAGE_ID}" in sha256:*) ;; *) exit 78 ;; esac; \
+    digest="${CUDA_SINGLEUSER_BASE_IMAGE_ID#sha256:}"; \
+    [ "${#digest}" -eq 64 ]; \
+    case "${digest}" in *[!0-9a-f]*|0000000000000000000000000000000000000000000000000000000000000000) exit 78 ;; esac; \
+    expected="team-workspace-singleuser:cuda-base-${digest}"; \
+    [ "${CUDA_SINGLEUSER_BASE_IMAGE}" = "${expected}" ] || { \
+      echo >&2 'CUDA single-user base tag is not bound to its image ID'; \
+      exit 78; \
+    }
+
+COPY requirements.cuda.txt /tmp/requirements.cuda.txt
+RUN [ "$(uname -m)" = "x86_64" ] \
+ && /opt/conda/envs/python312/bin/python -m pip install \
+      --disable-pip-version-check \
+      --no-cache-dir \
+      --only-binary=:all: \
+      --index-url=https://download.pytorch.org/whl/cu126 \
+      --requirement=/tmp/requirements.cuda.txt \
+ && /opt/conda/envs/python312/bin/python -m pip check \
+ && rm -f /tmp/requirements.cuda.txt
+
+# A GPU notebook must not offer the inherited non-CUDA Python interpreter. The
+# server is also started with ensure_native_kernel=False by the shared wrapper,
+# preventing jupyter_client from synthesizing an unreviewed fallback kernel.
+RUN mkdir -p /opt/conda/share/jupyter/kernels \
+             /opt/conda/envs/python312/share/jupyter/kernels \
+ && find /opt/conda/share/jupyter/kernels \
+         /opt/conda/envs/python312/share/jupyter/kernels \
+         -mindepth 1 -maxdepth 1 -type d -exec rm -rf -- {} + \
+ && /opt/conda/envs/python312/bin/python -m ipykernel install \
+      --prefix=/opt/conda \
+      --name=python312-cuda \
+      --display-name='Python 3.12 (PyTorch CUDA 12.6)'
+
+COPY --chmod=0755 platform-singleuser /usr/local/bin/platform-singleuser
+COPY --chmod=0755 verify_kernel_contract.py /usr/local/libexec/verify_kernel_contract.py
+COPY --chmod=0755 verify_private_storage.py /usr/local/libexec/verify_private_storage.py
+COPY --chmod=0755 verify_shared_storage.py /usr/local/libexec/verify_shared_storage.py
+COPY --chmod=0755 verify_cuda_runtime.py /usr/local/libexec/verify_cuda_runtime.py
+
+ENV PLATFORM_ACCELERATOR_CONTRACT='{"schema_version":1,"kind":"nvidia","count":1,"sharing":"exclusive","cuda_version":"12.6","framework":"pytorch","framework_version":"2.7.1"}' \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    JUPYTER_PATH=/opt/conda/share/jupyter
+
+RUN PLATFORM_DEFAULT_KERNEL=python312-cuda \
+    PLATFORM_PYTHON_EXECUTABLE=/opt/conda/envs/python312/bin/python \
+    PATH=/opt/conda/envs/python312/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PLATFORM_KERNEL_CONTRACT='{"schema_version":1,"python_version":"3.12.13","kernels":[{"name":"python312-cuda","display_name":"Python 3.12 (PyTorch CUDA 12.6)","language":"python","python_version":"3.12.13","executable":"/opt/conda/envs/python312/bin/python"}],"default_kernel":"python312-cuda"}' \
+    /opt/conda/bin/python /usr/local/libexec/verify_kernel_contract.py \
+ && PLATFORM_DEFAULT_KERNEL=python312-cuda \
+    PLATFORM_PYTHON_EXECUTABLE=/opt/conda/envs/python312/bin/python \
+    PATH=/opt/conda/envs/python312/bin:/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    PLATFORM_KERNEL_CONTRACT='{"schema_version":1,"python_version":"3.12.13","kernels":[{"name":"python312-cuda","display_name":"Python 3.12 (PyTorch CUDA 12.6)","language":"python","python_version":"3.12.13","executable":"/opt/conda/envs/python312/bin/python"}],"default_kernel":"python312-cuda"}' \
+    /opt/conda/envs/python312/bin/python \
+      /usr/local/libexec/verify_cuda_runtime.py --metadata-only
+
+HEALTHCHECK --interval=3s --timeout=1s --start-period=3s --retries=3 \
+  CMD /opt/conda/bin/python /etc/jupyter/docker_healthcheck.py || exit 1
+
+LABEL io.team-workspace.accelerator.kind="nvidia" \
+      io.team-workspace.accelerator.sharing="exclusive" \
+      io.team-workspace.cuda.version="12.6" \
+      io.team-workspace.framework="pytorch" \
+      io.team-workspace.framework.version="2.7.1" \
+      io.team-workspace.python.version="3.12.13" \
+      io.team-workspace.cpu-base.image-id="${CUDA_SINGLEUSER_BASE_IMAGE_ID}"
+
+USER 1000:100

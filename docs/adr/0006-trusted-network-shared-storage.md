@@ -138,4 +138,5 @@ filesystem 또는 예약 공간, shared/private backup과 복구 시험은 운�
 - 사용자 간 service/network 접근을 차단해야 함
 - 코드·데이터 반출 통제가 package allowlist보다 강해야 함
 - disk 고갈 사고가 발생하거나 사용자별 비용·용량 회계가 필요함
-- 여러 host, GPU, HA 또는 더 세밀한 resource/network policy가 필요함
+- 여러 host, 단일 물리 GPU 독점 범위를 넘는 다중 GPU·MIG·time-slicing, HA 또는 더
+  세밀한 resource/network policy가 필요함

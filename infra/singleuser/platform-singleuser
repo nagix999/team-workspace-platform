@@ -24,6 +24,34 @@ export PATH
 # values. The verifier changes only the mounted directory root mode; it does not
 # traverse or alter user files.
 workspace_id=${PLATFORM_WORKSPACE_ID:-}
+
+# The CUDA image alone contains this verifier. Image/profile preflight does not
+# assume the machine running it has a GPU, but every real workspace must prove
+# its signed physical-UUID assignment and execute a CUDA tensor before Jupyter
+# starts. A copied or partial CUDA image therefore fails closed.
+cuda_verifier=/usr/local/libexec/verify_cuda_runtime.py
+accelerator_contract=${PLATFORM_ACCELERATOR_CONTRACT:-}
+nvidia_gpu_device_ids=${PLATFORM_NVIDIA_GPU_DEVICE_IDS:-}
+nvidia_driver_capabilities=${NVIDIA_DRIVER_CAPABILITIES:-}
+if [ -e "${cuda_verifier}" ] || [ -n "${accelerator_contract}" ] || [ -n "${nvidia_gpu_device_ids}" ] || [ -n "${nvidia_driver_capabilities}" ]; then
+  if [ ! -x "${cuda_verifier}" ]; then
+    echo >&2 "CUDA runtime verification failed: accelerator verifier is unavailable"
+    exit 78
+  fi
+  if [ -n "${workspace_id}" ]; then
+    /opt/conda/envs/python312/bin/python "${cuda_verifier}" --require-gpu
+  else
+    /opt/conda/envs/python312/bin/python "${cuda_verifier}" --metadata-only
+  fi
+
+  # The image inventory is checked before startup, but a notebook user can
+  # create a kernelspec below their persistent HOME after the server starts.
+  # Keep the live CUDA server restricted to the one digest-bound CUDA kernel;
+  # the container remains useful as a normal shell without advertising the
+  # inherited CPU-only interpreter as a Jupyter kernel.
+  set -- "--KernelSpecManager.allowed_kernelspecs=${PLATFORM_DEFAULT_KERNEL}" "$@"
+fi
+
 private_mount_path=${PLATFORM_PRIVATE_MOUNT_PATH:-}
 private_uid=${PLATFORM_PRIVATE_UID:-}
 private_gid=${PLATFORM_PRIVATE_GID:-}
@@ -51,5 +79,6 @@ if [ -n "${shared_mount_path}" ] || [ -n "${shared_gid}" ]; then
 fi
 
 exec /opt/conda/bin/jupyterhub-singleuser \
+  "--KernelSpecManager.ensure_native_kernel=False" \
   "--MappingKernelManager.default_kernel_name=${PLATFORM_DEFAULT_KERNEL}" \
   "$@"

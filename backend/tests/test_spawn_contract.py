@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from app.models import EnvironmentVariable, SpawnAuthorization, Workspace
 from app.security import internal_signature
+from app.services.resource_policy import get_resource_policy
 from app.worker import OperationWorker
 
 from conftest import login, mutation_headers, provision
@@ -74,6 +75,9 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
             ("python-standard", 1),
         )
         assert workspace and profile
+        policy = get_resource_policy(db, app.state.settings)
+        policy.kernel_idle_timeout_seconds = 7_200
+        db.commit()
         ticket, _ = worker._create_spawn_authorization(
             operation_id, workspace.id, profile
         )
@@ -130,8 +134,16 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
         "environment_digest",
         "user_environment_generation",
         "workspace_environment_generation",
+        "kernel_idle_timeout_seconds",
+        "gpu_count",
+        "gpu_device_id",
+        "gpu_inventory_digest",
         "valid_until_unix",
     }
+    assert authorization["kernel_idle_timeout_seconds"] == 7_200
+    assert authorization["gpu_count"] == 0
+    assert authorization["gpu_device_id"] is None
+    assert authorization["gpu_inventory_digest"] is None
     assert authorization["environment"] == {
         "API_KEY": "never-log-this",
         "MODE": "development",
@@ -143,6 +155,7 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
             select(EnvironmentVariable).where(EnvironmentVariable.name == "API_KEY")
         )
         assert stored and stored.environment_snapshot_cipher is None
+        assert stored.kernel_idle_timeout_seconds == 7_200
         assert secret and secret.plain_value is None
         assert secret.value_cipher and "never-log-this" not in secret.value_cipher
 
@@ -150,6 +163,33 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
     check_authorization = {
         key: value for key, value in authorization.items() if key != "environment"
     }
+    # Changing the global policy later must not mutate the consumed launch
+    # contract during the post-spawn validation race window.
+    with app.state.session_factory() as db:
+        policy = get_resource_policy(db, app.state.settings)
+        policy.kernel_idle_timeout_seconds = 300
+        db.commit()
+    tampered_body = json.dumps(
+        {
+            "schema_version": 1,
+            **check_authorization,
+            "kernel_idle_timeout_seconds": 3_600,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    tampered = client.post(
+        check_path,
+        content=tampered_body,
+        headers=_headers(
+            app.state.settings.internal_hmac_key,
+            check_path,
+            tampered_body,
+            nonce="check-tampered-12345678",
+        ),
+    )
+    assert tampered.status_code == 403
+    assert tampered.json()["error"]["code"] == "SPAWN_BINDING_MISMATCH"
     check_body = json.dumps(
         {"schema_version": 1, **check_authorization},
         sort_keys=True,

@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import type { Capacity, WorkspaceProfile } from "../api/types";
 import {
   CreateWorkspace,
+  filterWorkspaceProfiles,
   resolveWorkspaceProfile,
+  workspaceAcceleratorKey,
   workspaceKernelKey,
 } from "./CreateWorkspace";
 
@@ -15,6 +17,11 @@ const profile: WorkspaceProfile = {
   kernelName: "python3",
   kernelDisplayName: "Python 3 (ipykernel)",
   pythonVersion: "3.12.4",
+  acceleratorKind: "none",
+  gpuCount: 0,
+  cudaVersion: null,
+  gpuFramework: null,
+  gpuFrameworkVersion: null,
   cpuLimit: "2.0",
   memoryLimitMb: 2048,
   privateDiskLimitMb: null,
@@ -31,6 +38,9 @@ const capacity: Capacity = {
   cpuBudgetMillicores: 8000,
   memoryReservedMb: 1024,
   memoryBudgetMb: 4096,
+  gpuReservedCount: 0,
+  gpuBudgetCount: 0,
+  kernelIdleTimeoutSeconds: 3600,
   executionHostHealthy: true,
 };
 const noop = async () => {};
@@ -56,6 +66,8 @@ describe("CreateWorkspace", () => {
     const html = render();
     expect(html).not.toContain('id="profile-select"');
     expect(html).toContain("Python standard");
+    expect(html).toContain('id="accelerator-select"');
+    expect(html).toContain("CPU 전용");
     expect(html).toContain('id="kernel-select"');
     expect(html).toContain('id="cpu-select"');
     expect(html).toContain('id="memory-select"');
@@ -96,6 +108,74 @@ describe("CreateWorkspace", () => {
       "2.0",
       2048,
     )).toBeNull();
+  });
+
+  it("filters accelerator, kernel and CPU axes before offering memory", () => {
+    const gpuBase: WorkspaceProfile = {
+      ...profile,
+      id: "python-cuda-2g",
+      name: "Python CUDA",
+      acceleratorKind: "nvidia",
+      gpuCount: 1,
+      cudaVersion: "12.6",
+      gpuFramework: "pytorch",
+      gpuFrameworkVersion: "2.7.1",
+    };
+    const gpu4g = { ...gpuBase, id: "python-cuda-4g", memoryLimitMb: 4096 };
+    const gpu4core = { ...gpu4g, id: "python-cuda-4core", cpuLimit: "4.0" };
+    const otherKernel = {
+      ...gpu4g,
+      id: "pyspark-cuda-4g",
+      kernelName: "pyspark",
+      kernelDisplayName: "PySpark CUDA",
+    };
+    const all = [profile, gpuBase, gpu4g, gpu4core, otherKernel];
+    const gpuKey = workspaceAcceleratorKey(gpuBase);
+
+    expect(filterWorkspaceProfiles(all, { acceleratorKey: gpuKey })
+      .map((item) => item.id)).toEqual([
+      "python-cuda-2g",
+      "python-cuda-4g",
+      "python-cuda-4core",
+      "pyspark-cuda-4g",
+    ]);
+    expect(filterWorkspaceProfiles(all, {
+      acceleratorKey: gpuKey,
+      kernelKey: workspaceKernelKey(gpuBase),
+    }).map((item) => item.id)).toEqual([
+      "python-cuda-2g",
+      "python-cuda-4g",
+      "python-cuda-4core",
+    ]);
+    expect(filterWorkspaceProfiles(all, {
+      acceleratorKey: gpuKey,
+      kernelKey: workspaceKernelKey(gpuBase),
+      cpuLimit: "2.0",
+    }).map((item) => item.memoryLimitMb)).toEqual([2048, 4096]);
+    expect(resolveWorkspaceProfile(
+      all,
+      workspaceKernelKey(gpuBase),
+      "2.0",
+      4096,
+      gpuKey,
+    )?.id).toBe("python-cuda-4g");
+  });
+
+  it("defaults to CPU when the server returns a GPU offer first", () => {
+    const gpuProfile: WorkspaceProfile = {
+      ...profile,
+      id: "python-cuda",
+      name: "Python CUDA",
+      acceleratorKind: "nvidia",
+      gpuCount: 1,
+      cudaVersion: "12.6",
+      gpuFramework: "pytorch",
+      gpuFrameworkVersion: "2.7.1",
+    };
+    const html = render({ profiles: [gpuProfile, profile] });
+    expect(html).toContain('<option value="none:0:-:-:-" selected="">CPU 전용</option>');
+    expect(html).toContain("NVIDIA GPU 1개 · CUDA 12.6 · PyTorch 2.7.1");
+    expect(html).toContain("가속기 CPU 전용");
   });
 
   it("labels storage as a hard limit only when enforcement is true", () => {

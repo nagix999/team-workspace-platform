@@ -20,6 +20,7 @@ x-backend-environment: &backend-environment
   PLATFORM_MAX_ACTIVE_WORKSPACES: "15"
   PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
   PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+  PLATFORM_NVIDIA_GPU_DEVICE_IDS: ${PLATFORM_NVIDIA_GPU_DEVICE_ID:-}
   PLATFORM_RECONCILIATION_FRESHNESS_SECONDS: "30"
   PLATFORM_WEB_PROVISIONING_ENABLED: "true"
   PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED: "true"
@@ -181,10 +182,10 @@ services:
       - --workers
       - "1"
       - --forwarded-allow-ips
-      - 172.38.0.10
+      - 172.29.3.10
     environment:
       <<: *backend-environment
-      FORWARDED_ALLOW_IPS: 172.38.0.10
+      FORWARDED_ALLOW_IPS: 172.29.3.10
     depends_on:
       bootstrap-profile:
         condition: service_completed_successfully
@@ -204,6 +205,7 @@ services:
     environment:
       <<: *backend-environment
       JUPYTERHUB_ADMIN_LIFECYCLE_TOKEN_FILE: /run/platform-secrets/admin_lifecycle_token
+      PLATFORM_INTERNAL_EGRESS_POLICY_DIR: /var/lib/platform-egress-policy
     volumes:
       - platform_data:/var/lib/platform
       - ./secrets/production/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
@@ -212,6 +214,11 @@ services:
       - ./secrets/production/spawn_hmac_key:/run/platform-secrets/spawn_hmac_key:ro
       - ./secrets/production/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
       - ./.runtime/production/profiles.json:/etc/platform/profiles.production.json:ro
+      - egress_policy_desired:/var/lib/platform-egress-policy/desired:rw
+      - egress_policy_ack:/var/lib/platform-egress-policy/ack:ro
+    group_add:
+      - ${PLATFORM_SECRET_GID:?Run make production-init first}
+      - "2999"
     command: ["python", "-m", "app.worker", "--poll-seconds", "1"]
     # Compose releases before the upstream disabled-healthcheck wait fix fail
     # instead of falling back to the container's running state when this
@@ -296,6 +303,29 @@ services:
       retries: 6
     logging: *bounded-logs
 
+  egress-policy-init:
+    build:
+      context: ./infra/egress-proxy
+      args:
+        SQUID_BASE_IMAGE: ubuntu/squid@sha256:8a3baed477e2c282ab8aa5edad442f69873246964f225c5c2ae8364b6610963c
+        ALLOW_MUTABLE_BASE_IMAGE: "false"
+    image: team-workspace-egress-proxy:production
+    # uid 0 owns the fresh volume root and effective gid 2999 may be assigned
+    # without CAP_CHOWN; no capability is added to this one-shot initializer.
+    user: "0:2999"
+    entrypoint: ["/usr/local/bin/init-policy-volume"]
+    command: []
+    volumes:
+      - egress_policy_desired:/var/lib/platform-egress-policy/desired:rw
+      - egress_policy_ack:/var/lib/platform-egress-policy/ack:rw
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+
   egress-proxy:
     build:
       context: ./infra/egress-proxy
@@ -306,11 +336,18 @@ services:
     user: "13:13"
     volumes:
       - ./infra/egress-proxy/approved-domains.production.txt:/etc/squid/approved-domains.txt:ro
+      - egress_policy_desired:/var/lib/platform-egress-policy/desired:ro
+      - egress_policy_ack:/var/lib/platform-egress-policy/ack:rw
+    group_add:
+      - "2999"
+    depends_on:
+      egress-policy-init:
+        condition: service_completed_successfully
     networks:
       jupyter:
-        ipv4_address: 172.40.0.20
+        ipv4_address: 172.29.0.20
       egress-out:
-        ipv4_address: 172.34.0.2
+        ipv4_address: 172.29.4.2
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
@@ -347,19 +384,20 @@ services:
       NATIVE_ENABLE_SIGNUP: "false"
       JUPYTERHUB_BIND_URL: http://:8000
       JUPYTERHUB_HUB_BIND_URL: http://0.0.0.0:8081
-      JUPYTERHUB_HUB_CONNECT_URL: http://172.40.0.10:8081
+      JUPYTERHUB_HUB_CONNECT_URL: http://172.29.0.10:8081
       JUPYTERHUB_SUBDOMAIN_HOST: https://cyberailabs.team
       PLATFORM_OAUTH_REDIRECT_URI: https://platform.cyberailabs.team/api/v1/auth/callback
       JUPYTER_NETWORK_NAME: platform-jupyter-compose-production
       JUPYTER_NETWORK_POLICY_MODE: compose-internal-trusted-v1
-      JUPYTER_NETWORK_SUBNET: 172.40.0.0/24
-      JUPYTER_NETWORK_DYNAMIC_IP_RANGE: 172.40.0.128/25
+      JUPYTER_NETWORK_SUBNET: 172.29.0.0/24
+      JUPYTER_NETWORK_DYNAMIC_IP_RANGE: 172.29.0.128/25
       JUPYTER_STORAGE_POLICY_MODE: docker-volume-unlimited-v1
-      JUPYTER_EGRESS_PROXY_URL: http://172.40.0.20:3128
+      JUPYTER_EGRESS_PROXY_URL: http://172.29.0.20:3128
       JUPYTER_SINGLEUSER_COMMAND: /opt/conda/bin/jupyterhub-singleuser
       JUPYTERHUB_CONCURRENT_SPAWN_LIMIT: "3"
       PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES: ${PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES:-8000}
       PLATFORM_WORKSPACE_MEMORY_BUDGET_MB: ${PLATFORM_WORKSPACE_MEMORY_BUDGET_MB:-4096}
+      JUPYTERHUB_NVIDIA_GPU_DEVICE_ID: ${PLATFORM_NVIDIA_GPU_DEVICE_ID:-}
       SPAWN_VALIDATOR_CONSUME_URL: http://api:8000/internal/v1/spawn-authorizations/consume
       SPAWN_VALIDATOR_CHECK_URL: http://api:8000/internal/v1/spawn-authorizations/check
       SPAWN_VALIDATOR_TIMEOUT_SECONDS: "5"
@@ -409,7 +447,7 @@ services:
       edge: {}
       control: {}
       jupyter:
-        ipv4_address: 172.40.0.10
+        ipv4_address: 172.29.0.10
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m
@@ -473,7 +511,7 @@ services:
         condition: service_healthy
     networks:
       edge:
-        ipv4_address: 172.38.0.10
+        ipv4_address: 172.29.3.10
       ingress: {}
     read_only: true
     tmpfs:
@@ -490,20 +528,28 @@ services:
 volumes:
   platform_data:
   jupyterhub_data:
+  egress_policy_desired:
+  egress_policy_ack:
 
 networks:
-  ingress: {}
+  ingress:
+    ipam:
+      config:
+        - subnet: 172.29.1.0/24
   edge:
     internal: true
     ipam:
       config:
-        - subnet: 172.38.0.0/24
+        - subnet: 172.29.3.0/24
   control:
     internal: true
+    ipam:
+      config:
+        - subnet: 172.29.2.0/24
   egress-out:
     ipam:
       config:
-        - subnet: 172.34.0.0/16
+        - subnet: 172.29.4.0/24
   jupyter:
     name: platform-jupyter-compose-production
     driver: bridge
@@ -519,5 +565,5 @@ networks:
       platform.network.policy: compose-internal-trusted-v1
     ipam:
       config:
-        - subnet: 172.40.0.0/24
-          ip_range: 172.40.0.128/25
+        - subnet: 172.29.0.0/24
+          ip_range: 172.29.0.128/25

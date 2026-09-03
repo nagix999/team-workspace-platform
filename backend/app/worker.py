@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import errno
 import json
+import logging
 import os
 import socket
 import stat
@@ -15,6 +16,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import Settings
+from .accelerators import gpu_inventory_digest, stored_profile_accelerator
 from .db import begin_immediate, create_database_engine, create_session_factory
 from .domain import (
     DesiredState,
@@ -51,6 +53,11 @@ from .models import (
 )
 from .security import TokenCipher, json_dumps_safe, random_token, sha256_hex
 from .services.environment import effective_environment, spawn_snapshot_purpose
+from .services.internal_egress import sync_internal_egress_runtime
+from .services.resource_policy import get_resource_policy
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def read_admin_lifecycle_token(path: Path) -> str:
@@ -144,9 +151,18 @@ class OperationWorker:
             return operation.id
 
     async def process_next(self) -> bool:
+        policy_processed = False
+        if self.settings.internal_egress_policy_dir is not None:
+            try:
+                policy_processed = sync_internal_egress_runtime(
+                    self.session_factory,
+                    Path(self.settings.internal_egress_policy_dir),
+                )
+            except Exception:
+                LOGGER.exception("internal egress policy synchronization failed")
         operation_id = self._claim()
         if operation_id is None:
-            return False
+            return policy_processed
         await self._process(operation_id)
         return True
 
@@ -873,6 +889,40 @@ class OperationWorker:
                 owner_user_id=user.id,
                 workspace_id=workspace.id,
             )
+            resource_policy = get_resource_policy(db, self.settings)
+            try:
+                accelerator = stored_profile_accelerator(profile)
+            except ValueError as exc:
+                db.rollback()
+                raise AppError(
+                    500,
+                    "PROFILE_RESOURCE_INVALID",
+                    "Pinned workspace profile accelerator values are invalid",
+                ) from exc
+            configured_gpu_ids = self.settings.nvidia_gpu_device_ids
+            if accelerator.count == 0:
+                if workspace.assigned_gpu_device_id is not None:
+                    db.rollback()
+                    raise AppError(
+                        500,
+                        "GPU_ALLOCATION_INVARIANT_FAILED",
+                        "A CPU workspace unexpectedly retains a GPU allocation",
+                    )
+                gpu_device_id = None
+                inventory_digest = None
+            else:
+                if (
+                    len(configured_gpu_ids) != 1
+                    or workspace.assigned_gpu_device_id != configured_gpu_ids[0]
+                ):
+                    db.rollback()
+                    raise AppError(
+                        503,
+                        "GPU_ALLOCATION_INVARIANT_FAILED",
+                        "Workspace GPU allocation does not match the verified host inventory",
+                    )
+                gpu_device_id = configured_gpu_ids[0]
+                inventory_digest = gpu_inventory_digest(configured_gpu_ids)
             db.execute(
                 update(SpawnAuthorization)
                 .where(
@@ -912,6 +962,12 @@ class OperationWorker:
                     profile_config_digest=profile.config_digest,
                     user_environment_generation=user.environment_generation,
                     workspace_environment_generation=workspace.environment_generation,
+                    kernel_idle_timeout_seconds=(
+                        resource_policy.kernel_idle_timeout_seconds
+                    ),
+                    gpu_count=accelerator.count,
+                    gpu_device_id=gpu_device_id,
+                    gpu_inventory_digest=inventory_digest,
                     environment_digest=environment.digest,
                     environment_snapshot_cipher=environment_snapshot_cipher,
                     expires_at=now
@@ -969,6 +1025,11 @@ class OperationWorker:
         workspace.hub_last_activity_at = server.last_activity_at
         workspace.last_reconciled_at = datetime.utcnow()
         workspace.stale = False
+        if (
+            server.state in {HubServerState.NOT_FOUND, HubServerState.STOPPED}
+            and workspace.desired_state != DesiredState.RUNNING.value
+        ):
+            workspace.assigned_gpu_device_id = None
         workspace.last_error_code = None
         workspace.last_error_summary = None
         workspace.row_version += 1

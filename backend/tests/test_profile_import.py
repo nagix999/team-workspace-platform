@@ -8,13 +8,16 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, select, text
+from sqlalchemy.exc import IntegrityError
 
 from app.admin import (
     PROFILE_EXECUTION_FIELDS_V1,
+    PROFILE_EXECUTION_FIELDS_V3,
     _profile_digest,
     import_profiles,
 )
 from app.db import create_database_engine, create_session_factory
+from app.errors import AppError
 from app.models import WorkspaceProfile, WorkspaceProfileOffer
 from app.services.resource_policy import get_resource_policy, update_resource_policy
 from app.services.resource_profiles import DYNAMIC_BASE_KEY
@@ -87,6 +90,38 @@ def _extended_profile(
     return profile
 
 
+def _schema_v3_profile(
+    *,
+    profile_id: str,
+    cuda_version: str | None = None,
+    framework_version: str | None = None,
+    selectable: bool = True,
+) -> dict[str, object]:
+    profile = _extended_profile(profile_id=profile_id)
+    profile["selectable"] = selectable
+    profile["accelerator"] = (
+        {
+            "kind": "none",
+            "count": 0,
+            "sharing": "none",
+            "cuda_version": None,
+            "framework": None,
+            "framework_version": None,
+        }
+        if cuda_version is None
+        else {
+            "kind": "nvidia",
+            "count": 1,
+            "sharing": "exclusive",
+            "cuda_version": cuda_version,
+            "framework": "pytorch",
+            "framework_version": framework_version,
+        }
+    )
+    profile["config_digest"] = _profile_digest(profile, PROFILE_EXECUTION_FIELDS_V3)
+    return profile
+
+
 def _write_policy(
     path: Path,
     *,
@@ -154,8 +189,14 @@ def test_fresh_migration_and_v2_profile_import(settings, tmp_path, monkeypatch):
                 "FROM workspace_profiles"
             )
         ).one()
+        kernel_idle_timeout = connection.execute(
+            text(
+                "SELECT kernel_idle_timeout_seconds FROM resource_policies WHERE id = 1"
+            )
+        ).scalar_one()
     engine.dispose()
     assert tuple(row) == ("python3", "Python 3.12", "3.12.11", 1, 1, 1)
+    assert kernel_idle_timeout == 3_600
 
 
 def test_admin_resource_values_materialize_verified_runtime_cross_product(
@@ -191,8 +232,12 @@ def test_admin_resource_values_materialize_verified_runtime_cross_product(
             memory_budget_mb=8_192,
             selectable_cpu_millicores=[2_000, 3_500],
             selectable_memory_mb=[2_048, 3_072],
+            gpu_budget_count=0,
+            selectable_gpu_counts=[0],
+            kernel_idle_timeout_seconds=3_600,
             reserved_cpu_millicores=0,
             reserved_memory_mb=0,
+            reserved_gpu_count=0,
         )
         db.commit()
         profiles = db.scalars(
@@ -217,6 +262,166 @@ def test_admin_resource_values_materialize_verified_runtime_cross_product(
             "config_digest": _extended_profile()["config_digest"],
         }
     engine.dispose()
+
+
+def test_resource_matrix_keeps_distinct_cuda_runtime_families(
+    settings, tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'gpu-runtime-matrix.db'}"
+    _set_migration_environment(monkeypatch, database_url)
+    command.upgrade(_alembic_config(), "head")
+    gpu_id = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+    local_settings = replace(
+        settings,
+        database_url=database_url,
+        workspace_cpu_budget_millicores=8_000,
+        workspace_memory_budget_mb=8_192,
+        nvidia_gpu_device_ids=(gpu_id,),
+    )
+    policy_path = tmp_path / "profiles-gpu-families.json"
+    first = _schema_v3_profile(
+        profile_id="python312-cuda126",
+        cuda_version="12.6",
+        framework_version="2.7.1",
+    )
+    second = _schema_v3_profile(
+        profile_id="python312-cuda127",
+        cuda_version="12.7",
+        framework_version="2.8.0",
+    )
+    _write_policy(policy_path, schema_version=3, profiles=[first, second])
+    import_profiles(local_settings, str(policy_path))
+
+    engine = create_database_engine(local_settings)
+    factory = create_session_factory(engine)
+    with factory() as db:
+        policy = get_resource_policy(db, local_settings)
+        update_resource_policy(
+            db,
+            settings=local_settings,
+            actor_user_id=None,  # type: ignore[arg-type] - service-level import test
+            expected_version=policy.version,
+            cpu_budget_millicores=8_000,
+            memory_budget_mb=8_192,
+            selectable_cpu_millicores=[2_000, 3_500],
+            selectable_memory_mb=[2_048, 3_072],
+            gpu_budget_count=1,
+            selectable_gpu_counts=[1],
+            kernel_idle_timeout_seconds=3_600,
+            reserved_cpu_millicores=0,
+            reserved_memory_mb=0,
+            reserved_gpu_count=0,
+        )
+        db.commit()
+        derived = db.scalars(
+            select(WorkspaceProfile).where(
+                WorkspaceProfile.selectable.is_(True),
+                WorkspaceProfile.cpu_limit == "3.5",
+                WorkspaceProfile.memory_limit_mb == 3_072,
+            )
+        ).all()
+        assert {
+            (
+                profile.accelerator_kind,
+                profile.cuda_version,
+                profile.gpu_framework,
+                profile.gpu_framework_version,
+            )
+            for profile in derived
+        } == {
+            ("nvidia", "12.6", "pytorch", "2.7.1"),
+            ("nvidia", "12.7", "pytorch", "2.8.0"),
+        }
+        assert {
+            json.loads(profile.provider_options_json)[DYNAMIC_BASE_KEY]["id"]
+            for profile in derived
+        } == {"python312-cuda126", "python312-cuda127"}
+    engine.dispose()
+
+
+def test_resource_policy_rejects_phantom_selected_gpu_value(
+    settings, tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'phantom-gpu-selection.db'}"
+    _set_migration_environment(monkeypatch, database_url)
+    command.upgrade(_alembic_config(), "head")
+    local_settings = replace(
+        settings,
+        database_url=database_url,
+        nvidia_gpu_device_ids=("GPU-01234567-89ab-cdef-0123-456789abcdef",),
+    )
+    policy_path = tmp_path / "profiles-cpu-only-v3.json"
+    _write_policy(
+        policy_path,
+        schema_version=3,
+        profiles=[_schema_v3_profile(profile_id="python312-cpu")],
+    )
+    import_profiles(local_settings, str(policy_path))
+
+    engine = create_database_engine(local_settings)
+    factory = create_session_factory(engine)
+    with factory() as db:
+        policy = get_resource_policy(db, local_settings)
+        original_version = policy.version
+        with pytest.raises(AppError) as caught:
+            update_resource_policy(
+                db,
+                settings=local_settings,
+                actor_user_id=None,  # type: ignore[arg-type] - service-level test
+                expected_version=policy.version,
+                cpu_budget_millicores=policy.cpu_budget_millicores,
+                memory_budget_mb=policy.memory_budget_mb,
+                selectable_cpu_millicores=[2_000],
+                selectable_memory_mb=[2_048],
+                gpu_budget_count=1,
+                selectable_gpu_counts=[0, 1],
+                kernel_idle_timeout_seconds=3_600,
+                reserved_cpu_millicores=0,
+                reserved_memory_mb=0,
+                reserved_gpu_count=0,
+            )
+        assert caught.value.status_code == 422
+        assert caught.value.code == "RESOURCE_SELECTION_EMPTY"
+        db.rollback()
+        assert get_resource_policy(db, local_settings).version == original_version
+    engine.dispose()
+
+
+def test_schema_v3_rejects_selectable_v2_row_but_keeps_history_compatible(
+    settings, tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'schema-v3-v2-row.db'}"
+    _set_migration_environment(monkeypatch, database_url)
+    command.upgrade(_alembic_config(), "head")
+    local_settings = replace(settings, database_url=database_url)
+    policy_path = tmp_path / "profiles-schema-v3.json"
+    historical = _extended_profile(profile_id="python312-history")
+
+    _write_policy(policy_path, schema_version=3, profiles=[historical])
+    with pytest.raises(
+        ValueError,
+        match="selectable schema-v3 profile requires accelerator metadata",
+    ):
+        import_profiles(local_settings, str(policy_path))
+
+    historical["selectable"] = False
+    current = _schema_v3_profile(profile_id="python312-current")
+    _write_policy(
+        policy_path,
+        schema_version=3,
+        profiles=[historical, current],
+    )
+    import_profiles(local_settings, str(policy_path))
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        stored = connection.execute(
+            text(
+                "SELECT enabled, selectable, accelerator_kind, gpu_count "
+                "FROM workspace_profiles WHERE id = 'python312-history'"
+            )
+        ).one()
+    engine.dispose()
+    assert tuple(stored) == (1, 0, "none", 0)
 
 
 def test_upgrade_preserves_legacy_row_and_v2_bootstrap_is_idempotent(
@@ -655,6 +860,77 @@ def test_repository_local_policy_matches_backend_contract(
     assert memory_values == [1024, 2048, 4096]
 
 
+def test_0005_upgrade_preserves_policy_and_enforces_kernel_idle_timeout(
+    settings, tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'kernel-idle-0004.db'}"
+    _set_migration_environment(monkeypatch, database_url)
+    config = _alembic_config()
+    command.upgrade(config, "0004")
+
+    timestamp = "2026-08-11 00:00:00"
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO resource_policies "
+                "(id, version, cpu_budget_millicores, memory_budget_mb, "
+                "selectable_cpu_millicores_json, selectable_memory_mb_json, "
+                "updated_by_user_id, created_at, updated_at) VALUES "
+                "(1, 7, 8000, 16384, '[1000,2000]', '[1024,2048]', NULL, "
+                ":now, :now)"
+            ),
+            {"now": timestamp},
+        )
+    engine.dispose()
+
+    command.upgrade(config, "0005")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT version, cpu_budget_millicores, memory_budget_mb, "
+                "selectable_cpu_millicores_json, selectable_memory_mb_json, "
+                "kernel_idle_timeout_seconds FROM resource_policies WHERE id = 1"
+            )
+        ).one()
+        revision = connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one()
+        assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
+    assert tuple(row) == (7, 8_000, 16_384, "[1000,2000]", "[1024,2048]", 3_600)
+    assert revision == "0005"
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE resource_policies "
+                    "SET kernel_idle_timeout_seconds = 299 WHERE id = 1"
+                )
+            )
+    engine.dispose()
+
+    command.downgrade(config, "0004")
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(resource_policies)"))
+        }
+        preserved = connection.execute(
+            text(
+                "SELECT version, cpu_budget_millicores, memory_budget_mb, "
+                "selectable_cpu_millicores_json, selectable_memory_mb_json "
+                "FROM resource_policies WHERE id = 1"
+            )
+        ).one()
+        assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
+    engine.dispose()
+    assert "kernel_idle_timeout_seconds" not in columns
+    assert tuple(preserved) == (7, 8_000, 16_384, "[1000,2000]", "[1024,2048]")
+
+
 def test_0003_upgrade_preserves_spawn_history_and_legacy_workspace_binding(
     settings, tmp_path, monkeypatch
 ):
@@ -773,6 +1049,45 @@ def test_0003_upgrade_preserves_spawn_history_and_legacy_workspace_binding(
             )
     engine.dispose()
 
+    # Stop at the real previous release schema and populate the authorization
+    # fields introduced there.  0005 batch-recreates this table, so defaults
+    # inherited from a 0003 fixture would not prove those values survive.
+    command.upgrade(config, "0004")
+    consumed_environment_digest = "hmac-sha256:" + "e" * 64
+    unconsumed_environment_digest = "hmac-sha256:" + "f" * 64
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE users SET environment_generation = 3 WHERE id = :id"),
+            {"id": ids["user"]},
+        )
+        connection.execute(
+            text("UPDATE workspaces SET environment_generation = 7 " "WHERE id = :id"),
+            {"id": ids["workspace"]},
+        )
+        connection.execute(
+            text(
+                "UPDATE spawn_authorizations SET "
+                "user_environment_generation = 3, "
+                "workspace_environment_generation = 7, "
+                "environment_digest = :digest, "
+                "environment_snapshot_cipher = NULL WHERE id = :id"
+            ),
+            {"digest": consumed_environment_digest, "id": ids["consumed"]},
+        )
+        connection.execute(
+            text(
+                "UPDATE spawn_authorizations SET "
+                "user_environment_generation = 3, "
+                "workspace_environment_generation = 7, "
+                "environment_digest = :digest, "
+                "environment_snapshot_cipher = 'encrypted-snapshot-preserved' "
+                "WHERE id = :id"
+            ),
+            {"digest": unconsumed_environment_digest, "id": ids["unconsumed"]},
+        )
+    engine.dispose()
+
     command.upgrade(config, "head")
     engine = create_engine(database_url)
     with engine.connect() as connection:
@@ -780,7 +1095,8 @@ def test_0003_upgrade_preserves_spawn_history_and_legacy_workspace_binding(
             text(
                 "SELECT id, consumed_at, revoked_at, user_environment_generation, "
                 "workspace_environment_generation, environment_digest, "
-                "environment_snapshot_cipher FROM spawn_authorizations ORDER BY id"
+                "environment_snapshot_cipher, kernel_idle_timeout_seconds "
+                "FROM spawn_authorizations ORDER BY id"
             )
         ).all()
         workspace_row = connection.execute(
@@ -804,16 +1120,30 @@ def test_0003_upgrade_preserves_spawn_history_and_legacy_workspace_binding(
     unconsumed = next(row for row in authorization_rows if row.id == ids["unconsumed"])
     assert consumed.consumed_at is not None and consumed.revoked_at is None
     assert unconsumed.consumed_at is None and unconsumed.revoked_at is not None
-    assert all(
-        row.user_environment_generation == 1
-        and row.workspace_environment_generation == 1
-        and row.environment_digest is None
-        and row.environment_snapshot_cipher is None
-        for row in authorization_rows
-    )
-    assert tuple(workspace_row) == ("환경-1", 1, 1, 1, None, None, None)
+    assert consumed.user_environment_generation == 3
+    assert consumed.workspace_environment_generation == 7
+    assert consumed.environment_digest == consumed_environment_digest
+    assert consumed.environment_snapshot_cipher is None
+    assert consumed.kernel_idle_timeout_seconds == 3_600
+    assert unconsumed.user_environment_generation == 3
+    assert unconsumed.workspace_environment_generation == 7
+    assert unconsumed.environment_digest == unconsumed_environment_digest
+    assert unconsumed.environment_snapshot_cipher == "encrypted-snapshot-preserved"
+    assert unconsumed.kernel_idle_timeout_seconds == 3_600
+    assert tuple(workspace_row) == ("환경-1", 7, 1, 1, None, None, None)
     assert actor_id == ids["user"]
     assert foreign_key_errors == []
+
+    engine = create_engine(database_url)
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE spawn_authorizations "
+                    "SET kernel_idle_timeout_seconds = 299"
+                )
+            )
+    engine.dispose()
 
     command.downgrade(config, "0003")
     engine = create_engine(database_url)
@@ -824,5 +1154,12 @@ def test_0003_upgrade_preserves_spawn_history_and_legacy_workspace_binding(
             ).scalar_one()
             == 2
         )
+        spawn_columns = {
+            row[1]
+            for row in connection.execute(
+                text("PRAGMA table_info(spawn_authorizations)")
+            )
+        }
+        assert "kernel_idle_timeout_seconds" not in spawn_columns
         assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
     engine.dispose()

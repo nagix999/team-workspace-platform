@@ -30,7 +30,7 @@ JupyterHub 공식 문서는 외부 애플리케이션이 REST API로 서버를 �
 사용자는 포털에서 다음 흐름을 완료할 수 있어야 한다.
 
 1. 자신의 ID와 password로 로그인한다.
-2. 승인된 Python·CPU·메모리 조합으로 자신의 개발환경을 중지 상태로 생성한다.
+2. 승인된 Python·CPU·메모리와 선택형 accelerator 조합으로 자신의 개발환경을 중지 상태로 생성한다.
 3. 환경변수를 설정한 뒤 시작을 요청하고 `시작 중 → 실행 중` 상태와 진행률을 확인한다.
 4. `Jupyter 열기`를 눌러 자신의 JupyterLab으로 이동한다.
 5. 환경을 중지하고 다시 시작해도 작업 파일이 보존된다.
@@ -51,6 +51,8 @@ JupyterHub 공식 문서는 외부 애플리케이션이 REST API로 서버를 �
 - 사용자 A의 private volume은 B에게 보이지 않고, 명시적인 shared directory만 공동 읽기·쓰기 가능하다.
 - 리버스 프록시를 통한 JupyterLab HTTP와 WebSocket이 모두 동작한다.
 - CPU, 메모리, 프로세스 수와 사용자당 환경 수에 상한이 있다.
+- 운영자가 명시적으로 활성화한 경우 물리 NVIDIA GPU 한 개가 한 workspace에만 독점 배정되고,
+  별도 Python 3.12/PyTorch CUDA kernel의 실제 tensor 실행이 검증된다.
 
 ### 2.3 이번 범위에서 제외
 
@@ -58,7 +60,7 @@ JupyterHub 공식 문서는 외부 애플리케이션이 REST API로 서버를 �
   loader/platform 환경변수를 덮어쓰는 기능
 - 공유 실행환경·공동 owner·세분화된 shared directory ACL
 - 일반 VM·클라우드 인스턴스 관리
-- GPU, 다중 노드 스케줄링, 자동 확장, 고가용성
+- 다중 GPU, MIG/time-slicing, GPU memory quota, 다중 노드 스케줄링, 자동 확장, 고가용성
 - 파일별 백업 복구
 - 브라우저 안 `iframe`으로 Jupyter를 임베드하는 기능
 
@@ -611,7 +613,7 @@ host의 mount/backup/crash-recovery 시험은 별도 출시 gate다.
 ### 7.8 Compose 결론을 재검토할 조건
 
 - 사용자 또는 동시 실행 환경이 단일 host 용량을 초과
-- 사용자 간 강한 격리, 민감 내부망, GPU, 다중 노드, HA 필요
+- 사용자 간 강한 격리, 민감 내부망, 다중 GPU·MIG·공유 GPU scheduling, 다중 노드, HA 필요
 - 팀별 network policy/resource quota가 필요
 - 현재 수용한 동적 Docker container 간 east-west 접근 위험을 더는 허용할 수 없음
 - Hub의 Docker socket 보유 위험을 수용할 수 없음
@@ -672,6 +674,7 @@ spawn_authorizations
   profile_id            TEXT NOT NULL
   profile_version       INTEGER NOT NULL
   profile_config_digest TEXT NOT NULL
+  kernel_idle_timeout_seconds INTEGER NOT NULL -- 0 또는 300..604800, 시작 시 정책 snapshot
   expires_at            DATETIME NOT NULL
   consumed_at           DATETIME
   revoked_at            DATETIME
@@ -690,7 +693,7 @@ workspace_profiles
   memory_limit_mb       INTEGER NOT NULL
   pids_limit            INTEGER NOT NULL
   private_disk_limit_mb INTEGER NOT NULL
-  idle_timeout_seconds  INTEGER             -- MVP는 NULL; automatic culler 미사용
+  idle_timeout_seconds  INTEGER             -- legacy profile 필드; kernel culler에는 사용하지 않음
   provider_options_json TEXT NOT NULL        -- 새 immutable version 생성 시에만 설정
   config_digest         TEXT NOT NULL        -- canonical execution fields의 digest
   enabled               INTEGER NOT NULL     -- 생성·재시작 허용; 실행 필드와 별도 lifecycle flag
@@ -1006,7 +1009,7 @@ sequenceDiagram
 | PAMAuthenticator | JupyterHub 내장, OS PAM 정책 재사용 | Compose에서 OS 계정·shadow·home 수명주기 운영이 부자연스럽고 위험 | 기존 Linux 계정이 없으므로 기각 |
 | React가 Hub API 직접 호출 | 구성요소가 적어 보임 | 광범위 token 노출, CORS, 소유권·감사 분산 | 기각 |
 | FastAPI가 Docker/Kubernetes API로 Jupyter 직접 생성 | 실행 세부 통제 | Hub의 인증·proxy·spawn 상태를 재구현 | 기각 |
-| 처음부터 KubeSpawner | 강한 격리 도구, quota, 다중 노드/HA/GPU | 소규모 파일럿에는 운영 복잡성과 비용 큼 | 조건부 대안 |
+| 처음부터 KubeSpawner | 강한 격리 도구, quota, 다중 노드/HA와 정교한 다중 GPU scheduling | 소규모 파일럿에는 운영 복잡성과 비용 큼 | 조건부 대안 |
 | default server 하나만 사용 | 가장 단순한 Hub 모델 | 사용자당 최대 5개 요구를 충족하지 못함 | 기각 |
 
 주가설의 가장 강한 대안은 두 가지다. native `/hub/spawn`은 더 작지만 포털에서 진행 상태를 보여 달라는 확정 요구를 충족하지 못한다. 별도 IdP는 여러 서비스와 MFA에 더 강하지만 지금은 사용자가 약 10명이고 Jupyter가 첫 서비스라 운영 비용이 더 크다. 따라서 현재 채택안이 우세하며, 서비스 범위나 인증 요구가 커질 때 결론을 바꾼다.

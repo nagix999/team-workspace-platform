@@ -22,7 +22,7 @@ def test_readyz_requires_exact_database_revision(app_env):
     assert outdated.json()["error"]["code"] == "DATABASE_SCHEMA_NOT_READY"
 
     with app.state.engine.begin() as connection:
-        connection.execute(text("UPDATE alembic_version SET version_num = '0004'"))
+        connection.execute(text("UPDATE alembic_version SET version_num = '0007'"))
     ready = client.get("/readyz")
     assert ready.status_code == 200, ready.text
     assert ready.json()["status"] == "ready"
@@ -32,5 +32,5 @@ def test_readyz_requires_exact_database_revision(app_env):
             connection.execute(
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-            == "0004"
+            == "0007"
         )

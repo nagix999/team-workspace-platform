@@ -1,0 +1,195 @@
+#!/bin/sh
+set -eu
+
+readonly bootstrap_file=/etc/squid/egress-internal-services.txt
+readonly policy_root=/var/lib/platform-egress-policy
+readonly desired_file=${policy_root}/desired/policy.txt
+readonly ack_directory=${policy_root}/ack
+readonly ack_file=${ack_directory}/status.txt
+readonly renderer=/usr/local/lib/platform/render-internal-services.awk
+readonly squid_config=/etc/squid/squid.conf
+readonly active_include=/tmp/operator-internal-services.conf
+readonly candidate_include=/tmp/operator-internal-services.candidate.conf
+readonly candidate_config=/tmp/squid.candidate.conf
+readonly snapshot_file=/tmp/operator-internal-services.desired.txt
+readonly body_file=/tmp/operator-internal-services.body.txt
+readonly backup_include=/tmp/operator-internal-services.previous.conf
+readonly maximum_policy_bytes=65536
+
+squid_pid=""
+
+fail() {
+    echo >&2 "egress internal services: $*"
+    exit 1
+}
+
+cleanup() {
+    status="$?"
+    trap - EXIT HUP INT TERM
+    if test -n "${squid_pid}" && kill -0 "${squid_pid}" 2>/dev/null; then
+        kill "${squid_pid}" 2>/dev/null || true
+        wait "${squid_pid}" 2>/dev/null || true
+    fi
+    rm -f -- "${candidate_include}" "${candidate_config}" \
+        "${snapshot_file}" "${body_file}" "${backup_include}"
+    exit "${status}"
+}
+trap cleanup EXIT HUP INT TERM
+
+validate_regular_policy_file() {
+    candidate="$1"
+    test -f "${candidate}" && test ! -L "${candidate}" && test -r "${candidate}" \
+        || return 1
+    size="$(wc -c <"${candidate}")" || return 1
+    case "${size}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    test "${size}" -le "${maximum_policy_bytes}"
+}
+
+write_ack() {
+    revision="$1"
+    digest="$2"
+    state="$3"
+    error_code="$4"
+    temporary_ack=${ack_directory}/status.txt.tmp
+    umask 007
+    printf '%s %s %s %s %s\n' \
+        PLATFORM_INTERNAL_EGRESS_ACK_V1 \
+        "${revision}" "${digest}" "${state}" "${error_code}" \
+        >"${temporary_ack}"
+    mv -- "${temporary_ack}" "${ack_file}"
+}
+
+parse_desired_snapshot() {
+    header="$(sed -n '1p' "${snapshot_file}")" || return 1
+    old_ifs=${IFS}
+    IFS=' '
+    # shellcheck disable=SC2086
+    set -- ${header}
+    IFS=${old_ifs}
+    test "$#" -eq 3 || return 1
+    test "$1" = PLATFORM_INTERNAL_EGRESS_V1 || return 1
+    candidate_revision="$2"
+    candidate_digest="$3"
+    case "${candidate_revision}" in
+        ''|0|*[!0-9]*) return 1 ;;
+    esac
+    test "${candidate_revision}" = "$((candidate_revision + 0))" || return 1
+    digest_hex=${candidate_digest#sha256:}
+    test "${candidate_digest}" = "sha256:${digest_hex}" \
+        && test "${#digest_hex}" -eq 64 \
+        || return 1
+    case "${digest_hex}" in
+        *[!0-9a-f]*) return 1 ;;
+    esac
+    tail -n +2 "${snapshot_file}" >"${body_file}" || return 1
+    actual_digest="sha256:$(sha256sum "${body_file}" | awk '{print $1}')" \
+        || return 1
+    test "${actual_digest}" = "${candidate_digest}" || return 1
+    LC_ALL=C awk -f "${renderer}" "${body_file}" >"${candidate_include}"
+}
+
+render_bootstrap() {
+    # Never trust a persisted desired/ack generation during startup: a database
+    # restore can legitimately move its revision backwards. Start deny-all and
+    # let the DB-authoritative worker republish before opening an exception.
+    validate_regular_policy_file "${bootstrap_file}" \
+        || fail "bootstrap allowlist must be a readable regular non-symlink file of at most ${maximum_policy_bytes} bytes"
+    LC_ALL=C awk -f "${renderer}" "${bootstrap_file}" >"${active_include}" \
+        || fail "bootstrap allowlist validation failed"
+}
+
+apply_desired_policy() {
+    desired_identity="$(sha256sum "${desired_file}" | awk '{print $1}')" \
+        || return 1
+    if test "${desired_identity}" = "${last_seen_identity:-}"; then
+        return 0
+    fi
+    cp -- "${desired_file}" "${snapshot_file}" || return 1
+    if ! parse_desired_snapshot; then
+        if write_ack 0 "sha256:${desired_identity}" FAILED INVALID_POLICY; then
+            last_seen_identity=${desired_identity}
+        fi
+        return 0
+    fi
+
+    if ! sed "s#${active_include}#${candidate_include}#g" \
+        "${squid_config}" >"${candidate_config}"
+    then
+        if write_ack "${candidate_revision}" "${candidate_digest}" FAILED CANDIDATE_CONFIG_FAILED; then
+            last_seen_identity=${desired_identity}
+        fi
+        return 0
+    fi
+    if ! squid -k parse -f "${candidate_config}" >/dev/null 2>&1; then
+        if write_ack "${candidate_revision}" "${candidate_digest}" FAILED SQUID_PARSE_FAILED; then
+            last_seen_identity=${desired_identity}
+        fi
+        return 0
+    fi
+
+    if ! cp -- "${active_include}" "${backup_include}"; then
+        if write_ack "${candidate_revision}" "${candidate_digest}" FAILED ACTIVE_BACKUP_FAILED; then
+            last_seen_identity=${desired_identity}
+        fi
+        return 0
+    fi
+    if ! mv -- "${candidate_include}" "${active_include}"; then
+        if write_ack "${candidate_revision}" "${candidate_digest}" FAILED ACTIVE_REPLACE_FAILED; then
+            last_seen_identity=${desired_identity}
+        fi
+        return 0
+    fi
+    if ! squid -k reconfigure -f "${squid_config}" >/dev/null 2>&1; then
+        mv -- "${backup_include}" "${active_include}" \
+            || fail "cannot restore the previous policy after reconfigure failure"
+        squid -k reconfigure -f "${squid_config}" >/dev/null 2>&1 \
+            || fail "cannot reconfigure Squid with the restored policy"
+        if write_ack "${candidate_revision}" "${candidate_digest}" FAILED SQUID_RECONFIGURE_FAILED; then
+            last_seen_identity=${desired_identity}
+        fi
+        return 0
+    fi
+
+    write_ack "${candidate_revision}" "${candidate_digest}" APPLIED NONE \
+        || fail "cannot acknowledge the applied policy"
+    last_seen_identity=${desired_identity}
+    rm -f -- "${backup_include}"
+}
+
+test -d "${policy_root}/desired" && test -d "${ack_directory}" \
+    || fail "dynamic policy volume is not initialized"
+render_bootstrap
+
+squid -Nz -f "${squid_config}" >/dev/null 2>&1 \
+    || fail "cannot initialize Squid runtime directories"
+squid "$@" &
+squid_pid=$!
+
+ready=false
+readiness_attempt=0
+while test "${readiness_attempt}" -lt 30; do
+    if ! kill -0 "${squid_pid}" 2>/dev/null; then
+        fail "Squid exited before becoming ready"
+    fi
+    if test -s /tmp/squid.pid \
+        && kill -0 "$(cat /tmp/squid.pid)" 2>/dev/null \
+        && squid -k check -f "${squid_config}" >/dev/null 2>&1
+    then
+        ready=true
+        break
+    fi
+    readiness_attempt=$((readiness_attempt + 1))
+    sleep 1
+done
+test "${ready}" = true || fail "Squid did not become ready for policy updates"
+
+while kill -0 "${squid_pid}" 2>/dev/null; do
+    if validate_regular_policy_file "${desired_file}"; then
+        apply_desired_policy || echo >&2 "egress internal services: transient policy read failure"
+    fi
+    sleep 1
+done
+
+wait "${squid_pid}"

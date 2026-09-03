@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "nvidia_driver_version": "REPLACE_WITH_EXACT_NVIDIA_DRIVER_VERSION",
+  "nvidia_container_toolkit_version": "REPLACE_WITH_EXACT_TOOLKIT_VERSION",
+  "gpu_uuids": [
+    "REPLACE_WITH_PHYSICAL_GPU_UUID"
+  ]
+}

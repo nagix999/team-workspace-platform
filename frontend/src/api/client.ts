@@ -11,6 +11,8 @@ import type {
   EnvironmentVariable,
   EnvironmentVariableList,
   EnvironmentVariableMutation,
+  InternalEgressPolicySnapshot,
+  InternalEgressRule,
   Operation,
   PortalUser,
   ProvisioningStatus,
@@ -32,6 +34,9 @@ export const API_BASE = (configuredBase || "/api/v1").replace(/\/$/, "");
 let csrfToken: string | null = null;
 const ADMIN_PAGE_LIMIT = 100;
 const MAX_ADMIN_PAGED_ITEMS = 10_000;
+const KERNEL_IDLE_TIMEOUT_MIN_SECONDS = 300;
+const KERNEL_IDLE_TIMEOUT_MAX_SECONDS = 604_800;
+const KERNEL_IDLE_TIMEOUT_STEP_SECONDS = 60;
 
 export class ApiError extends Error {
   readonly status: number;
@@ -135,6 +140,23 @@ function nonNegativeInteger(value: unknown): number | null {
     : null;
 }
 
+function exclusiveGpuCount(value: unknown): 0 | 1 {
+  return nonNegativeInteger(value) === 1 ? 1 : 0;
+}
+
+function kernelIdleTimeout(value: unknown): number | null {
+  const seconds = nonNegativeInteger(value);
+  return seconds !== null && (
+      seconds === 0 || (
+        seconds >= KERNEL_IDLE_TIMEOUT_MIN_SECONDS &&
+        seconds <= KERNEL_IDLE_TIMEOUT_MAX_SECONDS &&
+        seconds % KERNEL_IDLE_TIMEOUT_STEP_SECONDS === 0
+      )
+    )
+    ? seconds
+    : null;
+}
+
 function integerArray(value: unknown, positive = true): number[] {
   if (!Array.isArray(value)) return [];
   const values = value.filter((item): item is number =>
@@ -143,6 +165,54 @@ function integerArray(value: unknown, positive = true): number[] {
     (positive ? item > 0 : item >= 0),
   );
   return [...new Set(values)].sort((left, right) => left - right);
+}
+
+function normalizeAccelerator(value: JsonRecord): Pick<
+  WorkspaceProfile,
+  | "acceleratorKind"
+  | "gpuCount"
+  | "cudaVersion"
+  | "gpuFramework"
+  | "gpuFrameworkVersion"
+> | null {
+  const entirelyMissing = [
+    value.accelerator_kind,
+    value.gpu_count,
+    value.cuda_version,
+    value.gpu_framework,
+    value.gpu_framework_version,
+  ].every((item) => item === undefined);
+  const kind = entirelyMissing ? "none" : value.accelerator_kind;
+  const count = entirelyMissing ? 0 : value.gpu_count;
+  if (
+    kind === "none" && count === 0 &&
+    (value.cuda_version === undefined || value.cuda_version === null) &&
+    (value.gpu_framework === undefined || value.gpu_framework === null) &&
+    (value.gpu_framework_version === undefined || value.gpu_framework_version === null)
+  ) {
+    return {
+      acceleratorKind: "none",
+      gpuCount: 0,
+      cudaVersion: null,
+      gpuFramework: null,
+      gpuFrameworkVersion: null,
+    };
+  }
+  const cudaVersion = trimmedString(value.cuda_version, 16);
+  const frameworkVersion = trimmedString(value.gpu_framework_version, 32);
+  if (
+    kind !== "nvidia" || count !== 1 || value.gpu_framework !== "pytorch" ||
+    !cudaVersion || !/^(?:[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(cudaVersion) ||
+    !frameworkVersion ||
+    !/^(?:[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(frameworkVersion)
+  ) return null;
+  return {
+    acceleratorKind: "nvidia",
+    gpuCount: 1,
+    cudaVersion,
+    gpuFramework: "pytorch",
+    gpuFrameworkVersion: frameworkVersion,
+  };
 }
 
 function trimmedString(value: unknown, maxLength: number): string | null {
@@ -323,6 +393,7 @@ export function normalizeProfiles(payload: unknown): WorkspaceProfile[] {
     const pythonVersion = trimmedString(value.python_version, 64);
     const cpuLimit = positiveCpuLimit(value.cpu_limit);
     const memoryLimitMb = positiveInteger(value.memory_limit_mb);
+    const accelerator = normalizeAccelerator(value);
     const privateDiskQuotaEnforced = nullableBoolean(
       value.private_disk_quota_enforced,
     );
@@ -341,7 +412,7 @@ export function normalizeProfiles(payload: unknown): WorkspaceProfile[] {
       !kernelDisplayName || !pythonVersion ||
       !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(pythonVersion) ||
       !cpuLimit || !memoryLimitMb || privateDiskQuotaEnforced === null ||
-      !privateDiskShapeValid || !enabled) continue;
+      !privateDiskShapeValid || !accelerator || !enabled) continue;
     candidates.push({
       id,
       version,
@@ -350,6 +421,7 @@ export function normalizeProfiles(payload: unknown): WorkspaceProfile[] {
       kernelName,
       kernelDisplayName,
       pythonVersion,
+      ...accelerator,
       cpuLimit,
       memoryLimitMb,
       privateDiskLimitMb,
@@ -385,6 +457,7 @@ export function normalizeCapacity(payload: unknown): Capacity {
   const resources = optionalRecord(platform.resources) ?? {};
   const cpu = optionalRecord(resources.cpu_millicores) ?? {};
   const memory = optionalRecord(resources.memory_mb) ?? {};
+  const gpu = optionalRecord(resources.gpu_count) ?? {};
   return {
     workspaceUsed: numberValue(
       root.workspace_used ?? root.workspace_count ?? user.used ?? user.count,
@@ -410,6 +483,11 @@ export function normalizeCapacity(payload: unknown): Capacity {
     cpuBudgetMillicores: positiveInteger(cpu.limit),
     memoryReservedMb: nonNegativeInteger(memory.reserved),
     memoryBudgetMb: positiveInteger(memory.limit),
+    gpuReservedCount: nonNegativeInteger(gpu.reserved),
+    gpuBudgetCount: nonNegativeInteger(gpu.limit),
+    kernelIdleTimeoutSeconds: kernelIdleTimeout(
+      platform.kernel_idle_timeout_seconds,
+    ),
     executionHostHealthy:
       typeof root.execution_host_healthy === "boolean"
         ? root.execution_host_healthy
@@ -438,6 +516,14 @@ export function normalizeWorkspace(payload: unknown): Workspace {
       workspace_id: activeOperationValue.workspace_id ?? workspaceId,
     })
     : null;
+  const acceleratorFieldsPresent = [
+    value.accelerator_kind,
+    value.gpu_count,
+    value.cuda_version,
+    value.gpu_framework,
+    value.gpu_framework_version,
+  ].some((item) => item !== undefined);
+  const accelerator = acceleratorFieldsPresent ? normalizeAccelerator(value) : null;
   return {
     id: workspaceId,
     name: stringValue(value.name, "개발환경"),
@@ -447,6 +533,11 @@ export function normalizeWorkspace(payload: unknown): Workspace {
     kernelName: nullableString(value.kernel_name),
     kernelDisplayName: nullableString(value.kernel_display_name),
     pythonVersion: nullableString(value.python_version),
+    acceleratorKind: accelerator?.acceleratorKind ?? null,
+    gpuCount: accelerator?.gpuCount ?? null,
+    cudaVersion: accelerator?.cudaVersion ?? null,
+    gpuFramework: accelerator?.gpuFramework ?? null,
+    gpuFrameworkVersion: accelerator?.gpuFrameworkVersion ?? null,
     cpuLimit: nullableString(value.cpu_limit),
     memoryLimitMb: nullableNumber(value.memory_limit_mb),
     privateDiskLimitMb,
@@ -573,6 +664,93 @@ export function normalizeAuditEvents(payload: unknown): AdminAuditEvent[] {
     .filter((event) => event.id && event.action && event.result);
 }
 
+export function normalizeInternalEgressPolicy(
+  payload: unknown,
+): InternalEgressPolicySnapshot {
+  const root = asRecord(payload);
+  const policy = asRecord(root.policy);
+  const rawRules = Array.isArray(root.rules) ? root.rules : [];
+  const desiredRevision = positiveInteger(policy.desired_revision);
+  const desiredDigest = stringValue(policy.desired_digest);
+  const appliedRevision = positiveInteger(policy.applied_revision);
+  const appliedDigest = nullableString(policy.applied_digest);
+  const applyStatus = stringValue(policy.apply_status).toUpperCase();
+  const lastErrorCode = nullableString(policy.last_error_code);
+  const lastErrorSummary = nullableString(policy.last_error_summary);
+  const digestPattern = /^sha256:[0-9a-f]{64}$/;
+  const errorCodePattern = /^[A-Z][A-Z0-9_]{0,63}$/;
+  if (
+    desiredRevision === null ||
+    !digestPattern.test(desiredDigest) ||
+    !["PENDING", "APPLYING", "APPLIED", "FAILED"].includes(applyStatus) ||
+    ((appliedRevision === null) !== (appliedDigest === null)) ||
+    (appliedDigest !== null && !digestPattern.test(appliedDigest)) ||
+    (appliedRevision !== null && appliedRevision > desiredRevision) ||
+    ((applyStatus === "FAILED") !== (lastErrorCode !== null)) ||
+    (lastErrorCode !== null && !errorCodePattern.test(lastErrorCode)) ||
+    (applyStatus === "APPLIED" && (
+      appliedRevision !== desiredRevision || appliedDigest !== desiredDigest
+    ))
+  ) {
+    throw invalidMutationResponse();
+  }
+  if (rawRules.length > 32) throw invalidMutationResponse();
+  const rules: InternalEgressRule[] = rawRules.map((value) => {
+    const rule = asRecord(value);
+    const id = stringValue(rule.id);
+    const destinationCidr = stringValue(rule.destination_cidr);
+    const port = positiveInteger(rule.port);
+    const rowVersion = positiveInteger(rule.row_version);
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id) ||
+      !isCanonicalPrivateHostCidr(destinationCidr) ||
+      port === null || port < 1024 || port > 65535 ||
+      [2375, 2376, 2377, 3128, 4243, 6443, 10250].includes(port) ||
+      rowVersion === null
+    ) {
+      throw invalidMutationResponse();
+    }
+    return {
+      id,
+      destinationCidr,
+      port,
+      rowVersion,
+      createdAt: nullableString(rule.created_at),
+      updatedAt: nullableString(rule.updated_at),
+    };
+  });
+  if (
+    new Set(rules.map((rule) => rule.id)).size !== rules.length ||
+    new Set(rules.map((rule) => `${rule.destinationCidr}:${rule.port}`)).size !== rules.length
+  ) {
+    throw invalidMutationResponse();
+  }
+  return {
+    desiredRevision,
+    desiredDigest,
+    appliedRevision,
+    appliedDigest,
+    applyStatus: applyStatus as InternalEgressPolicySnapshot["applyStatus"],
+    lastErrorCode,
+    lastErrorSummary,
+    updatedAt: nullableString(policy.updated_at),
+    rules,
+  };
+}
+
+function isCanonicalPrivateHostCidr(value: string): boolean {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/32$/.exec(value);
+  if (!match) return false;
+  const octets = match.slice(1).map(Number);
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
+    return false;
+  }
+  if (`${octets.join(".")}/32` !== value) return false;
+  const [first, second] = octets;
+  return first === 10 || (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168);
+}
+
 export function normalizeAdminCapacity(payload: unknown): AdminCapacity {
   const root = asRecord(payload);
   const workspaces = optionalRecord(root.workspaces) ?? {};
@@ -580,6 +758,7 @@ export function normalizeAdminCapacity(payload: unknown): AdminCapacity {
     optionalRecord(optionalRecord(root.global)?.resources) ?? {};
   const cpu = optionalRecord(resources.cpu_millicores) ?? {};
   const memory = optionalRecord(resources.memory_mb) ?? {};
+  const gpu = optionalRecord(resources.gpu_count) ?? {};
   return {
     users: Math.max(0, numberValue(root.users, 0)),
     workspaceCreated: Math.max(0, numberValue(
@@ -599,6 +778,8 @@ export function normalizeAdminCapacity(payload: unknown): AdminCapacity {
     cpuBudgetMillicores: Math.max(0, numberValue(cpu.limit, 0)),
     memoryReservedMb: Math.max(0, numberValue(memory.reserved, 0)),
     memoryBudgetMb: Math.max(0, numberValue(memory.limit, 0)),
+    gpuReservedCount: Math.max(0, numberValue(gpu.reserved, 0)),
+    gpuBudgetCount: Math.max(0, numberValue(gpu.limit, 0)),
   };
 }
 
@@ -609,22 +790,66 @@ export function normalizeResourcePolicy(payload: unknown): ResourcePolicy {
   const selectedMemory = integerArray(value.selectable_memory_mb);
   const availableCpu = integerArray(value.available_cpu_millicores);
   const availableMemory = integerArray(value.available_memory_mb);
+  const selectedGpu = integerArray(value.selectable_gpu_counts, false)
+    .filter((item) => item <= 1);
+  const availableGpu = integerArray(value.available_gpu_counts, false)
+    .filter((item) => item <= 1);
   const hasAvailableCpu = Array.isArray(value.available_cpu_millicores);
   const hasAvailableMemory = Array.isArray(value.available_memory_mb);
+  const hasSelectedGpu = Array.isArray(value.selectable_gpu_counts);
+  const hasAvailableGpu = Array.isArray(value.available_gpu_counts);
   const hardCeiling = optionalRecord(value.hard_ceiling) ?? {};
+  const rawKernelBounds = optionalRecord(value.kernel_idle_timeout_bounds);
+  const kernelMinSeconds = positiveInteger(rawKernelBounds?.min_seconds);
+  const kernelMaxSeconds = positiveInteger(rawKernelBounds?.max_seconds);
+  const kernelStepSeconds = positiveInteger(rawKernelBounds?.step_seconds);
+  const kernelIdleTimeoutBounds = kernelMinSeconds !== null &&
+      kernelMaxSeconds !== null && kernelStepSeconds !== null &&
+      kernelMinSeconds <= kernelMaxSeconds &&
+      kernelMinSeconds % kernelStepSeconds === 0 &&
+      kernelMaxSeconds % kernelStepSeconds === 0
+    ? {
+        minSeconds: kernelMinSeconds,
+        maxSeconds: kernelMaxSeconds,
+        stepSeconds: kernelStepSeconds,
+      }
+    : null;
+  const rawKernelIdleTimeoutSeconds = nonNegativeInteger(
+    value.kernel_idle_timeout_seconds,
+  );
+  const kernelIdleTimeoutSeconds = rawKernelIdleTimeoutSeconds !== null &&
+      kernelIdleTimeoutBounds !== null &&
+      (rawKernelIdleTimeoutSeconds === 0 || (
+        rawKernelIdleTimeoutSeconds >= kernelIdleTimeoutBounds.minSeconds &&
+        rawKernelIdleTimeoutSeconds <= kernelIdleTimeoutBounds.maxSeconds &&
+        rawKernelIdleTimeoutSeconds % kernelIdleTimeoutBounds.stepSeconds === 0
+      ))
+    ? rawKernelIdleTimeoutSeconds
+    : null;
   return {
     version: numberValue(value.version, 0),
     cpuBudgetMillicores: numberValue(value.cpu_budget_millicores, 0),
     memoryBudgetMb: numberValue(value.memory_budget_mb, 0),
     selectableCpuMillicores: selectedCpu,
     selectableMemoryMb: selectedMemory,
+    // This release supports one exclusively assigned physical GPU only.  An
+    // out-of-contract server value must never make the UI advertise a larger
+    // pool than the runtime can enforce.
+    gpuBudgetCount: exclusiveGpuCount(value.gpu_budget_count),
+    selectableGpuCounts: hasSelectedGpu ? selectedGpu : [0],
     // Older API responses omitted the available catalog.  Preserve that
     // compatibility, but do not turn an explicitly empty current catalog into
     // an apparently valid stale selection.
     availableCpuMillicores: hasAvailableCpu ? availableCpu : selectedCpu,
     availableMemoryMb: hasAvailableMemory ? availableMemory : selectedMemory,
+    availableGpuCounts: hasAvailableGpu
+      ? availableGpu
+      : (hasSelectedGpu ? selectedGpu : [0]),
     maxCpuBudgetMillicores: positiveInteger(hardCeiling.cpu_millicores),
     maxMemoryBudgetMb: positiveInteger(hardCeiling.memory_mb),
+    maxGpuBudgetCount: exclusiveGpuCount(hardCeiling.gpu_count),
+    kernelIdleTimeoutSeconds,
+    kernelIdleTimeoutBounds,
     updatedAt: nullableString(value.updated_at),
   };
 }
@@ -638,14 +863,16 @@ function normalizeRuntimeTemplate(payload: unknown): RuntimeProfileTemplate | nu
   const pythonVersion = trimmedString(value.python_version, 64);
   const cpuLimit = positiveCpuLimit(value.cpu_limit);
   const memoryLimitMb = positiveInteger(value.memory_limit_mb);
+  const accelerator = normalizeAccelerator(value);
   if (!id || !version || !kernelName || !kernelDisplayName || !pythonVersion ||
-    !cpuLimit || !memoryLimitMb) return null;
+    !cpuLimit || !memoryLimitMb || !accelerator) return null;
   return {
     id,
     version,
     kernelName,
     kernelDisplayName,
     pythonVersion,
+    ...accelerator,
     cpuLimit,
     memoryLimitMb,
   };
@@ -866,6 +1093,9 @@ function normalizeResourcePolicyStrict(payload: unknown): ResourcePolicy {
     || policy.memoryBudgetMb <= 0
     || policy.selectableCpuMillicores.length === 0
     || policy.selectableMemoryMb.length === 0
+    || policy.selectableGpuCounts.length === 0
+    || policy.kernelIdleTimeoutSeconds === null
+    || policy.kernelIdleTimeoutBounds === null
   ) {
     throw invalidMutationResponse();
   }
@@ -1070,6 +1300,7 @@ async function mutationRequest<T>(
 
 export const portalApi = {
   loginUrl: `${API_BASE}/auth/login`,
+  passwordChangeUrl: `${API_BASE}/auth/change-password`,
   launchUrl(workspaceId: string): string {
     return `${API_BASE}/workspaces/${encodeURIComponent(workspaceId)}/launch`;
   },
@@ -1223,6 +1454,79 @@ export const portalApi = {
   async adminSettings(signal?: AbortSignal): Promise<ResourcePolicy> {
     return normalizeResourcePolicy(await request("/admin/settings", { signal }));
   },
+  async adminInternalEgressPolicy(
+    signal?: AbortSignal,
+  ): Promise<InternalEgressPolicySnapshot> {
+    return normalizeInternalEgressPolicy(
+      await request("/admin/internal-egress-policy", { signal }),
+    );
+  },
+  async createAdminInternalEgressRule(
+    destinationCidr: string,
+    port: number,
+    expectedRevision: number,
+  ): Promise<InternalEgressPolicySnapshot> {
+    return mutationRequest(
+      "/admin/internal-egress-policy/rules",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          destination_cidr: destinationCidr,
+          port,
+          expected_revision: expectedRevision,
+        }),
+      },
+      normalizeInternalEgressPolicy,
+    );
+  },
+  async updateAdminInternalEgressRule(input: {
+    id: string;
+    destinationCidr: string;
+    port: number;
+    expectedVersion: number;
+    expectedRevision: number;
+  }): Promise<InternalEgressPolicySnapshot> {
+    return mutationRequest(
+      `/admin/internal-egress-policy/rules/${encodeURIComponent(input.id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          destination_cidr: input.destinationCidr,
+          port: input.port,
+          expected_version: input.expectedVersion,
+          expected_revision: input.expectedRevision,
+        }),
+      },
+      normalizeInternalEgressPolicy,
+    );
+  },
+  async deleteAdminInternalEgressRule(
+    id: string,
+    expectedVersion: number,
+    expectedRevision: number,
+  ): Promise<InternalEgressPolicySnapshot> {
+    const query = new URLSearchParams({
+      expected_revision: String(expectedRevision),
+      expected_version: String(expectedVersion),
+    });
+    return mutationRequest(
+      `/admin/internal-egress-policy/rules/${encodeURIComponent(id)}?${query.toString()}`,
+      { method: "DELETE" },
+      normalizeInternalEgressPolicy,
+    );
+  },
+  async retryAdminInternalEgressPolicy(
+    expectedRevision: number,
+  ): Promise<InternalEgressPolicySnapshot> {
+    return mutationRequest(
+      "/admin/internal-egress-policy/retry",
+      {
+        method: "POST",
+        body: JSON.stringify({ expected_revision: expectedRevision }),
+      },
+      normalizeInternalEgressPolicy,
+    );
+  },
   async adminProfiles(signal?: AbortSignal): Promise<AdminProfileCatalog> {
     return normalizeAdminProfileCatalog(await request("/admin/profiles", { signal }));
   },
@@ -1290,6 +1594,9 @@ export const portalApi = {
           memory_budget_mb: update.memoryBudgetMb,
           selectable_cpu_millicores: update.selectableCpuMillicores,
           selectable_memory_mb: update.selectableMemoryMb,
+          gpu_budget_count: update.gpuBudgetCount,
+          selectable_gpu_counts: update.selectableGpuCounts,
+          kernel_idle_timeout_seconds: update.kernelIdleTimeoutSeconds,
         }),
       },
       normalizeResourcePolicyStrict,

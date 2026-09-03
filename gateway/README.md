@@ -83,7 +83,7 @@ production stack은 Engine 28+ base Compose와 Engine 27 자동 compatibility ov
 - `platform.cyberailabs.team`: Portal/API
 - `cyberailabs.team`: JupyterHub
 - `*.cyberailabs.team`: 사용자 서버
-- VIP `123.214.65.254:443` → production host `10.155.1.24:3030` TCP 전달
+- VIP `<PUBLIC_VIP>:443` → production host `<INTERNAL_SERVER_IP>:3030` TCP 전달
 
 upstream에는 외부 Host, `https`, port `443`, 검증된 client IP만 전달한다. Hub upload 한도는
 2 GiB이며 body를 disk에 모두 buffering하지 않고 WebSocket/장기 연결 timeout은 1시간이다.
@@ -101,7 +101,7 @@ hardened non-root probe를 검증한다. 이 검증이 통과한 뒤에만 Gatew
 서버 내부 HTTPS health를 확인하며, 실패한 Gateway는 다시 중지한다.
 
 API의 `FORWARDED_ALLOW_IPS`에는 production edge network의 Gateway 고정 IP
-`172.38.0.10` 하나만 들어간다. VIP는 TLS passthrough/DNAT-only로 전달하고 가능하면
+`172.29.3.10` 하나만 들어간다. VIP는 TLS passthrough/DNAT-only로 전달하고 가능하면
 SNAT하지 않아야 `$remote_addr` 기반 회사/VPN allowlist와 감사 IP가 일치한다.
 
 운영 시작 시에는 별도 read-only 파일

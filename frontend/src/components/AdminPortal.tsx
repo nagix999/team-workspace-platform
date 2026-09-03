@@ -2,8 +2,9 @@ import { useState } from "react";
 import type { AdminAuditEvent } from "../api/types";
 import { AdminAuditPanel } from "./AdminAuditPanel";
 import { AdminConsole, type AdminConsoleView } from "./AdminConsole";
+import { AdminInternalEgress } from "./AdminInternalEgress";
 
-export type AdminSection = AdminConsoleView | "audit";
+export type AdminSection = AdminConsoleView | "egress" | "audit";
 
 interface AdminPortalProps {
   auditEvents: AdminAuditEvent[];
@@ -18,9 +19,10 @@ export const adminNavigation: ReadonlyArray<{
   label: string;
 }> = [
   { id: "overview", label: "운영 현황" },
-  { id: "resources", label: "CPU·Memory 정책" },
+  { id: "resources", label: "자원·커널 정책" },
   { id: "profiles", label: "Python·자원 조합" },
   { id: "workspaces", label: "전체 개발환경" },
+  { id: "egress", label: "내부 서비스 통신" },
   { id: "audit", label: "감사 이벤트" },
 ];
 
@@ -62,6 +64,8 @@ export function AdminPortal({
           warning={auditWarning}
           refreshing={refreshing}
         />
+      ) : section === "egress" ? (
+        <AdminInternalEgress />
       ) : (
         <AdminConsole view={section} onPlatformChanged={onPlatformChanged} />
       )}

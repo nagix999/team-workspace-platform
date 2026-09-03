@@ -8,6 +8,8 @@ import {
   adminWorkspaceLifecycleControls,
   adminWorkspaceOperationNeedsPolling,
   availableResourceSelection,
+  gpuPolicyControlState,
+  resolveKernelIdleTimeoutSeconds,
 } from "./AdminConsole";
 
 const operation = (operationType: string, status: OperationStatus): Operation => ({
@@ -82,6 +84,71 @@ describe("AdminConsole operation polling", () => {
       2000,
     ]);
     expect(availableResourceSelection([500], [1000])).toEqual([]);
+  });
+
+  it("validates the administrator kernel idle timeout and supports disabling it", () => {
+    const bounds = { minSeconds: 300, maxSeconds: 604800, stepSeconds: 60 };
+    expect(resolveKernelIdleTimeoutSeconds(true, "60", bounds)).toBe(3600);
+    expect(resolveKernelIdleTimeoutSeconds(true, "5", bounds)).toBe(300);
+    expect(resolveKernelIdleTimeoutSeconds(true, "10080", bounds)).toBe(604800);
+    expect(resolveKernelIdleTimeoutSeconds(true, "4", bounds)).toBeNull();
+    expect(resolveKernelIdleTimeoutSeconds(true, "5.5", bounds)).toBeNull();
+    expect(resolveKernelIdleTimeoutSeconds(false, "", bounds)).toBe(0);
+    expect(resolveKernelIdleTimeoutSeconds(true, "60", null)).toBeNull();
+  });
+
+  it("enables the GPU toggle only for a verified free one-GPU pool", () => {
+    const configured = {
+      gpuBudgetCount: 1,
+      selectableGpuCounts: [0, 1],
+      availableGpuCounts: [0, 1],
+      maxGpuBudgetCount: 1,
+    };
+    expect(gpuPolicyControlState(configured, 0)).toEqual({
+      available: true,
+      enabled: true,
+      lockedByReservation: false,
+      canChange: true,
+    });
+    expect(gpuPolicyControlState(configured, 1)).toMatchObject({
+      available: true,
+      enabled: true,
+      lockedByReservation: true,
+      canChange: false,
+    });
+    expect(gpuPolicyControlState({
+      ...configured,
+      gpuBudgetCount: 0,
+      selectableGpuCounts: [0],
+      availableGpuCounts: [0],
+      maxGpuBudgetCount: 0,
+    }, 0)).toEqual({
+      available: false,
+      enabled: false,
+      lockedByReservation: false,
+      canChange: false,
+    });
+  });
+
+  it("allows a stale enabled GPU policy to be switched off after runtime removal", () => {
+    const staleEnabled = {
+      gpuBudgetCount: 1,
+      selectableGpuCounts: [0, 1],
+      availableGpuCounts: [0],
+      maxGpuBudgetCount: 0,
+    };
+    expect(gpuPolicyControlState(staleEnabled, 0)).toEqual({
+      available: false,
+      enabled: true,
+      lockedByReservation: false,
+      canChange: true,
+    });
+    expect(gpuPolicyControlState(staleEnabled, 1)).toEqual({
+      available: false,
+      enabled: true,
+      lockedByReservation: true,
+      canChange: false,
+    });
   });
 
   it.each(["NOT_FOUND", "STOPPED", "FAILED"] as const)(

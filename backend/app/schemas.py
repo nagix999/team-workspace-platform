@@ -4,7 +4,14 @@ from typing import Literal
 
 import unicodedata
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from .accelerators import NVIDIA_GPU_DEVICE_ID_RE
+from .policy_values import validate_kernel_idle_timeout
+from .services.internal_egress import (
+    normalize_destination_cidr,
+    validate_internal_service_port,
+)
 
 
 def _normalized_text(value: str, *, allow_blank: bool, maximum: int) -> str | None:
@@ -51,6 +58,46 @@ class ResourcePolicyUpdate(BaseModel):
     memory_budget_mb: int = Field(gt=0)
     selectable_cpu_millicores: list[int] = Field(min_length=1, max_length=32)
     selectable_memory_mb: list[int] = Field(min_length=1, max_length=32)
+    # Optional additions preserve the current values for older v1 clients;
+    # responses always contain the resolved policy values.
+    gpu_budget_count: int | None = Field(default=None, ge=0, le=1)
+    selectable_gpu_counts: list[int] | None = Field(
+        default=None, min_length=1, max_length=2
+    )
+    kernel_idle_timeout_seconds: int | None = Field(default=None, ge=0)
+
+    @field_validator("kernel_idle_timeout_seconds")
+    @classmethod
+    def kernel_idle_timeout_is_supported(cls, value: int | None) -> int | None:
+        return None if value is None else validate_kernel_idle_timeout(value)
+
+
+class InternalEgressRuleCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_revision: int = Field(gt=0)
+    destination_cidr: str = Field(min_length=1, max_length=18)
+    port: int = Field(ge=1024, le=65535)
+
+    @field_validator("destination_cidr")
+    @classmethod
+    def destination_is_exact_private_host(cls, value: str) -> str:
+        return normalize_destination_cidr(value)
+
+    @field_validator("port")
+    @classmethod
+    def port_is_not_control_plane(cls, value: int) -> int:
+        return validate_internal_service_port(value)
+
+
+class InternalEgressRuleUpdate(InternalEgressRuleCreate):
+    expected_version: int = Field(gt=0)
+
+
+class InternalEgressPolicyRetry(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_revision: int = Field(gt=0)
 
 
 class ProfileOfferCreate(BaseModel):
@@ -371,7 +418,25 @@ class SpawnAuthorizationBinding(BaseModel):
     environment_digest: str = Field(pattern=r"^hmac-sha256:[0-9a-f]{64}$")
     user_environment_generation: int = Field(gt=0)
     workspace_environment_generation: int = Field(gt=0)
+    kernel_idle_timeout_seconds: int = Field(strict=True, ge=0)
+    gpu_count: int = Field(strict=True, ge=0, le=1)
+    gpu_device_id: str | None = Field(pattern=NVIDIA_GPU_DEVICE_ID_RE.pattern)
+    gpu_inventory_digest: str | None = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     valid_until_unix: int = Field(gt=0)
+
+    @field_validator("kernel_idle_timeout_seconds")
+    @classmethod
+    def kernel_idle_timeout_is_supported(cls, value: int) -> int:
+        return validate_kernel_idle_timeout(value)
+
+    @model_validator(mode="after")
+    def gpu_assignment_is_exact(self) -> "SpawnAuthorizationBinding":
+        if self.gpu_count == 0:
+            if self.gpu_device_id is not None or self.gpu_inventory_digest is not None:
+                raise ValueError("CPU authorization cannot carry a GPU assignment")
+        elif self.gpu_device_id is None or self.gpu_inventory_digest is None:
+            raise ValueError("GPU authorization requires an exact inventory binding")
+        return self
 
 
 class SpawnAuthorizationPayload(SpawnAuthorizationBinding):

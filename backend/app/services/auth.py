@@ -348,6 +348,16 @@ class AuthService:
         # the previous Hub identity.
         return f"{self.settings.hub_public_url.rstrip('/')}/hub/logout"
 
+    def password_change_url(self) -> str:
+        """Return the exact NativeAuthenticator self-service password route.
+
+        Password fields are submitted directly to JupyterHub.  The portal only
+        provides an authenticated navigation boundary and never receives or
+        stores either the old or new password.
+        """
+
+        return f"{self.settings.hub_public_url.rstrip('/')}/hub/change-password"
+
     def decrypt_hub_token(self, portal_session: UserSession) -> str:
         now = datetime.utcnow()
         if (
