@@ -128,4 +128,22 @@ describe("WorkspaceCard profile compatibility", () => {
     expect(html).toContain("재시작 필요");
     expect(html).toContain("변경사항 적용 (재시작)");
   });
+
+  it.each(["NOT_FOUND", "STOPPED", "FAILED"] as const)(
+    "offers an enabled stop action for stale RUNNING intent observed as %s",
+    (observedState) => {
+      const html = render({
+        ...legacyWorkspace,
+        desiredState: "RUNNING",
+        observedState,
+        stale: true,
+      });
+      expect(html).toContain(
+        '<button class="button button--secondary" type="button">중지</button>',
+      );
+      expect(html).not.toContain(
+        '<button class="button button--secondary" type="button" disabled="">시작</button>',
+      );
+    },
+  );
 });

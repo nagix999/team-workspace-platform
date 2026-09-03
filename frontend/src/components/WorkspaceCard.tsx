@@ -56,13 +56,19 @@ export function WorkspaceCard({
     workspace.canRetryDelete && (
       workspace.deletionStatus === "FAILED" || workspace.lastErrorCode === "AUTH_REQUIRED"
     );
-  const controlsLocked = busy || operationActive || deletionPending || (
-    workspace.stale && !deletionRetryAvailable
-  );
   const lifecycleAvailable = workspace.desiredState !== "DELETED";
+  const intentRecoveryStop = lifecycleAvailable &&
+    workspace.desiredState === "RUNNING" &&
+    ["NOT_FOUND", "STOPPED", "FAILED"].includes(workspace.observedState);
+  const controlsLocked = busy || operationActive || deletionPending || (
+    workspace.stale && !deletionRetryAvailable && !intentRecoveryStop
+  );
   const canLaunch = lifecycleAvailable && workspace.observedState === "RUNNING" && !workspace.stale;
-  const canStart = lifecycleAvailable && ["NOT_FOUND", "STOPPED", "FAILED"].includes(workspace.observedState);
-  const canStop = lifecycleAvailable && ["STARTING", "RUNNING", "UNKNOWN"].includes(workspace.observedState);
+  const canStart = lifecycleAvailable && workspace.desiredState !== "RUNNING" &&
+    ["NOT_FOUND", "STOPPED", "FAILED"].includes(workspace.observedState);
+  const canStop = lifecycleAvailable && (
+    intentRecoveryStop || ["STARTING", "RUNNING", "UNKNOWN"].includes(workspace.observedState)
+  );
   const progress = Math.min(
     100,
     Math.max(0, operation?.progressPercent ?? workspace.progressPercent ?? 0),

@@ -73,6 +73,29 @@ x-backend-base: &backend-base
   logging: *bounded-logs
 
 services:
+  offline-maintenance:
+    profiles: [operator]
+    build:
+      context: ./backend
+    image: team-workspace-backend:production
+    entrypoint: ["python", "-m", "app.offline_maintenance"]
+    command: ["quiesce-stopped-intent"]
+    environment:
+      PLATFORM_DATABASE_URL: sqlite:////var/lib/platform/platform.db
+      PLATFORM_ENFORCE_SAFE_SQLITE: "true"
+    volumes:
+      - platform_data:/var/lib/platform
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging: *bounded-logs
+    restart: "no"
+
   native-user-admin:
     profiles: [operator]
     build:

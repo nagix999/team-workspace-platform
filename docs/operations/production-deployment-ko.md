@@ -52,10 +52,11 @@ disk 고갈 감시와 새 환경 생성 중단 절차가 필수다.
 - Linux 전용 호스트
 - Docker Engine 28 이상
 - Docker Compose v2
-- Git, Make, Python 3.10 이상, OpenSSL, curl
+- Git, Make, Python 3.10 이상, OpenSSL, curl, `flock`(util-linux)
 - DNS 확인용 `dig` 또는 동등 도구
 - 인증서 발급용 Certbot 또는 호환 ACME client
-- Docker image와 Python/npm 의존성을 내려받을 수 있는 build-time 외부 통신
+- Docker image, 공식 SQLite 소스(`www.sqlite.org`)와 Python/npm 의존성을 내려받을 수 있는
+  build-time 외부 통신
 - 운영자가 `/var/run/docker.sock`을 사용할 수 있는 권한
 
 버전을 확인한다.
@@ -540,6 +541,9 @@ curl --fail --silent --show-error https://platform.cyberailabs.team/healthz
 
 운영 서버에서 Git release를 받은 뒤 실행할 명령과 판정 기준은
 [10.155.1.24 운영 서버 Git 업데이트 절차](production-update-after-git-ko.md)를 따른다.
+운영 container를 이미 전부 수동 삭제해 DB의 실행 의도만 남은 장애는 같은 문서의
+`모든 container를 이미 삭제한 경우` 절차로만 복구한다. DB나 workspace volume을 직접
+삭제·수정하지 않는다.
 
 1. 모든 workspace를 중지하고 진행 중 operation/deletion이 없음을 확인한다.
 2. 운영 DB·Hub DB, secret, profile policy와 사용자 volume backup을 검증한다.
