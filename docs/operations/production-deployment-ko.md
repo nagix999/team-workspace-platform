@@ -422,7 +422,8 @@ Base의 Engine 28 isolated 정의를 그대로 유지하므로 기존 28 운영 
 27.5.1 미만 경고를 출력해도 다른 계약이 모두 맞으면 진행할 수 있지만, 경고를 변경 기록에
 남기고 가능한 즉시 27.5.1 이상 또는 조직이 승인한 현재 지원 release로 upgrade한다.
 
-상태는 모든 장기 실행 service가 healthy이고 worker가 running이어야 한다. `migrate`,
+상태는 모든 장기 실행 service가 healthy여야 한다. worker의 health는 HTTP가 아니라 PID 1
+operation-worker liveness를 뜻한다. `migrate`,
 `bootstrap-profile`, `singleuser-image`는 exit code 0인 one-shot container다.
 
 상세 로그는 다음으로 본다.

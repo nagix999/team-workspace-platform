@@ -344,6 +344,22 @@ class ProductionOrchestrationContractTests(unittest.TestCase):
         self.assertIn("driver_opts: !override", overlay)
         self.assertIn('inhibit_ipv4: "true"', overlay)
 
+    def test_worker_defines_compose_wait_compatible_liveness_check(self) -> None:
+        compose = (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
+        worker = compose.split("\n  worker:\n", 1)[1].split(
+            "\n  reconciler:\n", 1
+        )[0]
+
+        self.assertNotIn("disable: true", worker)
+        self.assertIn(
+            'test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]',
+            worker,
+        )
+        self.assertIn("interval: 10s", worker)
+        self.assertIn("timeout: 3s", worker)
+        self.assertIn("start_period: 5s", worker)
+        self.assertIn("retries: 3", worker)
+
     @unittest.skipUnless(shutil.which("docker"), "Docker Compose CLI is unavailable")
     def test_engine_27_overlay_renders_exact_driver_option_set(self) -> None:
         compose_version = subprocess.run(
@@ -380,6 +396,16 @@ class ProductionOrchestrationContractTests(unittest.TestCase):
         self.assertEqual(
             configuration["networks"]["jupyter"]["driver_opts"],
             network_contract.INHIBIT_IPV4_OPTIONS,
+        )
+        self.assertEqual(
+            configuration["services"]["worker"]["healthcheck"],
+            {
+                "test": ["CMD", "python", "-c", "import os; os.kill(1, 0)"],
+                "timeout": "3s",
+                "interval": "10s",
+                "retries": 3,
+                "start_period": "5s",
+            },
         )
 
 
