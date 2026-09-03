@@ -90,9 +90,11 @@ def test_stopped_workspace_creation_does_not_reserve_runtime_capacity(app_env):
         assert response.status_code == 202
     capacity = client.get("/api/v1/capacity").json()
     assert capacity["global"]["active"] == 0
+    assert capacity["global"]["kernel_idle_timeout_seconds"] == 3_600
     assert capacity["global"]["resources"] == {
         "cpu_millicores": {"reserved": 0, "limit": 16_000},
         "memory_mb": {"reserved": 0, "limit": 16_384},
+        "gpu_count": {"reserved": 0, "limit": 0},
     }
 
 

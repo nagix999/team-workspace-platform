@@ -413,6 +413,18 @@ restore_database_backup() {
   platform_sha="$(python3 scripts/domain_test_database_snapshot.py digest --bundle "$backup_dir" --filename platform.sqlite)"
   jupyterhub_sha="$(python3 scripts/domain_test_database_snapshot.py digest --bundle "$backup_dir" --filename jupyterhub.sqlite)"
 
+  # Reset DB-derived policy state before either database is mutated. A partial
+  # DB restore can then only restart with the image's deny-all bootstrap.
+  for policy_volume in \
+    "${project_name}_egress_policy_desired" \
+    "${project_name}_egress_policy_ack"
+  do
+    if docker volume inspect "${policy_volume}" >/dev/null 2>&1; then
+      docker volume rm "${policy_volume}" >/dev/null \
+        || { echo >&2 "database restore blocked: could not reset ${policy_volume}"; return 1; }
+    fi
+  done
+
   compose_base --profile maintenance run --rm --no-deps --user 0:0 \
     --volume "$backup_dir/platform.sqlite:/restore/input.sqlite:ro" \
     --env "PLATFORM_RESTORE_EXPECTED_SHA256=$platform_sha" \

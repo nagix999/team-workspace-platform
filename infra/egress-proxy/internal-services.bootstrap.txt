@@ -1,0 +1,2 @@
+# Immutable fail-closed bootstrap: dynamic administrator policy is published
+# after the control-plane worker starts. No private destination is allowed here.

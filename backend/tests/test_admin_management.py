@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from unittest.mock import AsyncMock
 
+from app.accelerators import gpu_inventory_digest
 from app.db import Base
 from app.domain import HubServerState
 from app.errors import AppError
@@ -27,11 +29,13 @@ from app.models import (
     WorkspaceDeletionJob,
     WorkspaceVolumeSlot,
 )
+from app.policy_values import kernel_idle_timeout_is_valid
 from app.services.deletions import (
     claim_deletion_job,
     complete_deletion_job,
     fail_deletion_job,
 )
+from app.services.mutations import mutation_request
 from app.services.resource_policy import get_resource_policy
 from app.services.workspaces import active_reservations
 from app.worker import OperationWorker, read_admin_lifecycle_token
@@ -184,6 +188,7 @@ def test_persisted_resource_policy_cannot_exceed_new_deployment_ceiling(
                 "memory_budget_mb": current["memory_budget_mb"],
                 "selectable_cpu_millicores": current["selectable_cpu_millicores"],
                 "selectable_memory_mb": current["selectable_memory_mb"],
+                "kernel_idle_timeout_seconds": current["kernel_idle_timeout_seconds"],
             },
             headers=mutation_headers(admin, "correct-lowered-hard-ceiling"),
         )
@@ -198,6 +203,282 @@ def test_persisted_resource_policy_cannot_exceed_new_deployment_ceiling(
             == old_budget - 1
         )
     assert client.get("/api/v1/capacity").status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (0, True),
+        (300, True),
+        (3_600, True),
+        (604_800, True),
+        (-1, False),
+        (1, False),
+        (299, False),
+        (301, False),
+        (604_801, False),
+        (True, False),
+        ("3600", False),
+    ],
+)
+def test_kernel_idle_timeout_value_contract(value, valid):
+    assert kernel_idle_timeout_is_valid(value) is valid
+
+
+def test_admin_kernel_idle_policy_validation_audit_and_replay(management_env):
+    app, hub, client = management_env
+    login(client, hub, "alice")
+    provision(app, "alice")
+
+    assert (
+        client.get("/api/v1/capacity").json()["global"]["kernel_idle_timeout_seconds"]
+        == 3_600
+    )
+    with TestClient(app, base_url=app.state.settings.portal_origin) as admin_client:
+        admin, *_ = login(admin_client, hub, "admin")
+        policy = admin_client.get("/api/v1/admin/settings").json()["resource_policy"]
+        assert policy["kernel_idle_timeout_seconds"] == 3_600
+        assert policy["kernel_idle_timeout_bounds"] == {
+            "min_seconds": 300,
+            "max_seconds": 604_800,
+            "step_seconds": 60,
+        }
+        base_payload = {
+            "version": policy["version"],
+            "cpu_budget_millicores": policy["cpu_budget_millicores"],
+            "memory_budget_mb": policy["memory_budget_mb"],
+            "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
+            "selectable_memory_mb": policy["selectable_memory_mb"],
+        }
+        invalid_values = (-1, 299, 301, 604_801, True, 3_600.0, "3600")
+        for index, invalid in enumerate(invalid_values):
+            rejected = admin_client.patch(
+                "/api/v1/admin/settings",
+                json={**base_payload, "kernel_idle_timeout_seconds": invalid},
+                headers=mutation_headers(admin, f"invalid-kernel-idle-{index}"),
+            )
+            assert rejected.status_code == 422, rejected.text
+            assert rejected.json()["error"]["code"] == "REQUEST_VALIDATION_FAILED"
+        missing = admin_client.patch(
+            "/api/v1/admin/settings",
+            json=base_payload,
+            headers=mutation_headers(admin, "missing-kernel-idle"),
+        )
+        assert missing.status_code == 200, missing.text
+        preserved = missing.json()["resource_policy"]
+        assert preserved["version"] == policy["version"] + 1
+        assert preserved["kernel_idle_timeout_seconds"] == 3_600
+        assert preserved["gpu_budget_count"] == policy["gpu_budget_count"] == 0
+        assert preserved["selectable_gpu_counts"] == [0]
+
+        payload = {
+            **base_payload,
+            "version": preserved["version"],
+            "kernel_idle_timeout_seconds": 0,
+        }
+        headers = mutation_headers(admin, "disable-kernel-idle-culling")
+        updated = admin_client.patch(
+            "/api/v1/admin/settings", json=payload, headers=headers
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["resource_policy"]["version"] == policy["version"] + 2
+        assert updated.json()["resource_policy"]["kernel_idle_timeout_seconds"] == 0
+        replay = admin_client.patch(
+            "/api/v1/admin/settings", json=payload, headers=headers
+        )
+        assert replay.status_code == 200
+        assert replay.json() == updated.json()
+
+    assert (
+        client.get("/api/v1/capacity").json()["global"]["kernel_idle_timeout_seconds"]
+        == 0
+    )
+    with app.state.session_factory() as db:
+        persisted = get_resource_policy(db, app.state.settings)
+        assert persisted.kernel_idle_timeout_seconds == 0
+        events = db.scalars(
+            select(AuditEvent).where(AuditEvent.action == "RESOURCE_POLICY_UPDATED")
+        ).all()
+        assert len(events) == 2
+        metadata_by_version = {
+            metadata["version"]: metadata
+            for metadata in (json.loads(event.safe_metadata_json) for event in events)
+        }
+        assert metadata_by_version[policy["version"] + 1] == {
+            "version": policy["version"] + 1,
+            "cpu_budget_millicores": policy["cpu_budget_millicores"],
+            "memory_budget_mb": policy["memory_budget_mb"],
+            "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
+            "selectable_memory_mb": policy["selectable_memory_mb"],
+            "previous_gpu_budget_count": 0,
+            "previous_selectable_gpu_counts": [0],
+            "gpu_budget_count": 0,
+            "selectable_gpu_counts": [0],
+            "previous_kernel_idle_timeout_seconds": 3_600,
+            "kernel_idle_timeout_seconds": 3_600,
+        }
+        assert metadata_by_version[policy["version"] + 2] == {
+            "version": policy["version"] + 2,
+            "cpu_budget_millicores": policy["cpu_budget_millicores"],
+            "memory_budget_mb": policy["memory_budget_mb"],
+            "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
+            "selectable_memory_mb": policy["selectable_memory_mb"],
+            "previous_gpu_budget_count": 0,
+            "previous_selectable_gpu_counts": [0],
+            "gpu_budget_count": 0,
+            "selectable_gpu_counts": [0],
+            "previous_kernel_idle_timeout_seconds": 3_600,
+            "kernel_idle_timeout_seconds": 0,
+        }
+
+
+def test_legacy_resource_policy_receipt_replays_when_idle_timeout_is_omitted(
+    management_env,
+):
+    app, hub, client = management_env
+    login(client, hub, "alice")
+    provision(app, "alice")
+    with TestClient(app, base_url=app.state.settings.portal_origin) as admin_client:
+        admin, *_ = login(admin_client, hub, "admin")
+        policy = admin_client.get("/api/v1/admin/settings").json()["resource_policy"]
+        legacy_payload = {
+            "version": policy["version"],
+            "cpu_budget_millicores": policy["cpu_budget_millicores"],
+            "memory_budget_mb": policy["memory_budget_mb"],
+            "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
+            "selectable_memory_mb": policy["selectable_memory_mb"],
+        }
+        legacy_policy = {
+            key: value
+            for key, value in policy.items()
+            if key
+            not in {
+                "gpu_budget_count",
+                "selectable_gpu_counts",
+                "available_gpu_counts",
+                "kernel_idle_timeout_seconds",
+                "kernel_idle_timeout_bounds",
+            }
+        }
+        legacy_policy["hard_ceiling"] = {
+            key: value
+            for key, value in policy["hard_ceiling"].items()
+            if key != "gpu_count"
+        }
+        legacy_response = {"resource_policy": legacy_policy}
+        request = mutation_request(
+            action="RESOURCE_POLICY_UPDATE",
+            target_key="resource-policy:1",
+            payload=legacy_payload,
+            fingerprint_key=app.state.settings.internal_hmac_key,
+        )
+        idempotency_key = "legacy-resource-policy-receipt"
+        with app.state.session_factory() as db:
+            db.add(
+                MutationReceipt(
+                    id=str(uuid.uuid4()),
+                    actor_user_id=admin["user"]["id"],
+                    idempotency_key=idempotency_key,
+                    action=request.action,
+                    target_key=request.target_key,
+                    request_fingerprint=request.fingerprint,
+                    response_json=json.dumps(
+                        legacy_response,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+            db.commit()
+
+        replay = admin_client.patch(
+            "/api/v1/admin/settings",
+            json=legacy_payload,
+            headers=mutation_headers(admin, idempotency_key),
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == legacy_response
+
+    with app.state.session_factory() as db:
+        persisted = get_resource_policy(db, app.state.settings)
+        assert persisted.version == policy["version"]
+        assert persisted.kernel_idle_timeout_seconds == 3_600
+        assert (
+            db.scalar(
+                select(func.count(AuditEvent.id)).where(
+                    AuditEvent.action == "RESOURCE_POLICY_UPDATED"
+                )
+            )
+            == 0
+        )
+
+
+def test_gpu_capacity_and_legacy_policy_update_preserve_gpu_fields(settings):
+    gpu_id = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+    gpu_settings = replace(
+        settings,
+        admin_usernames=("admin",),
+        nvidia_gpu_device_ids=(gpu_id,),
+    )
+    hub = FakeJupyterHubProvider()
+    app = create_app(gpu_settings, hub)
+    Base.metadata.create_all(app.state.engine)
+
+    with TestClient(app, base_url=gpu_settings.portal_origin) as client:
+        login(client, hub, "alice")
+        provision(app, "alice")
+        admin, *_ = login(client, hub, "admin")
+
+        policy = client.get("/api/v1/admin/settings").json()["resource_policy"]
+        assert policy["gpu_budget_count"] == 1
+        assert policy["selectable_gpu_counts"] == [0]
+        assert policy["available_gpu_counts"] == [0]
+        assert policy["hard_ceiling"]["gpu_count"] == 1
+
+        public_capacity = client.get("/api/v1/capacity")
+        assert public_capacity.status_code == 200, public_capacity.text
+        assert public_capacity.json()["global"]["resources"]["gpu_count"] == {
+            "reserved": 0,
+            "limit": 1,
+        }
+        admin_capacity = client.get("/api/v1/admin/capacity")
+        assert admin_capacity.status_code == 200, admin_capacity.text
+        assert admin_capacity.json()["resources"]["gpu_count"] == {
+            "reserved": 0,
+            "limit": 1,
+        }
+
+        # A pre-GPU v1 client sends neither GPU field.  Resolving the missing
+        # additions under the policy write lock must preserve, rather than
+        # silently reset, the administrator's current GPU budget and choices.
+        legacy_payload = {
+            "version": policy["version"],
+            "cpu_budget_millicores": policy["cpu_budget_millicores"],
+            "memory_budget_mb": policy["memory_budget_mb"],
+            "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
+            "selectable_memory_mb": policy["selectable_memory_mb"],
+        }
+        updated = client.patch(
+            "/api/v1/admin/settings",
+            json=legacy_payload,
+            headers=mutation_headers(admin, "legacy-client-preserves-gpu-policy"),
+        )
+        assert updated.status_code == 200, updated.text
+        updated_policy = updated.json()["resource_policy"]
+        assert updated_policy["gpu_budget_count"] == 1
+        assert updated_policy["selectable_gpu_counts"] == [0]
+
+    with app.state.session_factory() as db:
+        persisted = get_resource_policy(db, gpu_settings)
+        assert persisted.gpu_budget_count == 1
+        assert json.loads(persisted.selectable_gpu_counts_json) == [0]
+
+
+def test_gpu_inventory_digest_matches_hub_contract_vector():
+    assert gpu_inventory_digest(("GPU-01234567-89ab-cdef-0123-456789abcdef",)) == (
+        "sha256:df1a007a9153b95d91a0881a0eb37c0" "9590d10572c2c51afeae956271349a0b8"
+    )
 
 
 def test_unclaimed_start_releases_resources_when_stop_observes_not_found(
@@ -1026,7 +1307,11 @@ def test_admin_resource_policy_profile_offer_and_workspace_inventory(management_
         assert policy["hard_ceiling"] == {
             "cpu_millicores": app.state.settings.workspace_cpu_budget_millicores,
             "memory_mb": app.state.settings.workspace_memory_budget_mb,
+            "gpu_count": 0,
         }
+        assert policy["gpu_budget_count"] == 0
+        assert policy["selectable_gpu_counts"] == [0]
+        assert policy["available_gpu_counts"] == [0]
         too_high = admin_client.patch(
             "/api/v1/admin/settings",
             json={
@@ -1035,12 +1320,32 @@ def test_admin_resource_policy_profile_offer_and_workspace_inventory(management_
                 "memory_budget_mb": policy["memory_budget_mb"],
                 "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
                 "selectable_memory_mb": policy["selectable_memory_mb"],
+                "kernel_idle_timeout_seconds": policy["kernel_idle_timeout_seconds"],
             },
             headers=mutation_headers(admin, "policy-above-ceiling"),
         )
         assert too_high.status_code == 422
         assert (
             too_high.json()["error"]["code"] == "RESOURCE_BUDGET_EXCEEDS_HARD_CEILING"
+        )
+        gpu_too_high = admin_client.patch(
+            "/api/v1/admin/settings",
+            json={
+                "version": policy["version"],
+                "cpu_budget_millicores": policy["cpu_budget_millicores"],
+                "memory_budget_mb": policy["memory_budget_mb"],
+                "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
+                "selectable_memory_mb": policy["selectable_memory_mb"],
+                "gpu_budget_count": 1,
+                "selectable_gpu_counts": [0],
+                "kernel_idle_timeout_seconds": policy["kernel_idle_timeout_seconds"],
+            },
+            headers=mutation_headers(admin, "gpu-policy-above-ceiling"),
+        )
+        assert gpu_too_high.status_code == 422
+        assert (
+            gpu_too_high.json()["error"]["code"]
+            == "RESOURCE_BUDGET_EXCEEDS_HARD_CEILING"
         )
         below_reserved = admin_client.patch(
             "/api/v1/admin/settings",
@@ -1050,6 +1355,7 @@ def test_admin_resource_policy_profile_offer_and_workspace_inventory(management_
                 "memory_budget_mb": policy["memory_budget_mb"],
                 "selectable_cpu_millicores": policy["selectable_cpu_millicores"],
                 "selectable_memory_mb": policy["selectable_memory_mb"],
+                "kernel_idle_timeout_seconds": policy["kernel_idle_timeout_seconds"],
             },
             headers=mutation_headers(admin, "policy-below-reserved"),
         )
@@ -1065,6 +1371,9 @@ def test_admin_resource_policy_profile_offer_and_workspace_inventory(management_
         assert "image_ref" not in templates[0]
         assert "provider_options_json" not in templates[0]
         runtime = templates[0]
+        assert runtime["accelerator_kind"] == "none"
+        assert runtime["gpu_count"] == 0
+        assert runtime["cuda_version"] is None
         created_offer = admin_client.post(
             "/api/v1/admin/profiles",
             json={

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import ipaddress
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -24,10 +25,10 @@ def contract(mode: str = "inhibit-ipv4") -> network_contract.NetworkContract:
         network_name="platform-jupyter-compose-production",
         compose_project="team-workspace-production",
         isolation_mode=mode,
-        subnet=ipaddress.ip_network("172.40.0.0/24"),
-        ip_range=ipaddress.ip_network("172.40.0.128/25"),
+        subnet=ipaddress.ip_network("172.29.0.0/24"),
+        ip_range=ipaddress.ip_network("172.29.0.128/25"),
         required_endpoints=frozenset(
-            (ipaddress.ip_address("172.40.0.10"), ipaddress.ip_address("172.40.0.20"))
+            (ipaddress.ip_address("172.29.0.10"), ipaddress.ip_address("172.29.0.20"))
         ),
     )
 
@@ -58,17 +59,17 @@ def inspected_network(mode: str = "inhibit-ipv4") -> dict:
         "IPAM": {
             "Driver": "default",
             "Options": None,
-            "Config": [{"Subnet": "172.40.0.0/24", "IPRange": "172.40.0.128/25"}],
+            "Config": [{"Subnet": "172.29.0.0/24", "IPRange": "172.29.0.128/25"}],
         },
         "Containers": {
             "hub": {
                 "Name": "team-workspace-production-jupyterhub-1",
-                "IPv4Address": "172.40.0.10/24",
+                "IPv4Address": "172.29.0.10/24",
                 "IPv6Address": "",
             },
             "proxy": {
                 "Name": "team-workspace-production-egress-proxy-1",
-                "IPv4Address": "172.40.0.20/24",
+                "IPv4Address": "172.29.0.20/24",
                 "IPv6Address": "",
             },
         },
@@ -133,7 +134,7 @@ class DeclarativeNetworkContractTests(unittest.TestCase):
 
     def test_ipam_gateway_or_extra_option_is_rejected(self) -> None:
         gateway = inspected_network()
-        gateway["IPAM"]["Config"][0]["Gateway"] = "172.40.0.1"
+        gateway["IPAM"]["Config"][0]["Gateway"] = "172.29.0.1"
         extra_option = inspected_network()
         extra_option["Options"][
             "com.docker.network.bridge.enable_ip_masquerade"
@@ -246,7 +247,7 @@ class LiveNetworkContractTests(unittest.TestCase):
     def test_host_bridge_rejects_ipv4_and_non_link_local_ipv6(self) -> None:
         bridge_name = "br-" + "a" * 12
         for address in (
-            {"family": "inet", "local": "172.40.0.1"},
+            {"family": "inet", "local": "172.29.0.1"},
             {"family": "inet6", "local": "2001:db8::1"},
         ):
             with (
@@ -403,6 +404,13 @@ class ProductionOrchestrationContractTests(unittest.TestCase):
                 "json",
             ],
             cwd=ROOT,
+            env={
+                **os.environ,
+                # The checked-in example deliberately contains a non-IP
+                # fail-closed placeholder.  Supply a documentation-only
+                # address when this test exercises Compose rendering.
+                "PLATFORM_GATEWAY_BIND_IP": "192.0.2.24",
+            },
             check=False,
             capture_output=True,
             text=True,

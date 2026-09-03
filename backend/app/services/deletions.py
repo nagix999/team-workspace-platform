@@ -287,6 +287,7 @@ def complete_deletion_job(
     workspace.observed_state = ObservedState.NOT_FOUND.value
     workspace.stale = False
     workspace.hub_server_url = None
+    workspace.assigned_gpu_device_id = None
     workspace.archived_at = now
     workspace.deletion_checkpoint = "ARCHIVED"
     workspace.last_error_code = None

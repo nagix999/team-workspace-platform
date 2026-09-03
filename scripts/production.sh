@@ -11,7 +11,7 @@ readonly compose_file="${project_dir}/compose.production.yaml"
 readonly docker27_compose_file="${project_dir}/compose.production.docker27.yaml"
 readonly policy_file="${project_dir}/.runtime/production/profiles.json"
 readonly candidate_policy_file="${project_dir}/.runtime/production/profiles.candidate.json"
-readonly template_file="${project_dir}/infra/jupyterhub/profiles.local-dev.json"
+readonly template_file="${project_dir}/infra/jupyterhub/profiles.production-template.json"
 readonly production_runtime_dir="${project_dir}/.runtime/production"
 readonly backup_parent="${project_dir}/.runtime/production/backups"
 readonly operator_lock_file="${project_dir}/.runtime/production/operator.lock"
@@ -37,6 +37,17 @@ load_environment() {
   : "${PLATFORM_TLS_KEY_FILE:?}"
   : "${PLATFORM_INGRESS_CIDRS_FILE:?}"
   : "${PLATFORM_TLS_GID:?}"
+  PLATFORM_NVIDIA_GPU_DEVICE_ID=""
+  if [[ "${PLATFORM_GPU_RUNTIME_CONFIG_FILE:-disabled}" != disabled ]]; then
+    require_regular_file \
+      "${PLATFORM_GPU_RUNTIME_CONFIG_FILE}" "GPU runtime policy"
+    PLATFORM_NVIDIA_GPU_DEVICE_ID="$(
+      python3 infra/host/check_gpu_runtime.py \
+        --config "${PLATFORM_GPU_RUNTIME_CONFIG_FILE}" \
+        --print-device-id
+    )" || die "GPU runtime policy is invalid"
+  fi
+  export PLATFORM_NVIDIA_GPU_DEVICE_ID
 }
 
 compose() {
@@ -123,15 +134,36 @@ validate_docker_compose_override_contract() {
   fi
 }
 
+validate_gateway_bind_ip_contract() {
+  python3 - "${PLATFORM_GATEWAY_BIND_IP}" <<'PY' \
+    || die "PLATFORM_GATEWAY_BIND_IP must be a canonical IPv4 address that is not unspecified, loopback, or multicast"
+import ipaddress
+import sys
+
+try:
+    address = ipaddress.IPv4Address(sys.argv[1])
+except ipaddress.AddressValueError:
+    raise SystemExit(1)
+
+if (
+    str(address) != sys.argv[1]
+    or address.is_unspecified
+    or address.is_loopback
+    or address.is_multicast
+):
+    raise SystemExit(1)
+PY
+}
+
 production_network_contract() {
   python3 scripts/validate_production_network.py "$@" \
     --network-name platform-jupyter-compose-production \
     --compose-project "${PRODUCTION_COMPOSE_PROJECT_NAME}" \
     --isolation-mode "${production_network_isolation_mode}" \
-    --subnet 172.40.0.0/24 \
-    --ip-range 172.40.0.128/25 \
-    --required-endpoint 172.40.0.10 \
-    --required-endpoint 172.40.0.20
+    --subnet 172.29.0.0/24 \
+    --ip-range 172.29.0.128/25 \
+    --required-endpoint 172.29.0.10 \
+    --required-endpoint 172.29.0.20
 }
 
 validate_gateway_health() {
@@ -306,8 +338,16 @@ recover_after_user_admin_failure() {
 validate_host_contract() {
   local certificate_sans cert_key file_key key_mode san
   validate_docker_engine_contract
-  [[ "${PLATFORM_GATEWAY_BIND_IP}" == "10.155.1.24" ]] \
-    || die "PLATFORM_GATEWAY_BIND_IP must remain 10.155.1.24 for the reviewed VIP contract"
+  if [[ -n "${PLATFORM_NVIDIA_GPU_DEVICE_ID}" ]]; then
+    command -v nvidia-smi >/dev/null \
+      || die "nvidia-smi is required when GPU support is enabled"
+    command -v nvidia-ctk >/dev/null \
+      || die "NVIDIA Container Toolkit is required when GPU support is enabled"
+  fi
+  validate_gateway_bind_ip_contract
+  python3 scripts/check_production_subnet_conflicts.py \
+    --compose-project "${PRODUCTION_COMPOSE_PROJECT_NAME}" \
+    || die "production Docker subnets overlap an existing Docker network or host route"
   ip -4 -o address show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${PLATFORM_GATEWAY_BIND_IP}" \
     || die "this host does not own ${PLATFORM_GATEWAY_BIND_IP}; deploy on the production server"
   require_regular_file "${PLATFORM_TLS_CERT_FILE}" "TLS fullchain"
@@ -386,15 +426,49 @@ require_offline_recovery_state() {
 }
 
 prepare_images_and_policy() {
+  local image_id gpu_image_id="" cpu_image_hex cpu_cuda_base cpu_base_after gpu_base_label
+  local -a args profile_check_args=()
   compose build singleuser-image
   image_id="$(docker image inspect team-workspace-singleuser:production-current --format '{{.Id}}')"
   [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "single-user build did not produce an exact image ID"
+  if [[ -n "${PLATFORM_NVIDIA_GPU_DEVICE_ID}" ]]; then
+    cpu_image_hex="${image_id#sha256:}"
+    cpu_cuda_base="team-workspace-singleuser:cuda-base-${cpu_image_hex}"
+    docker tag "${image_id}" "${cpu_cuda_base}"
+    [[ "$(docker image inspect "${cpu_cuda_base}" --format '{{.Id}}')" == "${image_id}" ]] \
+      || die "CUDA build base tag does not resolve to the reviewed CPU image"
+    docker build \
+      --file infra/singleuser/Dockerfile.cuda \
+      --build-arg "CUDA_SINGLEUSER_BASE_IMAGE=${cpu_cuda_base}" \
+      --build-arg "CUDA_SINGLEUSER_BASE_IMAGE_ID=${image_id}" \
+      --tag team-workspace-singleuser-cuda:production-current \
+      infra/singleuser
+    cpu_base_after="$(docker image inspect "${cpu_cuda_base}" --format '{{.Id}}')"
+    [[ "${cpu_base_after}" == "${image_id}" ]] \
+      || die "CUDA build base tag changed while the image was being built"
+    gpu_image_id="$(docker image inspect team-workspace-singleuser-cuda:production-current --format '{{.Id}}')"
+    [[ "${gpu_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || die "CUDA single-user build did not produce an exact image ID"
+    gpu_base_label="$(
+      docker image inspect team-workspace-singleuser-cuda:production-current \
+        --format '{{index .Config.Labels "io.team-workspace.cpu-base.image-id"}}'
+    )"
+    [[ "${gpu_base_label}" == "${image_id}" ]] \
+      || die "CUDA single-user image is not bound to the reviewed CPU base"
+    python3 infra/host/check_gpu_runtime.py \
+      --config "${PLATFORM_GPU_RUNTIME_CONFIG_FILE}" \
+      --image "${gpu_image_id}"
+    profile_check_args+=(
+      --nvidia-gpu-device-id "${PLATFORM_NVIDIA_GPU_DEVICE_ID}"
+    )
+  fi
   args=(
     --template "${template_file}"
     --image-id "${image_id}"
     --shared-volume jupyter-shared
     --output "${candidate_policy_file}"
   )
+  [[ -z "${gpu_image_id}" ]] || args+=(--gpu-image-id "${gpu_image_id}")
   [[ ! -s "${policy_file}" ]] || args+=(--previous "${policy_file}")
   python3 infra/jupyterhub/generate_production_profile_policy.py "${args[@]}"
   while read -r retained_id; do
@@ -402,7 +476,9 @@ prepare_images_and_policy() {
       || die "retained production profile image is missing locally: ${retained_id}"
     docker tag "${retained_id}" "team-workspace-singleuser:retained-${retained_id#sha256:}"
   done < <(python3 -c 'import json,sys; print("\n".join(sorted({p["image"] for p in json.load(open(sys.argv[1]))["profiles"]})))' "${candidate_policy_file}")
-  python3 infra/jupyterhub/profile_image_check.py --policy "${candidate_policy_file}"
+  python3 infra/jupyterhub/profile_image_check.py \
+    --policy "${candidate_policy_file}" \
+    "${profile_check_args[@]}"
   compose build api jupyterhub frontend egress-proxy gateway
   compose config --quiet
 }
@@ -411,6 +487,22 @@ database_volume_names() {
   printf '%s\n' \
     "${PRODUCTION_COMPOSE_PROJECT_NAME}_platform_data" \
     "${PRODUCTION_COMPOSE_PROJECT_NAME}_jupyterhub_data"
+}
+
+internal_egress_runtime_volume_names() {
+  printf '%s\n' \
+    "${PRODUCTION_COMPOSE_PROJECT_NAME}_egress_policy_desired" \
+    "${PRODUCTION_COMPOSE_PROJECT_NAME}_egress_policy_ack"
+}
+
+reset_internal_egress_runtime_state() {
+  local volume_name
+  while read -r volume_name; do
+    if docker volume inspect "${volume_name}" >/dev/null 2>&1; then
+      docker volume rm "${volume_name}" >/dev/null \
+        || die "could not reset stale internal egress runtime state: ${volume_name}"
+    fi
+  done < <(internal_egress_runtime_volume_names)
 }
 
 database_volume_count() {
@@ -853,6 +945,10 @@ restore() {
   require_idle
   python3 scripts/domain_test_database_snapshot.py verify --bundle "${PRODUCTION_BACKUP_DIR}" >/dev/null
   compose down
+  # Reset derived policy state before mutating either database. If this fails,
+  # restoration stops with the original DB untouched; if a later DB restore
+  # step fails, the next proxy boot is still deny-all.
+  reset_internal_egress_runtime_state
   platform_identity="$(image_identity team-workspace-backend:production)"
   hub_identity="$(image_identity team-workspace-jupyterhub:production)"
   readarray -t volumes < <(database_volume_names)

@@ -9,8 +9,8 @@
 | 포털/API | `https://platform.cyberailabs.team` |
 | JupyterHub | `https://cyberailabs.team` |
 | 사용자 Jupyter | `https://<username>.cyberailabs.team` |
-| 공인 VIP | `123.214.65.254:443` |
-| 내부 운영 서버 | `10.155.1.24:3030` |
+| 공인 VIP | `<PUBLIC_VIP>:443` |
+| 내부 운영 서버 | `<INTERNAL_SERVER_IP>:3030` |
 | TLS 종료 | 운영 서버의 Gateway Nginx |
 | 배포 방식 | 단일 호스트 Docker Compose |
 
@@ -27,8 +27,8 @@ Gateway의 source CIDR allowlist로 적용한다.
 
 진행 전에 다음 담당자와 값을 확정한다.
 
-- 서버 담당자: `10.155.1.24` Linux/Docker/디스크/backup
-- 네트워크 담당자: `123.214.65.254:443 → 10.155.1.24:3030` TCP 전달
+- 서버 담당자: `<INTERNAL_SERVER_IP>` Linux/Docker/디스크/backup
+- 네트워크 담당자: `<PUBLIC_VIP>:443 → <INTERNAL_SERVER_IP>:3030` TCP 전달
 - DNS 담당자: HostingKR의 apex와 `*` A record, 선택적 `platform` A record, DNS-01 TXT
 - 인증서 담당자: 발급, 만료 알림, 갱신과 개인키 보관
 - 서비스 관리자: `PLATFORM_ADMIN_USERNAME`과 사용자 등록/퇴사 처리
@@ -59,6 +59,8 @@ disk 고갈 감시와 새 환경 생성 중단 절차가 필수다.
 - Docker image, 공식 SQLite 소스(`www.sqlite.org`)와 Python/npm 의존성을 내려받을 수 있는
   build-time 외부 통신
 - 운영자가 `/var/run/docker.sock`을 사용할 수 있는 권한
+- GPU 사용 시 x86_64 NVIDIA host, 호환 driver, NVIDIA Container Toolkit과 Docker `nvidia`
+  runtime (CPU-only 배포에는 불필요)
 
 버전을 확인한다.
 
@@ -84,7 +86,8 @@ ip -4 -o address show
 ss -ltnp
 ```
 
-`10.155.1.24`가 서버에 실제로 설정되어 있어야 하며 첫 배포 전 `10.155.1.24:3030`은 비어
+`<INTERNAL_SERVER_IP>`가 서버에 실제로 설정되어 있어야 하며 첫 배포 전
+`<INTERNAL_SERVER_IP>:3030`은 비어
 있어야 한다.
 
 ## 3. 검토된 소스코드 배치
@@ -117,9 +120,9 @@ HostingKR 권한 DNS에 다음 A record를 둔다.
 
 | 이름 | 유형 | 값 | 필요 여부 |
 | --- | --- | --- | --- |
-| `@` 또는 빈 이름 | A | `123.214.65.254` | 필수 |
-| `*` | A | `123.214.65.254` | 필수 |
-| `platform` | A | `123.214.65.254` | 선택 |
+| `@` 또는 빈 이름 | A | `<PUBLIC_VIP>` | 필수 |
+| `*` | A | `<PUBLIC_VIP>` | 필수 |
+| `platform` | A | `<PUBLIC_VIP>` | 선택 |
 
 별도 `platform` A record는 없어도 된다. `platform` 이름에 다른 record가 전혀 없으면 root
 wildcard가 `platform.cyberailabs.team`에도 응답한다. `platform` 이름에 record를 따로 둔다면
@@ -133,13 +136,13 @@ dig +short A platform.cyberailabs.team
 dig +short A dns-check-user.cyberailabs.team
 ```
 
-세 결과가 모두 `123.214.65.254`여야 한다. 변경 직전에는 TTL을 낮추고, 검증이 끝난 뒤 조직
+세 결과가 모두 `<PUBLIC_VIP>`여야 한다. 변경 직전에는 TTL을 낮추고, 검증이 끝난 뒤 조직
 정책값으로 되돌린다.
 
 네트워크 장비는 다음 계약으로 설정한다.
 
 ```text
-123.214.65.254:443/TCP  ->  10.155.1.24:3030/TCP
+<PUBLIC_VIP>:443/TCP  ->  <INTERNAL_SERVER_IP>:3030/TCP
 ```
 
 - VIP에서 TLS를 종료하거나 인증서를 교체하지 않는다.
@@ -300,13 +303,14 @@ chmod 0600 .env.production
 ```dotenv
 PRODUCTION_COMPOSE_PROJECT_NAME=team-workspace-production
 PLATFORM_ADMIN_USERNAME=platform-admin
-PLATFORM_GATEWAY_BIND_IP=10.155.1.24
+PLATFORM_GATEWAY_BIND_IP=<INTERNAL_SERVER_IP>
 PLATFORM_TLS_CERT_FILE=/etc/team-workspace/tls/fullchain.pem
 PLATFORM_TLS_KEY_FILE=/etc/team-workspace/tls/privkey.pem
 PLATFORM_INGRESS_CIDRS_FILE=/etc/team-workspace/ingress-cidrs.txt
 PLATFORM_TLS_GID=REPLACE_WITH_TLS_FILE_GROUP_GID
 PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES=8000
 PLATFORM_WORKSPACE_MEMORY_BUDGET_MB=4096
+PLATFORM_GPU_RUNTIME_CONFIG_FILE=disabled
 DOCKER_GID=REPLACE_WITH_DOCKER_SOCKET_GID
 PLATFORM_SECRET_GID=REPLACE_WITH_PRODUCTION_SECRET_GROUP_GID
 ```
@@ -327,8 +331,99 @@ hard ceiling**이다. OS, Docker, Gateway, Hub, DB와 build 여유를 남긴다.
 ceiling 안에서 사용자가 선택할 CPU·메모리 값을 추가할 수 있다. 처음부터 호스트 최대값으로
 설정하지 않는다.
 
+`PLATFORM_GPU_RUNTIME_CONFIG_FILE=disabled`는 CPU-only 기본값이다. 이 상태에서는 GPU image를
+빌드하거나 GPU profile을 노출하지 않으며, 일반 Python 3.12/3.13 kernel은 CUDA runtime이라고
+간주하지 않는다. GPU를 사용할 때만 다음 절차를 완료한 뒤 이 값을 절대경로로 바꾼다.
+
 `.env.production`에는 공백, shell 명령, 따옴표나 임의 확장을 넣을 수 없다. `KEY=value`의
 제한된 형식만 production script가 허용한다.
+
+### 8.1 선택: NVIDIA GPU runtime 활성화
+
+현재 GPU 범위는 **x86_64 host의 물리 NVIDIA GPU 정확히 1개를 workspace 하나에 독점 할당**하는
+초기 계약이다. 제공하는 kernel은 Python 3.12.13의 `python312-cuda` 하나이며 PyTorch
+`2.7.1+cu126`/CUDA 12.6으로 고정된다. 일반 Python kernel을 선택하면 GPU가 보이지 않는다.
+GPU memory quota, MIG, time-slicing, 여러 GPU 동시 할당, 사용자 CUDA extension compile용
+`nvcc`는 지원 범위가 아니다.
+
+Python 자체가 CUDA를 제공하는 것은 아니다. 이 플랫폼은 CPU single-user image와 별도인
+CUDA image에 CUDA-enabled PyTorch wheel을 설치한다. Host에는 CUDA Toolkit 전체나 `nvcc`가
+필수인 것이 아니라, GPU에 맞는 NVIDIA driver와 Docker에 장치를 주입하는 NVIDIA Container
+Toolkit이 필요하다. 실제 driver가 CUDA 12.6 runtime 및 해당 GPU와 호환되는지는 버전 문자열만
+믿지 않고 마지막 tensor probe로 확인한다.
+
+먼저 장비와 OS가 GPU를 인식하는지 확인한다. `nvidia-smi: command not found`이면 플랫폼을
+시작하기 전에 배포판/조직 표준 절차로 NVIDIA driver와 사용자 도구를 설치하고 reboot해야 한다.
+서버 모델과 GPU 세대에 맞는 driver branch는 서버 담당자가 정하며 임의의 package 이름을 이
+문서에서 고정하지 않는다.
+
+```bash
+uname -m
+lspci -nn | grep -i nvidia
+nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader,nounits
+```
+
+`uname -m`은 현재 image 계약에서 `x86_64`여야 한다. `nvidia-smi`가 성공한 뒤 NVIDIA 공식
+저장소 절차로 Container Toolkit을 설치하고 Docker runtime을 구성한다. 다음 구성 명령은 Docker
+daemon 설정을 바꾸고 restart는 실행 중 container에 영향을 줄 수 있으므로 최초 설치 또는 승인된
+유지보수 창에서만 수행한다.
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+nvidia-ctk --version
+docker info --format '{{json .Runtimes}}'
+```
+
+마지막 출력에는 `nvidia` runtime이 있어야 한다. Toolkit 설치 package/repository 명령은 OS별로
+달라지므로 이 문서 끝의 NVIDIA 공식 설치 문서를 그대로 따른다.
+
+플랫폼에 허용할 GPU UUID 하나와 실제 version을 Git 밖의 운영 파일에 고정한다. 아래 예제는
+secret은 아니지만 scheduler 입력이므로 무결성이 중요하다. 저장소의 예제 파일을 root 소유
+일반 파일로 복사하고 값을 직접 검토한다.
+
+```bash
+sudo install -d -m 0750 -o root -g "$(id -gn)" /etc/team-workspace
+sudo install -m 0640 -o root -g "$(id -gn)" \
+  infra/host/gpu-runtime.production.example.json \
+  /etc/team-workspace/gpu-runtime.json
+sudoedit /etc/team-workspace/gpu-runtime.json
+```
+
+형식은 다음과 같고 `gpu_uuids`에는 `nvidia-smi`가 출력한 `GPU-...` 물리 UUID 하나만 넣는다.
+index `0`, PCI bus ID, MIG UUID 또는 여러 UUID는 허용되지 않는다. version도 위 명령의 실제
+출력과 정확히 같아야 한다.
+
+```json
+{
+  "schema_version": 1,
+  "nvidia_driver_version": "EXACT_DRIVER_VERSION",
+  "nvidia_container_toolkit_version": "EXACT_TOOLKIT_VERSION",
+  "gpu_uuids": ["GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
+}
+```
+
+`.env.production`에는 다음 절대경로만 넣는다. GPU UUID를 `.env.production`이나 Compose 파일에
+직접 중복 기록하지 않는다.
+
+```dotenv
+PLATFORM_GPU_RUNTIME_CONFIG_FILE=/etc/team-workspace/gpu-runtime.json
+```
+
+이후 `make production-preflight`는 DB를 변경하기 전에 다음을 모두 확인한다.
+
+- 설정 파일이 일반 non-symlink 파일이고 group/world writable이 아님
+- 설정한 driver/toolkit version과 물리 GPU UUID가 현재 host inventory와 정확히 일치
+- Docker `nvidia` runtime 존재
+- CPU image와 별도로 만든 CUDA image가 검토한 CPU image ID를 base로 사용
+- 새 image뿐 아니라 재시작 가능하게 남은 모든 enabled GPU history image에서 container에
+  allowlist UUID 하나만 보이며 각 image의 PyTorch/CUDA/kernel 계약이 일치
+- `torch.cuda.is_available()`과 실제 CUDA tensor 연산/synchronize 성공
+
+CUDA image의 첫 build는 크고 `download.pytorch.org` 접근이 필요할 수 있다. 위 검증 중 하나라도
+실패하면 GPU profile policy를 생성하거나 DB migration을 시작하지 않는다. 오류를 우회하려고
+일반 Python profile에 `NVIDIA_VISIBLE_DEVICES`, `CUDA_VISIBLE_DEVICES` 같은 환경변수를 추가하면
+안 되며 이 이름들은 사용자 환경변수에서 차단된다.
 
 ## 9. egress와 차단 사용자 정책 검토
 
@@ -341,6 +436,20 @@ infra/egress-proxy/approved-domains.production.txt
 
 기본값은 PyPI, npm과 승인된 GitHub download 경로다. 사내망, metadata 주소, 임의 domain을
 넣지 않는다. 변경은 code review 후 새 image build로 배포한다.
+
+특정 내부 HTTP(S) 서비스가 필요한 경우 domain allowlist나 `.env`에 IP를 추가하지 않는다.
+최초 `v0.1.6` 배포에서는 DB migration과 동적 정책용 volume/mount 생성 때문에 stack을
+재생성해야 한다. 배포 후 관리자 포털의 **내부 서비스 통신** 메뉴에서 검토한 사설 IPv4
+`/32`와 TCP port를
+등록한다. 저장 직후 desired revision이 올라가고, 정상일 때 수 초 안에 applied revision이
+같아져야 한다. 실패 상태에서는 이전 정상 정책이 유지되며 **적용 재시도**를 사용할 수 있다.
+
+같은 host의 서비스를 대상으로 할 때 process가 `127.0.0.1`에만 listen하면 container의
+loopback과 다른 주소이므로 접근할 수 없다. host LAN 주소 또는 보안 검토한 `0.0.0.0`에
+listen시키고, 노트북 요청은 기존 `HTTP_PROXY/HTTPS_PROXY`를 그대로 사용한다. 대상 IP를
+`NO_PROXY`에 넣으면 안 된다. 정책 삭제는 새 연결에 즉시 반영되지만 이미 열린 CONNECT/HTTP
+연결 종료는 보장되지 않는다. 사고 대응에서 즉시 폐기가 필요하면 egress connection을 drain한
+후 proxy를 재시작한다.
 
 퇴사자/차단 사용자는 다음 JSON에 exact username으로 관리한다.
 
@@ -362,7 +471,7 @@ make production-preflight
 
 사전검사는 다음을 fail-closed로 확인한다.
 
-- 서버가 `10.155.1.24`를 실제 보유함
+- 서버가 `<INTERNAL_SERVER_IP>`를 실제 보유함
 - Docker Server Engine이 기능 호환 하한 27.1.2 이상임; 27.5.1 미만 경고를 검토함
 - Engine 27이면 Docker Compose 2.24.4+와 compatibility overlay 렌더링이 유효함
 - 인증서/개인키 일치, key mode/GID, 24시간 이상 유효, apex/wildcard 두 SAN
@@ -370,6 +479,7 @@ make production-preflight
 - 실행 중 single-user container와 local/domain-test stack 부재
 - Platform/Hub DB volume이 둘 다 존재하거나 둘 다 존재하지 않음
 - digest-pinned base image와 전체 Python/CPU/메모리 profile image 계약
+- GPU 활성화 시 별도 CUDA/PyTorch image, 정확한 GPU UUID·driver·toolkit과 CUDA tensor 계약
 - production Compose 렌더링과 Gateway `nginx -t`
 
 첫 build는 image 다운로드와 Python/npm 설치 때문에 오래 걸릴 수 있다. 중간에 실패하면 원인을
@@ -390,7 +500,8 @@ make production-ps
 
 `production-up`은 preflight를 다시 실행하고 다음 순서로 진행한다.
 
-1. Host·TLS·Engine/Compose·image/Compose 계약과 DB idle을 다시 사전 검사
+1. Host·TLS·Engine/Compose·image/Compose 계약과 DB idle을 다시 사전 검사; GPU가 활성화된
+   경우 exact UUID를 주입한 CUDA tensor smoke도 반복
 2. 기존 Gateway와 제어면 내부 service를 중지하고 DB idle을 다시 확인
 3. 기존 DB가 있으면 Platform/Hub SQLite online backup 생성
 4. Production profile policy를 exact single-user image ID에 결속하고 Alembic migration과
@@ -501,7 +612,9 @@ make production-create-user USERNAME=alice
 ```
 
 임시 비밀번호는 별도의 안전한 채널로 사용자에게 전달하고, 사용자는 첫 로그인 직후
-`https://cyberailabs.team/hub/change-password`에서 변경한다. username은 소문자 영문으로
+포털의 **비밀번호 변경** 버튼으로 exact Hub
+`https://cyberailabs.team/hub/change-password` self-service 화면을 열어 변경한다. 비밀번호
+본문은 Platform API를 거치지 않는다. username은 소문자 영문으로
 시작하고 소문자·숫자·단일 하이픈 조합의 최대 32자다. 계정 생성 명령도 잠깐의 control-plane
 유지보수 구간을 사용하므로 사용자에게 공지한 뒤 실행한다.
 
@@ -531,16 +644,28 @@ curl --fail --silent --show-error https://alice.cyberailabs.team/healthz
 - 관리자 로그인 후 관리자 전용 메뉴 표시
 - 일반 사용자에게 관리자 메뉴/API가 보이지 않음
 - 로그아웃 후 기존 계정으로 자동 재로그인되지 않고 ID/password를 다시 요구
+- 로그인 완료 후 Hub의 exact `/hub/spawn` fallback이 포털 root로 `303` 응답하고 브라우저가
+  `https://platform.cyberailabs.team/`에 도착
+- 포털의 **비밀번호 변경** 버튼이 exact Hub `/hub/change-password` self-service 화면으로
+  연결되고 비밀번호 본문은 Platform API 요청에 포함되지 않음
 - 잘못된 비밀번호 반복 시 rate limit 확인
 - 관리자 화면에서 생성 환경 수, 실제 실행 수, CPU/RAM 예약과 ceiling 확인
+- GPU를 활성화한 경우 GPU hard ceiling, 선택 정책과 예약 수 확인
+- 관리자 자원·커널 정책에서 유휴 커널 자동 정리 on/off와 시간 저장
 
 ### 13.3 workspace
 
 - 사용자 개인공간 준비 완료
-- Python, CPU, 메모리 선택 후 중지 상태 workspace 생성
+- Python, CPU, 메모리와 허용된 accelerator 선택 후 중지 상태 workspace 생성
 - 생성 후 일반/secret 환경변수 저장
 - 환경변수 변경 시 restart 필요 안내
 - 시작 후 JupyterLab, Notebook kernel, terminal과 WebSocket 동작
+- GPU 환경에서 `python312-cuda`만 표시되고 `torch.__version__ == "2.7.1+cu126"`,
+  `torch.version.cuda == "12.6"`, `torch.cuda.is_available() is True`, device 수 1과 CUDA tensor
+  연산 성공; CPU 환경에서는 GPU가 보이지 않음
+- 첫 GPU workspace가 실행 중이면 두 번째 GPU workspace 시작은 capacity 부족으로 거부되고,
+  첫 환경을 정상 중지한 뒤 다음 환경이 시작됨
+- 테스트용 timeout 적용 후 busy kernel 유지, idle kernel 정리와 파일 보존 확인
 - `/home/jovyan/work` private data 영속성
 - `/home/jovyan/shared` 팀 공유 read/write와 재시작 후 보존
 - 직접 사내망/인터넷 연결 차단 및 승인된 PyPI/Git만 proxy를 통해 성공
@@ -565,7 +690,11 @@ make production-logs
 df -h
 df -i
 docker system df
+nvidia-smi
 ```
+
+`nvidia-smi`는 GPU를 활성화한 host에서만 실행한다. GPU 사용률·memory는 관측 지표이며 현재
+플랫폼이 사용자별 GPU memory quota를 강제한다는 의미는 아니다.
 
 최소 경보 대상은 다음과 같다.
 
@@ -620,7 +749,7 @@ zone으로 CNAME/NS 위임해 갱신을 자동화할 수 있다. DNS API key는 
 ## 16. 애플리케이션 업그레이드
 
 운영 서버에서 Git release를 받은 뒤 실행할 명령과 판정 기준은
-[10.155.1.24 운영 서버 Git 업데이트 절차](production-update-after-git-ko.md)를 따른다.
+[운영 서버 Git 업데이트 절차](production-update-after-git-ko.md)를 따른다.
 운영 container를 이미 전부 수동 삭제해 DB의 실행 의도만 남은 장애는 같은 문서의
 `모든 container를 이미 삭제한 경우` 절차로만 복구한다. DB나 workspace volume을 직접
 삭제·수정하지 않는다.
@@ -632,6 +761,18 @@ zone으로 CNAME/NS 위임해 갱신을 자동화할 수 있다. DNS API key는 
 5. `make production-preflight`를 실행한다.
 6. `make production-up`을 실행한다.
 7. health, 로그인, 기존 중지 workspace restart를 확인한다.
+
+GPU 기능이 포함된 release로 기존 CPU-only DB를 올릴 때 schema-v2 CPU profile history는 원래
+digest와 image ID를 유지한 채 재시작 전용으로 남고, 새 schema-v3 CPU/GPU runtime이 추가된다.
+GPU 설정 파일이 `disabled`이면 CPU profile만 생성되므로 GPU 설치는 upgrade의 필수 조건이
+아니다. 반대로 GPU를 한 번 활성화해 enabled GPU history가 생긴 뒤에는 설정 파일을 단순히
+`disabled`로 바꾸면 preflight가 실패하는 것이 정상이다. 기존 GPU workspace의 재시작 계약을
+조용히 제거하지 않기 위한 보호이므로, GPU 폐기는 workspace와 profile history를 함께 다루는
+검토된 별도 release/이전 절차로 진행하고 runtime policy 파일을 직접 편집하지 않는다.
+
+DB migration과 schema-v3 profile promotion 뒤 구버전 code만 checkout하는 것은 안전한 rollback이
+아니다. 되돌려야 한다면 upgrade 직전의 검증된 Platform/Hub DB backup과 같은 세대의 profile
+policy를 함께 복원한다.
 
 `production-up`은 기존 DB가 있을 때 두 DB의 SQLite online backup을 먼저 만든다. 출력된 경로는
 서버 내부 임시 안전망이지 off-host backup을 대신하지 않는다.
@@ -656,6 +797,7 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 | production Hub DB volume | ID/password hash, OAuth, named-server 상태 |
 | `secrets/production` | DB 암호문 복호화와 서비스 인증에 필요한 key |
 | `.runtime/production/profiles.json` | 기존 workspace의 immutable runtime 결속 |
+| `/etc/team-workspace/gpu-runtime.json` | 선택한 물리 GPU와 검증할 driver/toolkit 계약(GPU 사용 시) |
 | `platform.managed=true` private volumes | 사용자 작업 데이터 |
 | `jupyter-shared` | 팀 공유 데이터 |
 | TLS/ACME 계정 자료 | 인증서 갱신 연속성 |
@@ -676,7 +818,7 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 
 | 증상 | 확인할 항목 |
 | --- | --- |
-| `this host does not own 10.155.1.24` | NIC 주소와 배포 대상 서버 확인 |
+| `this host does not own <INTERNAL_SERVER_IP>` | NIC 주소와 배포 대상 서버 확인 |
 | TLS file이 symlink라 거부됨 | Certbot `live`를 직접 지정하지 말고 전용 regular file로 복사 |
 | `PLATFORM_TLS_GID does not match` | key의 숫자 GID와 `.env.production` 비교 |
 | 외부에서 444/timeout | source/SNAT CIDR, VIP ACL, ingress allowlist 확인 |
@@ -698,13 +840,15 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 - [ ] 검토된 release tag/commit이며 working tree가 깨끗함
 - [ ] Docker Server Engine 27.1.2+, Engine 27이면 Compose 2.24.4+, Docker firewall 관리 활성 확인
 - [ ] Engine 27.5.1 미만 경고를 기록하고 최신 보안 patch로 올릴 일정 확인
-- [ ] 서버가 `10.155.1.24`를 보유하고 3030 충돌 없음
+- [ ] 서버가 `<INTERNAL_SERVER_IP>`를 보유하고 3030 충돌 없음
 - [ ] DNS apex와 root wildcard를 통한 portal/random hostname이 VIP를 반환
 - [ ] VIP 443→host 3030 L4 전달과 source IP/SNAT 계약 확인
 - [ ] 인증서 apex/wildcard SAN 두 개, key mode/GID, 만료 경보 확인
 - [ ] 회사/VPN CIDR allowlist와 상위 ACL 확인
 - [ ] live execution network option, host bridge IPv4/routable IPv6 주소 부재와 Docker restart 후 연결 차단 확인
 - [ ] CPU/RAM ceiling에 control-plane/OS 여유 포함
+- [ ] GPU 사용 시 driver/toolkit/runtime, 외부 관리 GPU policy 파일과 exact UUID/tensor probe 확인
+- [ ] GPU memory quota·MIG·공유 할당이 제공되지 않는 제한을 운영자와 사용자에게 공지
 - [ ] egress domain과 blocked-user 정책 검토
 - [ ] `make production-preflight` 성공
 - [ ] `make production-up` 및 모든 health 성공
@@ -719,6 +863,10 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 ## 공식 참고자료
 
 - [Docker Engine 설치](https://docs.docker.com/engine/install/)
+- [NVIDIA Container Toolkit 설치와 Docker runtime 구성](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+- [NVIDIA Container의 GPU 열거와 driver capability](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html)
+- [NVIDIA CUDA minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+- [PyTorch CUDA 설치·검증](https://pytorch.org/get-started/locally/)
 - [Let's Encrypt DNS-01 및 wildcard challenge](https://letsencrypt.org/ca/docs/challenge-types/)
 - [Certbot manual DNS와 갱신 제한](https://eff-certbot.readthedocs.io/en/stable/using.html#manual)
 - [HostingKR TXT 레코드 등록](https://help.hosting.kr/hc/ko/articles/5696985768217-TXT%EB%A0%88%EC%BD%94%EB%93%9C-%EB%93%B1%EB%A1%9D%ED%95%98%EA%B8%B0)

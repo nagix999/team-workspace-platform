@@ -121,6 +121,10 @@ key 교체는 명시적인 재암호화 migration과 restore 시험으로만 수
   선택 정책에 직접 추가할 수 있으며, 서버는 immutable Python runtime마다 전체 자원 조합을
   파생 profile로 materialize한다. Hub는 원본 runtime digest, 파생 digest와 같은 hard ceiling을
   재검증한다. offer는 image/command를 받지 않는다.
+  같은 versioned singleton 정책의 `kernel_idle_timeout_seconds`는 `0` 또는 5분~7일의 분
+  단위 값이다. worker가 시작 시점 값을 authorization에 snapshot하고 Hub가 다시 검증한 뒤
+  Jupyter kernel culler argument로 적용한다. 변경은 이미 실행 중인 process에 hot-apply하지
+  않으며 일반 사용자 capacity 응답에도 현재 정책을 안내용으로 포함한다.
   hard ceiling을 낮출 때는 먼저 이 API로 persisted budget을 새 ceiling 이하로 줄인 뒤
   배포 설정을 변경한다. 반대 순서에서는 admission/import가 의도적으로 fail-closed된다.
 - workspace 응답의 `active_operation`은 최신 `PENDING|RUNNING|WAITING_EXTERNAL` lifecycle
@@ -160,4 +164,4 @@ pytest
 테스트는 실제 Hub 대신 `FakeJupyterHubProvider`를 주입하며 OAuth state 단일 사용,
 opaque cookie/암호문 저장, 소유권, transactional 5-slot/idempotency, provisioning
 lease·manifest·재시도, worker 수렴, 관리자 actor/target 분리, 환경 secret/rollback,
-restart/remove, crash-safe deletion과 populated 0003→0004 migration 데이터 보존을 확인한다.
+restart/remove, crash-safe deletion과 populated 0003→0007 migration 데이터 보존을 확인한다.

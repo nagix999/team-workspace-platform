@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from .accelerators import CPU_ACCELERATOR, profile_accelerator_options
 from .config import Settings
 from .db import begin_immediate, create_database_engine, create_session_factory
 from .domain import UserProvisioningStatus
@@ -58,6 +59,9 @@ PROFILE_EXECUTION_FIELDS_V2 = tuple(
     )
 )
 PROFILE_EXECUTION_FIELDS = PROFILE_EXECUTION_FIELDS_V2
+PROFILE_EXECUTION_FIELDS_V3 = tuple(
+    sorted({*PROFILE_EXECUTION_FIELDS_V2, "accelerator"})
+)
 PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 KERNEL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 PYTHON_VERSION_RE = re.compile(
@@ -129,7 +133,7 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
     if (
         set(policy) != {"schema_version", "shared_volume", "profiles"}
         or type(policy["schema_version"]) is not int
-        or policy["schema_version"] not in {1, 2}
+        or policy["schema_version"] not in {1, 2, 3}
     ):
         raise ValueError("profile policy top-level schema mismatch")
     schema_version = policy["schema_version"]
@@ -149,6 +153,9 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
     )
     v2_legacy_profile_keys = v1_legacy_profile_keys.union({"selectable"})
     v2_extended_profile_keys = set(PROFILE_EXECUTION_FIELDS_V2).union(
+        {"enabled", "selectable", "config_digest"}
+    )
+    v3_extended_profile_keys = set(PROFILE_EXECUTION_FIELDS_V3).union(
         {"enabled", "selectable", "config_digest"}
     )
     profiles = policy["profiles"]
@@ -209,12 +216,19 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
             if schema_version == 1 and raw_keys == v1_legacy_profile_keys:
                 execution_fields = PROFILE_EXECUTION_FIELDS_V1
                 extended_profile = False
-            elif schema_version == 2 and raw_keys == v2_legacy_profile_keys:
+                has_accelerator = False
+            elif schema_version in {2, 3} and raw_keys == v2_legacy_profile_keys:
                 execution_fields = PROFILE_EXECUTION_FIELDS_V1
                 extended_profile = False
-            elif schema_version == 2 and raw_keys == v2_extended_profile_keys:
+                has_accelerator = False
+            elif schema_version in {2, 3} and raw_keys == v2_extended_profile_keys:
                 execution_fields = PROFILE_EXECUTION_FIELDS_V2
                 extended_profile = True
+                has_accelerator = False
+            elif schema_version == 3 and raw_keys == v3_extended_profile_keys:
+                execution_fields = PROFILE_EXECUTION_FIELDS_V3
+                extended_profile = True
+                has_accelerator = True
             else:
                 # This also rejects a partial v2 extension and any extended profile
                 # inside a v1 document.
@@ -233,7 +247,9 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
             seen_profile_keys.add(key)
             if type(raw["enabled"]) is not bool:
                 raise ValueError("profile enabled must be boolean")
-            selectable = raw["selectable"] if schema_version == 2 else raw["enabled"]
+            selectable = (
+                raw["selectable"] if schema_version in {2, 3} else raw["enabled"]
+            )
             if type(selectable) is not bool:
                 raise ValueError("profile selectable must be boolean")
             if selectable and not raw["enabled"]:
@@ -241,6 +257,10 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
             if selectable and not extended_profile:
                 raise ValueError(
                     "selectable v2 profile requires exact runtime metadata"
+                )
+            if schema_version == 3 and selectable and not has_accelerator:
+                raise ValueError(
+                    "selectable schema-v3 profile requires accelerator metadata"
                 )
 
             image = raw["image"]
@@ -307,6 +327,7 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
                     raise ValueError(
                         "profile private_disk_quota_enforced must be boolean"
                     )
+                accelerator = profile_accelerator_options(raw)
             else:
                 kernel_name = "python3"
                 kernel_display_name = "Python 3"
@@ -315,6 +336,11 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
                 # False is the conservative disclosure and legacy rows are not
                 # selectable in a v2 policy.
                 quota_enforced = False
+                accelerator = CPU_ACCELERATOR
+            if selectable and accelerator.count > len(settings.nvidia_gpu_device_ids):
+                raise ValueError(
+                    "selectable GPU profile exceeds the verified deployment GPU inventory"
+                )
             if (
                 raw["enabled"]
                 and not settings.unsafe_local_runtime
@@ -341,6 +367,11 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
                 "kernel_name": kernel_name,
                 "kernel_display_name": kernel_display_name,
                 "python_version": python_version,
+                "accelerator_kind": accelerator.kind,
+                "gpu_count": accelerator.count,
+                "cuda_version": accelerator.cuda_version,
+                "gpu_framework": accelerator.framework,
+                "gpu_framework_version": accelerator.framework_version,
                 "image_ref": str(image),
                 "cpu_limit": str(raw["cpu_limit"]),
                 "memory_limit_mb": memory_mb,
@@ -389,7 +420,9 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
         # endpoints never create or reactivate offers.
         ensure_default_offers(db)
         resource_policy = get_resource_policy(db, settings, create=True)
-        selected_cpu, selected_memory = selected_resource_values(resource_policy)
+        selected_cpu, selected_memory, _selected_gpu = selected_resource_values(
+            resource_policy
+        )
         ensure_resource_profile_matrix(
             db,
             cpu_millicores=sorted(selected_cpu),

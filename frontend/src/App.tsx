@@ -91,6 +91,9 @@ export default function App() {
               <small>{portal.user.role === "ADMIN" ? "관리자" : portal.user.username}</small>
             </span>
           </div>
+          <a className="text-button" href={portalApi.passwordChangeUrl}>
+            비밀번호 변경
+          </a>
           <button className="text-button" type="button" onClick={() => void portal.logout()}>
             로그아웃
           </button>

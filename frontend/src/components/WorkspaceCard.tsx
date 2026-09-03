@@ -80,6 +80,11 @@ export function WorkspaceCard({
   const kernelName = profile?.kernelDisplayName ??
     workspace.kernelDisplayName ?? workspace.kernelName;
   const pythonVersion = profile?.pythonVersion ?? workspace.pythonVersion;
+  const acceleratorKind = profile?.acceleratorKind ?? workspace.acceleratorKind;
+  const gpuCount = profile?.gpuCount ?? workspace.gpuCount;
+  const cudaVersion = profile?.cudaVersion ?? workspace.cudaVersion;
+  const gpuFrameworkVersion = profile?.gpuFrameworkVersion ??
+    workspace.gpuFrameworkVersion;
   const cpuLimit = profile?.cpuLimit ?? workspace.cpuLimit;
   const memoryLimitMb = profile?.memoryLimitMb ?? workspace.memoryLimitMb;
   const privateDiskLimitMb = profile?.privateDiskLimitMb ?? workspace.privateDiskLimitMb;
@@ -87,7 +92,7 @@ export function WorkspaceCard({
     workspace.privateDiskQuotaEnforced;
   const hasProfileDetails = Boolean(
     kernelName || pythonVersion || cpuLimit || memoryLimitMb ||
-      privateDiskLimitMb || privateDiskQuotaEnforced !== null,
+      privateDiskLimitMb || privateDiskQuotaEnforced !== null || acceleratorKind,
   );
 
   return (
@@ -118,6 +123,9 @@ export function WorkspaceCard({
         <ul className="resource-list workspace-profile-details" aria-label="개발환경 설정">
           {kernelName && <li>기본 커널 {kernelName}</li>}
           {pythonVersion && <li>기본 노트북/터미널 Python {pythonVersion}</li>}
+          {acceleratorKind === "nvidia" && gpuCount === 1 && (
+            <li>NVIDIA GPU 1개 · CUDA {cudaVersion} · PyTorch {gpuFrameworkVersion}</li>
+          )}
           {cpuLimit && <li>CPU {cpuLimit}</li>}
           {memoryLimitMb !== null && <li>메모리 {formatMegabytes(memoryLimitMb)}</li>}
           {privateDiskQuotaEnforced === true ? (

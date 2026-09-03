@@ -17,6 +17,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+from .policy_values import KERNEL_IDLE_TIMEOUT_DEFAULT_SECONDS
 
 
 def utcnow() -> datetime:
@@ -109,6 +110,15 @@ class AuthTransaction(Base):
 class WorkspaceProfile(Base):
     __tablename__ = "workspace_profiles"
     __table_args__ = (
+        CheckConstraint(
+            "(accelerator_kind = 'none' AND gpu_count = 0 AND "
+            "cuda_version IS NULL AND gpu_framework IS NULL AND "
+            "gpu_framework_version IS NULL) OR "
+            "(accelerator_kind = 'nvidia' AND gpu_count = 1 AND "
+            "cuda_version IS NOT NULL AND gpu_framework = 'pytorch' AND "
+            "gpu_framework_version IS NOT NULL)",
+            name="ck_profiles_accelerator_contract",
+        ),
         UniqueConstraint(
             "id", "version", "config_digest", name="uq_profiles_digest_binding"
         ),
@@ -126,6 +136,13 @@ class WorkspaceProfile(Base):
     python_version: Mapped[str] = mapped_column(
         String(32), nullable=False, default="legacy"
     )
+    accelerator_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none"
+    )
+    gpu_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cuda_version: Mapped[str | None] = mapped_column(String(16))
+    gpu_framework: Mapped[str | None] = mapped_column(String(32))
+    gpu_framework_version: Mapped[str | None] = mapped_column(String(32))
     image_ref: Mapped[str] = mapped_column(String(512), nullable=False)
     cpu_limit: Mapped[str] = mapped_column(String(32), nullable=False)
     memory_limit_mb: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -221,6 +238,7 @@ class Workspace(Base):
     profile_offer_id: Mapped[str | None] = mapped_column(String(64))
     profile_offer_version: Mapped[int | None] = mapped_column(Integer)
     profile_offer_name_snapshot: Mapped[str | None] = mapped_column(String(80))
+    assigned_gpu_device_id: Mapped[str | None] = mapped_column(String(96))
     hub_target_key: Mapped[str] = mapped_column(
         String(255), nullable=False, unique=True
     )
@@ -264,6 +282,13 @@ Index(
     Workspace.private_volume_slot_id,
     unique=True,
     sqlite_where=Workspace.archived_at.is_(None),
+)
+
+Index(
+    "uq_workspace_assigned_gpu_device",
+    Workspace.assigned_gpu_device_id,
+    unique=True,
+    sqlite_where=Workspace.assigned_gpu_device_id.is_not(None),
 )
 
 
@@ -339,6 +364,19 @@ class AuditEvent(Base):
 class SpawnAuthorization(Base):
     __tablename__ = "spawn_authorizations"
     __table_args__ = (
+        CheckConstraint(
+            "kernel_idle_timeout_seconds = 0 OR "
+            "(kernel_idle_timeout_seconds BETWEEN 300 AND 604800 AND "
+            "kernel_idle_timeout_seconds % 60 = 0)",
+            name="ck_spawn_auth_kernel_idle_timeout",
+        ),
+        CheckConstraint(
+            "(gpu_count = 0 AND gpu_device_id IS NULL AND "
+            "gpu_inventory_digest IS NULL) OR "
+            "(gpu_count = 1 AND gpu_device_id IS NOT NULL AND "
+            "gpu_inventory_digest IS NOT NULL)",
+            name="ck_spawn_auth_gpu_contract",
+        ),
         UniqueConstraint(
             "operation_id", "attempt_no", name="uq_spawn_auth_operation_attempt"
         ),
@@ -389,6 +427,12 @@ class SpawnAuthorization(Base):
     workspace_environment_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1
     )
+    kernel_idle_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=KERNEL_IDLE_TIMEOUT_DEFAULT_SECONDS
+    )
+    gpu_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    gpu_device_id: Mapped[str | None] = mapped_column(String(96))
+    gpu_inventory_digest: Mapped[str | None] = mapped_column(String(71))
     environment_digest: Mapped[str | None] = mapped_column(String(76))
     environment_snapshot_cipher: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -407,6 +451,16 @@ class ResourcePolicy(Base):
         CheckConstraint(
             "memory_budget_mb > 0", name="ck_resource_policy_memory_budget"
         ),
+        CheckConstraint(
+            "kernel_idle_timeout_seconds = 0 OR "
+            "(kernel_idle_timeout_seconds BETWEEN 300 AND 604800 AND "
+            "kernel_idle_timeout_seconds % 60 = 0)",
+            name="ck_resource_policy_kernel_idle_timeout",
+        ),
+        CheckConstraint(
+            "gpu_budget_count BETWEEN 0 AND 1",
+            name="ck_resource_policy_gpu_budget",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
@@ -415,6 +469,13 @@ class ResourcePolicy(Base):
     memory_budget_mb: Mapped[int] = mapped_column(Integer, nullable=False)
     selectable_cpu_millicores_json: Mapped[str] = mapped_column(Text, nullable=False)
     selectable_memory_mb_json: Mapped[str] = mapped_column(Text, nullable=False)
+    gpu_budget_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    selectable_gpu_counts_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[0]"
+    )
+    kernel_idle_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=KERNEL_IDLE_TIMEOUT_DEFAULT_SECONDS
+    )
     updated_by_user_id: Mapped[str | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL")
     )
@@ -513,6 +574,114 @@ class MutationReceipt(Base):
     response_json: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utcnow
+    )
+
+
+class InternalEgressPolicy(Base):
+    __tablename__ = "internal_egress_policies"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_internal_egress_policy_singleton"),
+        CheckConstraint(
+            "desired_revision > 0",
+            name="ck_internal_egress_policy_desired_revision",
+        ),
+        CheckConstraint(
+            "length(desired_digest) = 71 AND "
+            "substr(desired_digest, 1, 7) = 'sha256:' AND "
+            "substr(desired_digest, 8) NOT GLOB '*[^0-9a-f]*'",
+            name="ck_internal_egress_policy_desired_digest",
+        ),
+        CheckConstraint(
+            "applied_digest IS NULL OR "
+            "(length(applied_digest) = 71 AND "
+            "substr(applied_digest, 1, 7) = 'sha256:' AND "
+            "substr(applied_digest, 8) NOT GLOB '*[^0-9a-f]*')",
+            name="ck_internal_egress_policy_applied_digest",
+        ),
+        CheckConstraint(
+            "(applied_revision IS NULL AND applied_digest IS NULL) OR "
+            "(applied_revision IS NOT NULL AND applied_revision > 0 AND "
+            "applied_revision <= desired_revision AND applied_digest IS NOT NULL)",
+            name="ck_internal_egress_policy_applied_binding",
+        ),
+        CheckConstraint(
+            "(applied_revision IS NULL AND applied_at IS NULL) OR "
+            "(applied_revision IS NOT NULL AND applied_at IS NOT NULL)",
+            name="ck_internal_egress_policy_applied_time_binding",
+        ),
+        CheckConstraint(
+            "apply_status IN ('PENDING', 'APPLYING', 'APPLIED', 'FAILED')",
+            name="ck_internal_egress_policy_status",
+        ),
+        CheckConstraint(
+            "apply_status != 'APPLIED' OR "
+            "(applied_revision IS NOT NULL AND applied_digest IS NOT NULL AND "
+            "applied_revision = desired_revision AND "
+            "applied_digest = desired_digest)",
+            name="ck_internal_egress_policy_applied_current",
+        ),
+        CheckConstraint(
+            "(apply_status = 'FAILED' AND last_error_code IS NOT NULL) OR "
+            "(apply_status != 'FAILED' AND last_error_code IS NULL)",
+            name="ck_internal_egress_policy_error_binding",
+        ),
+        CheckConstraint(
+            "last_error_code IS NULL OR "
+            "(length(last_error_code) BETWEEN 1 AND 64 AND "
+            "substr(last_error_code, 1, 1) GLOB '[A-Z]' AND "
+            "last_error_code NOT GLOB '*[^A-Z0-9_]*')",
+            name="ck_internal_egress_policy_error_code",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    desired_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    desired_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    applied_revision: Mapped[int | None] = mapped_column(Integer)
+    applied_digest: Mapped[str | None] = mapped_column(String(71))
+    apply_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="PENDING"
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, onupdate=utcnow
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class InternalEgressRule(Base):
+    __tablename__ = "internal_egress_rules"
+    __table_args__ = (
+        UniqueConstraint(
+            "destination_cidr",
+            "port",
+            name="uq_internal_egress_destination_port",
+        ),
+        CheckConstraint("port BETWEEN 1024 AND 65535", name="ck_internal_egress_port"),
+        CheckConstraint("row_version > 0", name="ck_internal_egress_rule_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    destination_cidr: Mapped[str] = mapped_column(String(18), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    updated_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow, onupdate=utcnow
     )
 
 

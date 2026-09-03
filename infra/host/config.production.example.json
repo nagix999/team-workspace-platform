@@ -8,12 +8,12 @@
   "network": {
     "name": "platform-jupyter",
     "bridge_name": "br-plt-jupyter",
-    "subnet": "172.30.0.0/24",
-    "dynamic_ip_range": "172.30.0.128/25",
-    "hub_ip": "172.30.0.10",
-    "egress_proxy_ip": "172.30.0.20",
-    "egress_out_subnet": "172.29.0.0/24",
-    "egress_out_proxy_ip": "172.29.0.2",
+    "subnet": "172.29.0.0/24",
+    "dynamic_ip_range": "172.29.0.128/25",
+    "hub_ip": "172.29.0.10",
+    "egress_proxy_ip": "172.29.0.20",
+    "egress_out_subnet": "172.29.4.0/24",
+    "egress_out_proxy_ip": "172.29.4.2",
     "hub_api_port": 8081,
     "singleuser_port": 8888,
     "egress_proxy_port": 3128

@@ -8,13 +8,14 @@ labels, and persisted project-ID reservations cannot drift between entrypoints.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
 import stat
 import tempfile
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -144,6 +145,102 @@ def validate_local_manifest(path: Path) -> dict[str, Any]:
             f"cannot read existing local manifest {path}: {exc}"
         ) from exc
     return validate_local_manifest_value(manifest, where=str(path))
+
+
+def validate_persisted_manifest(path: Path) -> dict[str, Any]:
+    """Validate either manifest format written into the shared state directory.
+
+    Local/domain-test provisioning persists the synthetic manifest while the
+    reviewed production Docker-volume path persists a digest-bound inventory
+    with exact mountpoints.  Both formats reserve the same project-ID namespace,
+    so the allocator must validate and import both before assigning a new block.
+    """
+
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"cannot read existing provisioning manifest {path}: {exc}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"{path} is not an object")
+    if "inventory_sha256" not in manifest:
+        return validate_local_manifest_value(manifest, where=str(path))
+    return validate_production_manifest_value(manifest, where=str(path))
+
+
+def validate_production_manifest_value(
+    manifest: object, *, where: str = "production manifest"
+) -> dict[str, Any]:
+    """Validate a persisted production inventory and return its allocation."""
+
+    expected_keys = {
+        "schema_version",
+        "inventory_sha256",
+        "user_id",
+        "username",
+        "uid",
+        "gid",
+        "slots",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise RuntimeError(f"{where} schema is invalid")
+    if manifest["schema_version"] != 1:
+        raise RuntimeError(f"{where} has an invalid schema version")
+
+    slots = manifest["slots"]
+    if not isinstance(slots, list):
+        raise RuntimeError(f"{where} must contain five slots")
+    local_slots: list[dict[str, Any]] = []
+    paths: set[str] = set()
+    for slot in slots:
+        if not isinstance(slot, dict) or set(slot) != {
+            "slot_id",
+            "slot_number",
+            "volume_name",
+            "hard_limit_bytes",
+            "project_id",
+            "path",
+        }:
+            raise RuntimeError(f"{where} has an invalid slot schema")
+        raw_path = slot["path"]
+        if not isinstance(raw_path, str):
+            raise RuntimeError(f"{where} has an invalid volume path")
+        parsed_path = PurePosixPath(raw_path)
+        if (
+            not parsed_path.is_absolute()
+            or ".." in parsed_path.parts
+            or str(parsed_path) != raw_path
+            or raw_path in paths
+        ):
+            raise RuntimeError(f"{where} has an invalid volume path")
+        paths.add(raw_path)
+        local_slots.append({key: value for key, value in slot.items() if key != "path"})
+
+    local_equivalent = {
+        "schema_version": manifest["schema_version"],
+        "unsafe_local_dev": True,
+        "user_id": manifest["user_id"],
+        "username": manifest["username"],
+        "uid": manifest["uid"],
+        "gid": manifest["gid"],
+        "slots": local_slots,
+    }
+    allocation = validate_local_manifest_value(local_equivalent, where=where)
+    inventory = {
+        "user_id": manifest["user_id"],
+        "username": manifest["username"],
+        "uid": manifest["uid"],
+        "gid": manifest["gid"],
+        "slots": slots,
+    }
+    canonical = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    expected_digest = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    if manifest["inventory_sha256"] != expected_digest:
+        raise RuntimeError(f"{where} inventory digest is invalid")
+    return allocation
 
 
 def validate_local_manifest_value(
@@ -325,7 +422,7 @@ def reserve_project_id_block(
         if output.exists():
             manifest_paths.add(output)
         for manifest_path in sorted(manifest_paths):
-            allocation = validate_local_manifest(manifest_path)
+            allocation = validate_persisted_manifest(manifest_path)
             if manifest_path == output and (
                 allocation["user_id"] != canonical_id
                 or allocation["username"] != safe_username

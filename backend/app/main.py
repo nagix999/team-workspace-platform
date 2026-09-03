@@ -36,6 +36,9 @@ from .models import (
 )
 from .schemas import (
     EnvironmentVariablePut,
+    InternalEgressPolicyRetry,
+    InternalEgressRuleCreate,
+    InternalEgressRuleUpdate,
     ProfileOfferCreate,
     ProfileOfferUpdate,
     ResourcePolicyUpdate,
@@ -70,6 +73,14 @@ from .services.environment import (
     put_environment_variable,
     workspace_restart_required,
 )
+from .services.internal_egress import (
+    create_internal_egress_rule,
+    delete_internal_egress_rule,
+    get_internal_egress_policy,
+    internal_egress_policy_dict,
+    retry_internal_egress_policy,
+    update_internal_egress_rule,
+)
 from .services.mutations import mutation_request, record_mutation, replay_mutation
 from .services.profile_offers import (
     admin_profile_catalog,
@@ -83,6 +94,7 @@ from .services.resource_policy import (
     get_resource_policy,
     profile_is_allowed,
     resource_policy_dict,
+    selected_resource_values,
     update_resource_policy,
 )
 from .services.provisioning import (
@@ -103,7 +115,7 @@ from .services.workspaces import (
 )
 
 
-EXPECTED_DATABASE_REVISION = "0004"
+EXPECTED_DATABASE_REVISION = "0007"
 
 
 def create_app(
@@ -132,7 +144,7 @@ def create_app(
 
     app = FastAPI(
         title="Team Development Platform API",
-        version="0.1.5",
+        version="0.1.6",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -353,6 +365,12 @@ def create_app(
         )
         return response
 
+    @app.get("/api/v1/auth/change-password")
+    def change_password(
+        _context: Annotated[SessionContext, Depends(current_context)],
+    ) -> RedirectResponse:
+        return RedirectResponse(auth_service.password_change_url(), status_code=303)
+
     @app.get("/api/v1/me")
     def me(
         context: Annotated[SessionContext, Depends(current_context)],
@@ -450,6 +468,7 @@ def create_app(
             "global": {
                 "active": reservations.count,
                 "limit": settings.max_active_workspaces,
+                "kernel_idle_timeout_seconds": policy.kernel_idle_timeout_seconds,
                 "resources": {
                     "cpu_millicores": {
                         "reserved": reservations.cpu_millicores,
@@ -458,6 +477,10 @@ def create_app(
                     "memory_mb": {
                         "reserved": reservations.memory_mb,
                         "limit": policy.memory_budget_mb,
+                    },
+                    "gpu_count": {
+                        "reserved": reservations.gpu_count,
+                        "limit": policy.gpu_budget_count,
                     },
                 },
             },
@@ -1232,7 +1255,10 @@ def create_app(
         mutation = mutation_request(
             action="RESOURCE_POLICY_UPDATE",
             target_key="resource-policy:1",
-            payload=payload.model_dump(),
+            # Keep an older v1 client's canonical request shape when it omits
+            # later policy fields. Durable receipts created by that client can
+            # then still be replayed after the corresponding schema migrations.
+            payload=payload.model_dump(exclude_unset=True),
             fingerprint_key=settings.internal_hmac_key,
         )
         begin_immediate(db)
@@ -1246,6 +1272,30 @@ def create_app(
             db.commit()
             return replay
         reservations = active_reservations(db)
+        current_policy = get_resource_policy(db, settings, enforce_hard_ceiling=False)
+        _current_cpu, _current_memory, current_gpu_counts = selected_resource_values(
+            current_policy
+        )
+        previous_gpu_budget_count = current_policy.gpu_budget_count
+        previous_selectable_gpu_counts = sorted(current_gpu_counts)
+        gpu_budget_count = (
+            previous_gpu_budget_count
+            if payload.gpu_budget_count is None
+            else payload.gpu_budget_count
+        )
+        selectable_gpu_counts = (
+            previous_selectable_gpu_counts
+            if payload.selectable_gpu_counts is None
+            else payload.selectable_gpu_counts
+        )
+        previous_kernel_idle_timeout_seconds = (
+            current_policy.kernel_idle_timeout_seconds
+        )
+        kernel_idle_timeout_seconds = (
+            previous_kernel_idle_timeout_seconds
+            if payload.kernel_idle_timeout_seconds is None
+            else payload.kernel_idle_timeout_seconds
+        )
         policy = update_resource_policy(
             db,
             settings=settings,
@@ -1255,8 +1305,12 @@ def create_app(
             memory_budget_mb=payload.memory_budget_mb,
             selectable_cpu_millicores=payload.selectable_cpu_millicores,
             selectable_memory_mb=payload.selectable_memory_mb,
+            gpu_budget_count=gpu_budget_count,
+            selectable_gpu_counts=selectable_gpu_counts,
+            kernel_idle_timeout_seconds=kernel_idle_timeout_seconds,
             reserved_cpu_millicores=reservations.cpu_millicores,
             reserved_memory_mb=reservations.memory_mb,
+            reserved_gpu_count=reservations.gpu_count,
         )
         response = {"resource_policy": resource_policy_dict(db, settings, policy)}
         _admin_audit(
@@ -1270,6 +1324,246 @@ def create_app(
                 "memory_budget_mb": policy.memory_budget_mb,
                 "selectable_cpu_millicores": payload.selectable_cpu_millicores,
                 "selectable_memory_mb": payload.selectable_memory_mb,
+                "previous_gpu_budget_count": previous_gpu_budget_count,
+                "previous_selectable_gpu_counts": previous_selectable_gpu_counts,
+                "gpu_budget_count": policy.gpu_budget_count,
+                "selectable_gpu_counts": selectable_gpu_counts,
+                "previous_kernel_idle_timeout_seconds": (
+                    previous_kernel_idle_timeout_seconds
+                ),
+                "kernel_idle_timeout_seconds": policy.kernel_idle_timeout_seconds,
+            },
+        )
+        record_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+            response=response,
+        )
+        db.commit()
+        return response
+
+    @app.get("/api/v1/admin/internal-egress-policy")
+    def get_admin_internal_egress_policy(
+        _context: Annotated[SessionContext, Depends(admin_context)],
+        db: Annotated[Session, Depends(get_db)],
+    ) -> dict[str, object]:
+        policy = get_internal_egress_policy(db, create=True)
+        response = internal_egress_policy_dict(db, policy)
+        # Metadata-created development databases do not run Alembic's singleton
+        # seed. Persist the same fail-closed empty policy on first inspection.
+        db.commit()
+        return response
+
+    @app.post("/api/v1/admin/internal-egress-policy/rules", status_code=201)
+    def post_admin_internal_egress_rule(
+        payload: InternalEgressRuleCreate,
+        request: Request,
+        context: Annotated[SessionContext, Depends(admin_mutating_context)],
+        db: Annotated[Session, Depends(get_db)],
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, object]:
+        key = _idempotency_key(idempotency_key)
+        mutation = mutation_request(
+            action="INTERNAL_EGRESS_RULE_CREATE",
+            target_key="internal-egress-rule:new",
+            payload=payload.model_dump(),
+            fingerprint_key=settings.internal_hmac_key,
+        )
+        begin_immediate(db)
+        replay = replay_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+        )
+        if replay is not None:
+            db.commit()
+            return replay
+        policy, rule = create_internal_egress_rule(
+            db,
+            actor_user_id=context.user.id,
+            expected_revision=payload.expected_revision,
+            destination_cidr=payload.destination_cidr,
+            port=payload.port,
+        )
+        response = internal_egress_policy_dict(db, policy)
+        _admin_audit(
+            db,
+            actor_user_id=context.user.id,
+            action="INTERNAL_EGRESS_RULE_CREATED",
+            request_id=request.state.request_id,
+            metadata={
+                "rule_id": rule.id,
+                "destination_cidr": rule.destination_cidr,
+                "port": rule.port,
+                "desired_revision": policy.desired_revision,
+            },
+        )
+        record_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+            response=response,
+        )
+        db.commit()
+        return response
+
+    @app.patch("/api/v1/admin/internal-egress-policy/rules/{rule_id}")
+    def patch_admin_internal_egress_rule(
+        rule_id: str,
+        payload: InternalEgressRuleUpdate,
+        request: Request,
+        context: Annotated[SessionContext, Depends(admin_mutating_context)],
+        db: Annotated[Session, Depends(get_db)],
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, object]:
+        key = _idempotency_key(idempotency_key)
+        mutation = mutation_request(
+            action="INTERNAL_EGRESS_RULE_UPDATE",
+            target_key=f"internal-egress-rule:{rule_id}",
+            payload=payload.model_dump(),
+            fingerprint_key=settings.internal_hmac_key,
+        )
+        begin_immediate(db)
+        replay = replay_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+        )
+        if replay is not None:
+            db.commit()
+            return replay
+        policy, rule = update_internal_egress_rule(
+            db,
+            rule_id=rule_id,
+            actor_user_id=context.user.id,
+            expected_revision=payload.expected_revision,
+            expected_version=payload.expected_version,
+            destination_cidr=payload.destination_cidr,
+            port=payload.port,
+        )
+        response = internal_egress_policy_dict(db, policy)
+        _admin_audit(
+            db,
+            actor_user_id=context.user.id,
+            action="INTERNAL_EGRESS_RULE_UPDATED",
+            request_id=request.state.request_id,
+            metadata={
+                "rule_id": rule.id,
+                "destination_cidr": rule.destination_cidr,
+                "port": rule.port,
+                "version": rule.row_version,
+                "desired_revision": policy.desired_revision,
+            },
+        )
+        record_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+            response=response,
+        )
+        db.commit()
+        return response
+
+    @app.delete("/api/v1/admin/internal-egress-policy/rules/{rule_id}")
+    def delete_admin_internal_egress_rule(
+        rule_id: str,
+        expected_revision: int,
+        expected_version: int,
+        request: Request,
+        context: Annotated[SessionContext, Depends(admin_mutating_context)],
+        db: Annotated[Session, Depends(get_db)],
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, object]:
+        key = _idempotency_key(idempotency_key)
+        mutation = mutation_request(
+            action="INTERNAL_EGRESS_RULE_DELETE",
+            target_key=f"internal-egress-rule:{rule_id}",
+            payload={
+                "expected_revision": expected_revision,
+                "expected_version": expected_version,
+            },
+            fingerprint_key=settings.internal_hmac_key,
+        )
+        begin_immediate(db)
+        replay = replay_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+        )
+        if replay is not None:
+            db.commit()
+            return replay
+        policy, deleted = delete_internal_egress_rule(
+            db,
+            rule_id=rule_id,
+            actor_user_id=context.user.id,
+            expected_revision=expected_revision,
+            expected_version=expected_version,
+        )
+        response = internal_egress_policy_dict(db, policy)
+        _admin_audit(
+            db,
+            actor_user_id=context.user.id,
+            action="INTERNAL_EGRESS_RULE_DELETED",
+            request_id=request.state.request_id,
+            metadata={**deleted, "desired_revision": policy.desired_revision},
+        )
+        record_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+            response=response,
+        )
+        db.commit()
+        return response
+
+    @app.post("/api/v1/admin/internal-egress-policy/retry")
+    def post_admin_internal_egress_policy_retry(
+        payload: InternalEgressPolicyRetry,
+        request: Request,
+        context: Annotated[SessionContext, Depends(admin_mutating_context)],
+        db: Annotated[Session, Depends(get_db)],
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, object]:
+        key = _idempotency_key(idempotency_key)
+        mutation = mutation_request(
+            action="INTERNAL_EGRESS_POLICY_RETRY",
+            target_key="internal-egress-policy:singleton",
+            payload=payload.model_dump(),
+            fingerprint_key=settings.internal_hmac_key,
+        )
+        begin_immediate(db)
+        replay = replay_mutation(
+            db,
+            actor_user_id=context.user.id,
+            idempotency_key=key,
+            request=mutation,
+        )
+        if replay is not None:
+            db.commit()
+            return replay
+        policy = retry_internal_egress_policy(
+            db,
+            actor_user_id=context.user.id,
+            expected_revision=payload.expected_revision,
+        )
+        response = internal_egress_policy_dict(db, policy)
+        _admin_audit(
+            db,
+            actor_user_id=context.user.id,
+            action="INTERNAL_EGRESS_POLICY_RETRIED",
+            request_id=request.state.request_id,
+            metadata={
+                "desired_revision": policy.desired_revision,
+                "desired_digest": policy.desired_digest,
             },
         )
         record_mutation(
@@ -1536,6 +1830,10 @@ def create_app(
                 "memory_mb": {
                     "reserved": reservations.memory_mb,
                     "limit": policy.memory_budget_mb,
+                },
+                "gpu_count": {
+                    "reserved": reservations.gpu_count,
+                    "limit": policy.gpu_budget_count,
                 },
             },
         }

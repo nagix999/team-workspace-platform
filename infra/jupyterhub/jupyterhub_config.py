@@ -23,7 +23,11 @@ from dockerspawner import DockerSpawner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from profile_policy import ProfilePolicyError, load_profile_policy  # noqa: E402
+from profile_policy import (  # noqa: E402
+    ProfilePolicyError,
+    accelerator_contract,
+    load_profile_policy,
+)
 from platform_spawner import PlatformDockerSpawnerMixin  # noqa: E402
 from local_volume_policy import (  # noqa: E402
     validate_web_provisioning_mode,
@@ -180,6 +184,29 @@ enabled_profiles = {
     if value["enabled"] is True
 }
 first_profile = enabled_profiles[sorted(enabled_profiles)[0]]
+enabled_gpu_profiles = [
+    key
+    for key, profile in enabled_profiles.items()
+    if (accelerator_contract(profile) or {}).get("kind") == "nvidia"
+]
+nvidia_gpu_device_id_value = os.environ.get(
+    "JUPYTERHUB_NVIDIA_GPU_DEVICE_ID", ""
+).strip()
+if enabled_gpu_profiles:
+    try:
+        nvidia_gpu_device_id = spawn_guard.validate_nvidia_gpu_device_id(
+            nvidia_gpu_device_id_value
+        )
+    except spawn_guard.SpawnGuardError as exc:
+        raise RuntimeError(
+            "enabled NVIDIA profile requires one exact trusted physical GPU UUID"
+        ) from exc
+elif nvidia_gpu_device_id_value:
+    raise RuntimeError(
+        "JUPYTERHUB_NVIDIA_GPU_DEVICE_ID is set without an enabled NVIDIA profile"
+    )
+else:
+    nvidia_gpu_device_id = None
 
 admin_users = {
     item.strip()
@@ -314,6 +341,7 @@ configure_spawn_guard(
         unsafe_local_dev=unsafe_local_runtime,
         max_cpu_millicores=positive_int_env("PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES"),
         max_memory_mb=positive_int_env("PLATFORM_WORKSPACE_MEMORY_BUDGET_MB"),
+        nvidia_gpu_device_id=nvidia_gpu_device_id,
     )
 )
 
@@ -342,6 +370,12 @@ c.JupyterHub.bind_url = required_env("JUPYTERHUB_BIND_URL")
 c.JupyterHub.hub_bind_url = required_env("JUPYTERHUB_HUB_BIND_URL")
 c.JupyterHub.hub_connect_url = hub_connect_url
 c.JupyterHub.subdomain_host = subdomain_host
+# This Hub is an execution plane, not the user-facing control plane.  A direct
+# NativeAuthenticator login has no ``next`` query argument; JupyterHub would
+# otherwise fall back to ``/hub/spawn`` and expose a route the public gateway
+# deliberately blocks.  OAuth and single-user login requests carry an explicit
+# validated ``next`` value, which JupyterHub gives precedence over this default.
+c.JupyterHub.default_url = f"{portal_origin}/"
 # Passing the default string through config can remain an unvalidated string in
 # JupyterHub 5.5.0 and later crash service initialization. Use the documented
 # callable directly so per-user/service subdomains are deterministic.

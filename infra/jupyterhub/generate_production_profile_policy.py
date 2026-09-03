@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate a production profile history pinned to one local Docker image ID.
+"""Generate a production profile history pinned to reviewed local image IDs.
 
-The single-host deployment deliberately supports an exact local image ID in
-addition to a registry digest.  Old enabled versions remain in the document so
-stopped workspaces can restart; only the newest version of each template stays
-selectable for new workspaces.
+The single-host deployment deliberately pins CPU and optional NVIDIA runtimes
+to separate exact local image IDs. Old enabled versions remain in the document
+so stopped workspaces can restart; only the newest version of each template
+stays selectable for new workspaces.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ def generate_policy(
     *,
     template: dict[str, Any],
     image_id: str,
+    gpu_image_id: str | None = None,
     shared_volume_name: str,
     previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -47,14 +48,23 @@ def generate_policy(
         )
     if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", shared_volume_name):
         raise RuntimeError("production shared volume name is invalid")
-    if template.get("schema_version") != 2:
-        raise RuntimeError("production profile template must use schema version 2")
+    template_schema = template.get("schema_version")
+    if template_schema not in {2, 3}:
+        raise RuntimeError("production profile template must use schema version 2 or 3")
+    if gpu_image_id is not None and not IMAGE_ID_RE.fullmatch(gpu_image_id):
+        raise RuntimeError(
+            "production GPU single-user image must be an exact local image ID"
+        )
 
     template_profiles = []
     for raw in template.get("profiles", []):
         if not isinstance(raw, dict):
             raise RuntimeError("production profile template contains an invalid row")
-        if raw.get("enabled") is True and "python_version" in raw:
+        if (
+            raw.get("enabled") is True
+            and "python_version" in raw
+            and (template_schema == 2 or "accelerator" in raw)
+        ):
             template_profiles.append(raw)
     if not template_profiles or not any(
         row.get("selectable") is True for row in template_profiles
@@ -64,8 +74,11 @@ def generate_policy(
     retained: list[dict[str, Any]] = []
     previous_by_id: dict[str, list[dict[str, Any]]] = {}
     if previous is not None:
-        if previous.get("schema_version") != 2:
-            raise RuntimeError("previous production policy must use schema version 2")
+        previous_schema = previous.get("schema_version")
+        if previous_schema not in ({2} if template_schema == 2 else {2, 3}):
+            raise RuntimeError(
+                "previous production policy schema is incompatible with template"
+            )
         for raw in previous.get("profiles", []):
             if not isinstance(raw, dict) or not isinstance(raw.get("id"), str):
                 raise RuntimeError("previous production policy contains an invalid row")
@@ -73,6 +86,15 @@ def generate_policy(
             row["selectable"] = False
             retained.append(row)
             previous_by_id.setdefault(row["id"], []).append(row)
+        if gpu_image_id is None and any(
+            isinstance(row.get("accelerator"), dict)
+            and row["accelerator"].get("kind") == "nvidia"
+            and row.get("enabled") is True
+            for row in retained
+        ):
+            raise RuntimeError(
+                "enabled production GPU history requires --gpu-image-id"
+            )
 
     generated: list[dict[str, Any]] = []
     for source in template_profiles:
@@ -80,7 +102,25 @@ def generate_policy(
         prior = previous_by_id.get(profile_id, [])
         latest = max(prior, key=lambda row: row["version"]) if prior else None
         candidate = dict(source)
-        candidate["image"] = image_id
+        if template_schema == 3:
+            accelerator = candidate.get("accelerator")
+            if not isinstance(accelerator, dict):
+                raise RuntimeError("schema-v3 runtime is missing accelerator metadata")
+            accelerator_kind = accelerator.get("kind")
+            if accelerator_kind == "nvidia":
+                if gpu_image_id is None:
+                    # GPU support is an explicit operator opt-in.  A fresh
+                    # CPU-only deployment may use the same reviewed template;
+                    # once GPU history exists, the guard above prevents silent
+                    # removal of restartable immutable rows.
+                    continue
+                candidate["image"] = gpu_image_id
+            elif accelerator_kind == "none":
+                candidate["image"] = image_id
+            else:
+                raise RuntimeError("schema-v3 accelerator kind is unsupported")
+        else:
+            candidate["image"] = image_id
         candidate["enabled"] = True
         candidate["selectable"] = bool(source["selectable"])
 
@@ -108,7 +148,7 @@ def generate_policy(
     profiles = retained + generated
     profiles.sort(key=lambda row: (row["id"], row["version"]))
     policy = {
-        "schema_version": 2,
+        "schema_version": template_schema,
         "shared_volume": {
             "name": shared_volume_name,
             "mount_path": "/home/jovyan/shared",
@@ -161,6 +201,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--template", type=Path)
     parser.add_argument("--image-id")
+    parser.add_argument("--gpu-image-id")
     parser.add_argument("--shared-volume", default="jupyter-shared")
     parser.add_argument("--previous", type=Path)
     parser.add_argument(
@@ -172,7 +213,12 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.promote is not None:
-        if args.template is not None or args.image_id is not None or args.previous:
+        if (
+            args.template is not None
+            or args.image_id is not None
+            or args.gpu_image_id is not None
+            or args.previous
+        ):
             parser.error("--promote cannot be combined with generation arguments")
         try:
             loaded = load_profile_policy(args.promote, allow_unsafe_images=False)
@@ -203,6 +249,7 @@ def main() -> int:
     policy = generate_policy(
         template=template,
         image_id=args.image_id,
+        gpu_image_id=args.gpu_image_id,
         shared_volume_name=args.shared_volume,
         previous=previous,
     )
@@ -217,7 +264,7 @@ def main() -> int:
         ) from exc
     print(
         "production profile policy ready: "
-        f"profiles={len(loaded['profiles'])} image={args.image_id} output={args.output}"
+        f"profiles={len(loaded['profiles'])} output={args.output}"
     )
     return 0
 

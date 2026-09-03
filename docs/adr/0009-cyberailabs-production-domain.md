@@ -6,7 +6,7 @@
 ## 맥락
 
 조직은 HostingKR에서 `cyberailabs.team`을 구매했고, 운영 VIP
-`123.214.65.254:443`을 단일 production host `10.155.1.24:3030`으로 Static NAT한다.
+`<PUBLIC_VIP>:443`을 단일 production host `<INTERNAL_SERVER_IP>:3030`으로 Static NAT한다.
 HostingKR UI는 중첩 wildcard `*.hub` 이름을 직접 받지 않으며, DNS 사업자 이전과 사용자별
 record 등록은 원하지 않는다. 팀원은 상호 신뢰하지만 Notebook과 설치 패키지는 비신뢰 코드로
 취급한다. 플랫폼은 운영 host 방화벽을 변경하지 않는다.

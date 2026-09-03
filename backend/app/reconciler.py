@@ -21,7 +21,7 @@ from sqlalchemy import exists, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .db import begin_immediate, create_database_engine, create_session_factory
-from .domain import HubServerState, OperationStatus
+from .domain import DesiredState, HubServerState, OperationStatus
 from .hub import HubServer
 from .models import AuditEvent, Operation, User, Workspace
 from .security import json_dumps_safe
@@ -575,6 +575,12 @@ class WorkspaceReconciler:
                 observed = self._observed(server)
                 previous = workspace.observed_state
                 state_changed = previous != observed
+                release_gpu = bool(
+                    workspace.assigned_gpu_device_id is not None
+                    and server.state
+                    in {HubServerState.NOT_FOUND, HubServerState.STOPPED}
+                    and workspace.desired_state != DesiredState.RUNNING.value
+                )
                 material_changed = state_changed or any(
                     (
                         workspace.progress_percent != server.progress_percent,
@@ -582,6 +588,7 @@ class WorkspaceReconciler:
                         workspace.hub_started_at != server.started_at,
                         workspace.hub_last_activity_at != server.last_activity_at,
                         workspace.hub_server_url is not None,
+                        release_gpu,
                     )
                 )
                 workspace.observed_state = observed
@@ -590,6 +597,8 @@ class WorkspaceReconciler:
                 workspace.hub_started_at = server.started_at
                 workspace.hub_last_activity_at = server.last_activity_at
                 workspace.hub_server_url = None
+                if release_gpu:
+                    workspace.assigned_gpu_device_id = None
                 # Freshness is the age of the observation, not the time this
                 # database transaction happened to finish.
                 workspace.last_reconciled_at = snapshot.captured_at

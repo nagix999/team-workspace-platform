@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+for directory in \
+    /var/lib/platform-egress-policy/desired \
+    /var/lib/platform-egress-policy/ack
+do
+    test -d "${directory}" && test ! -L "${directory}" \
+        || { echo >&2 "policy mount is not a directory: ${directory}"; exit 1; }
+    # The process owns a fresh named-volume root as uid 0 and runs with gid
+    # 2999, so this ownership change needs no CAP_CHOWN.
+    install -d -m 2770 -o 0 -g 2999 "${directory}"
+done

@@ -48,10 +48,20 @@ V2_RUNTIME_KEYS = {
 }
 V2_LEGACY_PROFILE_KEYS = LEGACY_PROFILE_KEYS | {"selectable"}
 V2_PROFILE_KEYS = V2_LEGACY_PROFILE_KEYS | V2_RUNTIME_KEYS
+ACCELERATOR_KEYS = {
+    "kind",
+    "count",
+    "sharing",
+    "cuda_version",
+    "framework",
+    "framework_version",
+}
+V3_PROFILE_KEYS = V2_PROFILE_KEYS | {"accelerator"}
 LEGACY_EXECUTION_FIELDS = tuple(
     sorted(LEGACY_PROFILE_KEYS - {"enabled", "config_digest"})
 )
 V2_EXECUTION_FIELDS = tuple(sorted(V2_PROFILE_KEYS - PROFILE_METADATA_KEYS))
+V3_EXECUTION_FIELDS = tuple(sorted(V3_PROFILE_KEYS - PROFILE_METADATA_KEYS))
 PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 VOLUME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 IMMUTABLE_IMAGE_RE = re.compile(r"^(?:\S+@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$")
@@ -59,6 +69,7 @@ SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 PYTHON_VERSION_RE = re.compile(
     r"^(?:[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$"
 )
+CUDA_VERSION_RE = re.compile(r"^(?:[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
 KERNEL_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 PYTHON_EXECUTABLE_RE = re.compile(
     r"^/opt/conda(?:/envs/[a-z][a-z0-9_-]{0,63})?/bin/python$"
@@ -109,6 +120,8 @@ def canonical_profile(profile: dict[str, Any]) -> bytes:
         fields = LEGACY_EXECUTION_FIELDS
     elif keys == V2_PROFILE_KEYS:
         fields = V2_EXECUTION_FIELDS
+    elif keys == V3_PROFILE_KEYS:
+        fields = V3_EXECUTION_FIELDS
     else:
         raise ProfilePolicyError("profile keys do not match a supported digest schema")
     document = {field: profile[field] for field in fields}
@@ -124,8 +137,11 @@ def profile_digest(profile: dict[str, Any]) -> str:
 def resource_runtime_signature(profile: dict[str, Any]) -> str:
     """Identify immutable runtime facts while excluding CPU and memory."""
 
-    if set(profile) != V2_PROFILE_KEYS:
-        raise ProfilePolicyError("resource base must be a schema v2 profile")
+    if frozenset(profile) not in {
+        frozenset(V2_PROFILE_KEYS),
+        frozenset(V3_PROFILE_KEYS),
+    }:
+        raise ProfilePolicyError("resource base must be a managed runtime profile")
     excluded = {
         "id",
         "version",
@@ -186,6 +202,22 @@ def is_managed_runtime_profile(profile: dict[str, Any]) -> bool:
     return V2_RUNTIME_KEYS.issubset(profile)
 
 
+def accelerator_contract(profile: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the explicit v3 accelerator contract, if the profile has one.
+
+    Schema-v2 profiles predate accelerator support and are always CPU-only.
+    Keeping that fact implicit preserves their historical digest so stopped
+    workspaces can still restart after a schema-v3 rollout.
+    """
+
+    accelerator = profile.get("accelerator")
+    if accelerator is None:
+        return None
+    if not isinstance(accelerator, dict) or set(accelerator) != ACCELERATOR_KEYS:
+        raise ProfilePolicyError("profile accelerator contract is invalid")
+    return accelerator
+
+
 def kernel_runtime_environment(profile: dict[str, Any]) -> dict[str, str]:
     """Build the exact environment consumed by the single-user image wrapper.
 
@@ -209,7 +241,7 @@ def kernel_runtime_environment(profile: dict[str, Any]) -> dict[str, str]:
         "kernels": profile["kernels"],
         "default_kernel": profile["default_kernel"],
     }
-    return {
+    environment = {
         "PLATFORM_DEFAULT_KERNEL": profile["default_kernel"],
         "PLATFORM_PYTHON_EXECUTABLE": executable,
         "PATH": (
@@ -223,6 +255,20 @@ def kernel_runtime_environment(profile: dict[str, Any]) -> dict[str, str]:
             ensure_ascii=True,
         ),
     }
+    accelerator = accelerator_contract(profile)
+    if accelerator is not None and accelerator["kind"] == "nvidia":
+        environment.update(
+            {
+                "PLATFORM_ACCELERATOR_CONTRACT": json.dumps(
+                    {"schema_version": 1, **accelerator},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ),
+                "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+            }
+        )
+    return environment
 
 
 def _validate_v2_runtime(profile: dict[str, Any], where: str) -> None:
@@ -291,6 +337,56 @@ def _validate_v2_runtime(profile: dict[str, Any], where: str) -> None:
         )
 
 
+def _validate_v3_accelerator(profile: dict[str, Any], where: str) -> None:
+    accelerator = profile["accelerator"]
+    if not isinstance(accelerator, dict):
+        raise ProfilePolicyError(f"{where}.accelerator must be an object")
+    _exact_keys(accelerator, ACCELERATOR_KEYS, f"{where}.accelerator")
+
+    kind = accelerator["kind"]
+    count = accelerator["count"]
+    sharing = accelerator["sharing"]
+    cuda_version = accelerator["cuda_version"]
+    framework = accelerator["framework"]
+    framework_version = accelerator["framework_version"]
+    if type(count) is not int:
+        raise ProfilePolicyError(f"{where}.accelerator.count must be an integer")
+
+    if kind == "none":
+        if (
+            count != 0
+            or sharing != "none"
+            or cuda_version is not None
+            or framework is not None
+            or framework_version is not None
+        ):
+            raise ProfilePolicyError(
+                f"{where}.accelerator CPU contract must use zero/null values"
+            )
+        return
+
+    if kind != "nvidia":
+        raise ProfilePolicyError(f"{where}.accelerator.kind is unsupported")
+    if count != 1 or sharing != "exclusive":
+        raise ProfilePolicyError(
+            f"{where}.accelerator NVIDIA contract must request one exclusive GPU"
+        )
+    if not isinstance(cuda_version, str) or not CUDA_VERSION_RE.fullmatch(cuda_version):
+        raise ProfilePolicyError(f"{where}.accelerator.cuda_version must be exact X.Y")
+    if framework != "pytorch":
+        raise ProfilePolicyError(f"{where}.accelerator.framework must be pytorch")
+    if not isinstance(framework_version, str) or not PYTHON_VERSION_RE.fullmatch(
+        framework_version
+    ):
+        raise ProfilePolicyError(
+            f"{where}.accelerator.framework_version must be exact X.Y.Z"
+        )
+    if len(profile["kernels"]) != 1:
+        raise ProfilePolicyError(
+            f"{where} NVIDIA profile must expose exactly one verified kernel"
+        )
+
+
 def load_profile_policy(
     path: str | Path, *, allow_unsafe_images: bool = False
 ) -> dict[str, Any]:
@@ -306,8 +402,8 @@ def load_profile_policy(
         raise ProfilePolicyError("profile policy must be a JSON object")
     _exact_keys(policy, TOP_LEVEL_KEYS, "profile policy")
     schema_version = policy["schema_version"]
-    if type(schema_version) is not int or schema_version not in {1, 2}:
-        raise ProfilePolicyError("profile policy schema_version must be 1 or 2")
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+        raise ProfilePolicyError("profile policy schema_version must be 1, 2 or 3")
 
     shared = policy["shared_volume"]
     if not isinstance(shared, dict):
@@ -340,18 +436,26 @@ def load_profile_policy(
         if schema_version == 1:
             _exact_keys(profile, LEGACY_PROFILE_KEYS, where)
             is_extended = False
+            has_accelerator = False
         elif profile_keys == V2_LEGACY_PROFILE_KEYS:
             is_extended = False
+            has_accelerator = False
         elif profile_keys == V2_PROFILE_KEYS:
             is_extended = True
+            has_accelerator = False
+        elif schema_version == 3 and profile_keys == V3_PROFILE_KEYS:
+            is_extended = True
+            has_accelerator = True
         else:
-            raise ProfilePolicyError(f"{where} keys do not match a v2 profile schema")
+            raise ProfilePolicyError(
+                f"{where} keys do not match the policy profile schema"
+            )
         if not PROFILE_ID_RE.fullmatch(str(profile["id"])):
             raise ProfilePolicyError(f"{where}.id is invalid")
         version = _positive_int(profile["version"], f"{where}.version")
         if not isinstance(profile["enabled"], bool):
             raise ProfilePolicyError(f"{where}.enabled must be boolean")
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             if not isinstance(profile["selectable"], bool):
                 raise ProfilePolicyError(f"{where}.selectable must be boolean")
             if profile["selectable"] and not profile["enabled"]:
@@ -360,8 +464,14 @@ def load_profile_policy(
                 raise ProfilePolicyError(
                     f"{where} legacy profile may remain enabled but cannot be selectable"
                 )
+            if schema_version == 3 and profile["selectable"] and not has_accelerator:
+                raise ProfilePolicyError(
+                    f"{where} selectable schema-v3 profile requires accelerator metadata"
+                )
         if is_extended:
             _validate_v2_runtime(profile, where)
+        if has_accelerator:
+            _validate_v3_accelerator(profile, where)
         if profile["enabled"] and not allow_unsafe_images and not is_extended:
             raise ProfilePolicyError(
                 f"{where} production profile requires schema v2 exact runtime metadata"

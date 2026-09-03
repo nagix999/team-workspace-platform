@@ -12,10 +12,20 @@ const policy: ResourcePolicy = {
   memoryBudgetMb: 8192,
   selectableCpuMillicores: [1000, 2000],
   selectableMemoryMb: [1024, 2048],
+  gpuBudgetCount: 0,
+  selectableGpuCounts: [0],
   availableCpuMillicores: [1000, 2000],
   availableMemoryMb: [1024, 2048],
+  availableGpuCounts: [0],
   maxCpuBudgetMillicores: 16000,
   maxMemoryBudgetMb: 32768,
+  maxGpuBudgetCount: 0,
+  kernelIdleTimeoutSeconds: 3600,
+  kernelIdleTimeoutBounds: {
+    minSeconds: 300,
+    maxSeconds: 604800,
+    stepSeconds: 60,
+  },
   updatedAt: null,
 };
 
@@ -26,7 +36,7 @@ describe("AdminProfileManager", () => {
     );
     expect(html).toContain("검증된 Python 커널");
     expect(html).toContain("Python 커널 공개 설정");
-    expect(html).toContain("모든 조합을 먼저 생성");
+    expect(html).toContain("조합을 먼저 생성");
     expect(html).toContain("이미지와 실행 명령은 화면에서 입력할 수 없습니다");
     expect(html).not.toContain('type="file"');
     expect(html).not.toContain('name="image"');
@@ -53,6 +63,11 @@ describe("AdminProfileManager", () => {
         kernelName,
         kernelDisplayName: `Python ${pythonVersion}`,
         pythonVersion,
+        acceleratorKind: "none",
+        gpuCount: 0,
+        cudaVersion: null,
+        gpuFramework: null,
+        gpuFrameworkVersion: null,
         cpuLimit,
         memoryLimitMb,
       },
@@ -66,8 +81,56 @@ describe("AdminProfileManager", () => {
     ]);
 
     expect(groups.map((group) => [group.key, group.profiles.length])).toEqual([
-      ["python312:3.12.13", 2],
-      ["python3:3.13.14", 1],
+      ["python312:3.12.13:none:-:-", 2],
+      ["python3:3.13.14:none:-:-", 1],
+    ]);
+  });
+
+  it("keeps CPU and CUDA runtimes in separate administrator groups", () => {
+    const cpu = {
+      id: "cpu",
+      version: 1,
+      name: "CPU",
+      description: null,
+      enabled: true,
+      effectiveSelectable: true,
+      runtimeProfile: {
+        id: "cpu-runtime",
+        version: 1,
+        kernelName: "python312",
+        kernelDisplayName: "Python 3.12",
+        pythonVersion: "3.12.13",
+        acceleratorKind: "none" as const,
+        gpuCount: 0 as const,
+        cudaVersion: null,
+        gpuFramework: null,
+        gpuFrameworkVersion: null,
+        cpuLimit: "2.0",
+        memoryLimitMb: 2048,
+      },
+      createdAt: null,
+      updatedAt: null,
+    };
+    const gpu: AdminWorkspaceProfile = {
+      ...cpu,
+      id: "gpu",
+      name: "GPU",
+      runtimeProfile: {
+        ...cpu.runtimeProfile,
+        id: "gpu-runtime",
+        acceleratorKind: "nvidia",
+        gpuCount: 1,
+        cudaVersion: "12.6",
+        gpuFramework: "pytorch",
+        gpuFrameworkVersion: "2.7.1",
+      },
+    };
+
+    const groups = groupAdminProfilesByKernel([gpu, cpu]);
+    expect(groups).toHaveLength(2);
+    expect(groups.map((group) => group.acceleratorLabel)).toEqual([
+      "CPU 전용",
+      "NVIDIA GPU 1개 · CUDA 12.6 · PyTorch 2.7.1",
     ]);
   });
 });

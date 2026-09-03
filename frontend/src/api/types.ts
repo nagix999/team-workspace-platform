@@ -34,6 +34,11 @@ export interface WorkspaceProfile {
   kernelName: string;
   kernelDisplayName: string;
   pythonVersion: string;
+  acceleratorKind: "none" | "nvidia";
+  gpuCount: 0 | 1;
+  cudaVersion: string | null;
+  gpuFramework: "pytorch" | null;
+  gpuFrameworkVersion: string | null;
   cpuLimit: string;
   memoryLimitMb: number;
   privateDiskLimitMb: number | null;
@@ -51,6 +56,9 @@ export interface Capacity {
   cpuBudgetMillicores: number | null;
   memoryReservedMb: number | null;
   memoryBudgetMb: number | null;
+  gpuReservedCount: number | null;
+  gpuBudgetCount: number | null;
+  kernelIdleTimeoutSeconds: number | null;
   executionHostHealthy: boolean | null;
 }
 
@@ -83,6 +91,11 @@ export interface Workspace {
   kernelName: string | null;
   kernelDisplayName: string | null;
   pythonVersion: string | null;
+  acceleratorKind: "none" | "nvidia" | null;
+  gpuCount: 0 | 1 | null;
+  cudaVersion: string | null;
+  gpuFramework: "pytorch" | null;
+  gpuFrameworkVersion: string | null;
   cpuLimit: string | null;
   memoryLimitMb: number | null;
   privateDiskLimitMb: number | null;
@@ -163,6 +176,8 @@ export interface AdminCapacity {
   cpuBudgetMillicores: number;
   memoryReservedMb: number;
   memoryBudgetMb: number;
+  gpuReservedCount: number;
+  gpuBudgetCount: number;
 }
 
 export interface ResourcePolicy {
@@ -171,10 +186,20 @@ export interface ResourcePolicy {
   memoryBudgetMb: number;
   selectableCpuMillicores: number[];
   selectableMemoryMb: number[];
+  gpuBudgetCount: number;
+  selectableGpuCounts: number[];
   availableCpuMillicores: number[];
   availableMemoryMb: number[];
+  availableGpuCounts: number[];
   maxCpuBudgetMillicores: number | null;
   maxMemoryBudgetMb: number | null;
+  maxGpuBudgetCount: number;
+  kernelIdleTimeoutSeconds: number | null;
+  kernelIdleTimeoutBounds: {
+    minSeconds: number;
+    maxSeconds: number;
+    stepSeconds: number;
+  } | null;
   updatedAt: string | null;
 }
 
@@ -184,6 +209,9 @@ export interface ResourcePolicyUpdate {
   memoryBudgetMb: number;
   selectableCpuMillicores: number[];
   selectableMemoryMb: number[];
+  gpuBudgetCount: number;
+  selectableGpuCounts: number[];
+  kernelIdleTimeoutSeconds: number;
 }
 
 export interface AdminWorkspacePage {
@@ -205,6 +233,11 @@ export interface RuntimeProfileTemplate {
   kernelName: string;
   kernelDisplayName: string;
   pythonVersion: string;
+  acceleratorKind: "none" | "nvidia";
+  gpuCount: 0 | 1;
+  cudaVersion: string | null;
+  gpuFramework: "pytorch" | null;
+  gpuFrameworkVersion: string | null;
   cpuLimit: string;
   memoryLimitMb: number;
 }
@@ -232,6 +265,29 @@ export interface AdminAuditEvent {
   action: string;
   result: string;
   createdAt: string | null;
+}
+
+export type InternalEgressApplyStatus = "PENDING" | "APPLYING" | "APPLIED" | "FAILED";
+
+export interface InternalEgressRule {
+  id: string;
+  destinationCidr: string;
+  port: number;
+  rowVersion: number;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface InternalEgressPolicySnapshot {
+  desiredRevision: number;
+  desiredDigest: string;
+  appliedRevision: number | null;
+  appliedDigest: string | null;
+  applyStatus: InternalEgressApplyStatus;
+  lastErrorCode: string | null;
+  lastErrorSummary: string | null;
+  updatedAt: string | null;
+  rules: InternalEgressRule[];
 }
 
 export interface ApiErrorBody {

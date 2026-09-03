@@ -58,6 +58,12 @@ function CapacityMeter({
   );
 }
 
+export function formatKernelIdleTimeout(seconds: number): string {
+  if (seconds >= 86_400 && seconds % 86_400 === 0) return `${seconds / 86_400}일`;
+  if (seconds >= 3_600 && seconds % 3_600 === 0) return `${seconds / 3_600}시간`;
+  return `${seconds / 60}분`;
+}
+
 export function CapacityPanel({ capacity, loading }: CapacityPanelProps) {
   const resourcesKnown = capacity !== null &&
     capacity.cpuReservedMillicores !== null &&
@@ -78,43 +84,67 @@ export function CapacityPanel({ capacity, loading }: CapacityPanelProps) {
       {loading && !capacity ? (
         <div className="skeleton-block" aria-label="사용 현황 불러오는 중" />
       ) : capacity ? (
-        <div className="capacity-panel__meters">
-          <CapacityMeter
-            label="내 환경"
-            detail="보유 중"
-            used={capacity.workspaceUsed}
-            limit={capacity.workspaceLimit}
-          />
-          <CapacityMeter
-            label="전체 실행 환경"
-            detail="가동 중"
-            used={capacity.activeUsed}
-            limit={capacity.activeLimit}
-            accent
-          />
-          {resourcesKnown ? (
-            <>
-              <CapacityMeter
-                label="CPU 예약"
-                detail="전체 예산"
-                used={capacity.cpuReservedMillicores!}
-                limit={capacity.cpuBudgetMillicores!}
-                formatValue={(value) => `${value / 1000} core`}
-              />
-              <CapacityMeter
-                label="메모리 예약"
-                detail="전체 예산"
-                used={capacity.memoryReservedMb!}
-                limit={capacity.memoryBudgetMb!}
-                formatValue={(value) => formatMegabytes(value) ?? `${value} MB`}
-              />
-            </>
-          ) : (
-            <p className="form-hint capacity-resource-warning" role="status">
-              CPU·메모리 예약 현황을 확인할 수 없습니다.
-            </p>
-          )}
-        </div>
+        <>
+          <div className="capacity-panel__meters">
+            <CapacityMeter
+              label="내 환경"
+              detail="보유 중"
+              used={capacity.workspaceUsed}
+              limit={capacity.workspaceLimit}
+            />
+            <CapacityMeter
+              label="전체 실행 환경"
+              detail="가동 중"
+              used={capacity.activeUsed}
+              limit={capacity.activeLimit}
+              accent
+            />
+            {resourcesKnown ? (
+              <>
+                <CapacityMeter
+                  label="CPU 예약"
+                  detail="전체 예산"
+                  used={capacity.cpuReservedMillicores!}
+                  limit={capacity.cpuBudgetMillicores!}
+                  formatValue={(value) => `${value / 1000} core`}
+                />
+                <CapacityMeter
+                  label="메모리 예약"
+                  detail="전체 예산"
+                  used={capacity.memoryReservedMb!}
+                  limit={capacity.memoryBudgetMb!}
+                  formatValue={(value) => formatMegabytes(value) ?? `${value} MB`}
+                />
+                {capacity.gpuReservedCount !== null &&
+                  capacity.gpuBudgetCount !== null &&
+                  capacity.gpuBudgetCount > 0 && (
+                    <CapacityMeter
+                      label="NVIDIA GPU 예약"
+                      detail="독점 할당"
+                      used={capacity.gpuReservedCount}
+                      limit={capacity.gpuBudgetCount}
+                      formatValue={(value) => `${value}개`}
+                    />
+                  )}
+              </>
+            ) : (
+              <p className="form-hint capacity-resource-warning" role="status">
+                CPU·메모리 예약 현황을 확인할 수 없습니다.
+              </p>
+            )}
+          </div>
+          {capacity.kernelIdleTimeoutSeconds !== null &&
+            capacity.kernelIdleTimeoutSeconds > 0 && (
+              <p className="capacity-kernel-policy" role="note">
+                <strong>유휴 커널 자동 정리 {formatKernelIdleTimeout(
+                  capacity.kernelIdleTimeoutSeconds,
+                )}</strong>
+                새로 시작하거나 재시작한 환경에서 Jupyter가 유휴로 판단한 커널은 자동으로
+                종료됩니다. Jupyter가 실행 중(busy)으로 인식하는 셀과 저장한 파일은 보호되지만,
+                메모리 변수와 실행 상태는 사라집니다. 셀 밖 background 작업은 보호 대상이 아닙니다.
+              </p>
+            )}
+        </>
       ) : (
         <p className="empty-copy">사용 현황을 불러오지 못했습니다.</p>
       )}

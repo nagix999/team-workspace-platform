@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from app.domain import HubServerState
 from app.hub import HubRequestError, HubServer
 from app.models import Operation, SpawnAuthorization, Workspace
+from app.services.resource_policy import get_resource_policy
 from app.worker import OperationWorker
 
 from conftest import login, mutation_headers, provision
@@ -57,6 +58,44 @@ def test_worker_converges_create_and_launches_with_tokenless_url(app_env):
     launch = client.get(workspace["launch_url"], follow_redirects=False)
     assert launch.status_code == 303
     assert "token=" not in launch.headers["location"]
+
+
+def test_worker_snapshots_nondefault_kernel_idle_policy(app_env):
+    app, hub, client = app_env
+    me, *_ = login(client, hub, "alice")
+    provision(app, "alice")
+    with app.state.session_factory() as db:
+        policy = get_resource_policy(db, app.state.settings)
+        policy.kernel_idle_timeout_seconds = 7_200
+        db.commit()
+
+    created = _create_and_start(client, me, "kernel-idle-snapshot")
+    worker = OperationWorker(
+        app.state.settings,
+        app.state.session_factory,
+        hub,
+        app.state.token_cipher,
+        worker_id="kernel-idle-worker",
+    )
+    assert asyncio.run(worker.process_next()) is True
+    with app.state.session_factory() as db:
+        authorization = db.scalar(
+            select(SpawnAuthorization).where(
+                SpawnAuthorization.operation_id == created["operation"]["id"]
+            )
+        )
+        policy = get_resource_policy(db, app.state.settings)
+        assert authorization and authorization.kernel_idle_timeout_seconds == 7_200
+        policy.kernel_idle_timeout_seconds = 300
+        db.commit()
+
+    with app.state.session_factory() as db:
+        authorization = db.scalar(
+            select(SpawnAuthorization).where(
+                SpawnAuthorization.operation_id == created["operation"]["id"]
+            )
+        )
+        assert authorization and authorization.kernel_idle_timeout_seconds == 7_200
 
 
 def test_new_worker_reclaims_pending_async_spawn(app_env):

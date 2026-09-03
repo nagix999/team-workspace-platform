@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import begin_immediate
+from ..accelerators import NVIDIA_GPU_DEVICE_ID_RE, stored_profile_accelerator
 from ..domain import DesiredState, OperationStatus, ProvisionStatus, UserStatus
 from ..errors import AppError
 from ..models import (
@@ -18,6 +19,7 @@ from ..models import (
     WorkspaceProfile,
     WorkspaceVolumeSlot,
 )
+from ..policy_values import kernel_idle_timeout_is_valid
 from ..profile_values import cpu_limit_to_millicores
 from ..schemas import (
     SpawnAuthorizationBinding,
@@ -101,6 +103,23 @@ def _validate_mutable_invariants(
             and slot.hard_limit_mb == profile.private_disk_limit_mb
             and profile.enabled
             and profile.config_digest == authorization.profile_config_digest
+            and authorization.gpu_count == profile.gpu_count
+            and (
+                (
+                    profile.gpu_count == 0
+                    and workspace.assigned_gpu_device_id is None
+                    and authorization.gpu_device_id is None
+                    and authorization.gpu_inventory_digest is None
+                )
+                or (
+                    profile.gpu_count == 1
+                    and workspace.assigned_gpu_device_id == authorization.gpu_device_id
+                    and isinstance(authorization.gpu_device_id, str)
+                    and NVIDIA_GPU_DEVICE_ID_RE.fullmatch(authorization.gpu_device_id)
+                    is not None
+                    and isinstance(authorization.gpu_inventory_digest, str)
+                )
+            )
             and authorization.environment_digest is not None
             and user.environment_generation == authorization.user_environment_generation
             and workspace.environment_generation
@@ -128,6 +147,22 @@ def _binding(
     }
     if authorization.environment_digest is None:
         raise AppError(403, "SPAWN_INVARIANT_FAILED", "Environment digest is missing")
+    if not kernel_idle_timeout_is_valid(authorization.kernel_idle_timeout_seconds):
+        raise AppError(
+            403,
+            "SPAWN_INVARIANT_FAILED",
+            "Kernel idle timeout snapshot is invalid",
+        )
+    try:
+        accelerator = stored_profile_accelerator(profile)
+    except ValueError as exc:
+        raise AppError(
+            403, "SPAWN_INVARIANT_FAILED", "Accelerator contract is invalid"
+        ) from exc
+    if accelerator.count != authorization.gpu_count:
+        raise AppError(
+            403, "SPAWN_INVARIANT_FAILED", "GPU authorization does not match profile"
+        )
     return SpawnAuthorizationBinding(
         spawn_authorization_id=authorization.id,
         workspace_id=workspace.id,
@@ -153,6 +188,10 @@ def _binding(
         environment_digest=authorization.environment_digest,
         user_environment_generation=authorization.user_environment_generation,
         workspace_environment_generation=authorization.workspace_environment_generation,
+        kernel_idle_timeout_seconds=authorization.kernel_idle_timeout_seconds,
+        gpu_count=authorization.gpu_count,
+        gpu_device_id=authorization.gpu_device_id,
+        gpu_inventory_digest=authorization.gpu_inventory_digest,
         valid_until_unix=int(
             authorization.expires_at.replace(tzinfo=timezone.utc).timestamp()
         ),

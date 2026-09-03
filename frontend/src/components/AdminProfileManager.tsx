@@ -17,11 +17,18 @@ function templateKey(template: RuntimeProfileTemplate): string {
   return `${template.id}:${template.version}`;
 }
 
+function runtimeAcceleratorLabel(runtime: RuntimeProfileTemplate): string {
+  return runtime.acceleratorKind === "nvidia"
+    ? `NVIDIA GPU 1개 · CUDA ${runtime.cudaVersion} · PyTorch ${runtime.gpuFrameworkVersion}`
+    : "CPU 전용";
+}
+
 interface AdminKernelGroup {
   key: string;
   kernelName: string;
   displayName: string;
   pythonVersion: string;
+  acceleratorLabel: string;
   profiles: AdminWorkspaceProfile[];
 }
 
@@ -31,12 +38,14 @@ export function groupAdminProfilesByKernel(
   const groups = new Map<string, AdminKernelGroup>();
   for (const profile of profiles) {
     const runtime = profile.runtimeProfile;
-    const key = `${runtime.kernelName}:${runtime.pythonVersion}`;
+    const acceleratorLabel = runtimeAcceleratorLabel(runtime);
+    const key = `${runtime.kernelName}:${runtime.pythonVersion}:${runtime.acceleratorKind}:${runtime.cudaVersion ?? "-"}:${runtime.gpuFrameworkVersion ?? "-"}`;
     const group = groups.get(key) ?? {
       key,
       kernelName: runtime.kernelName,
       displayName: runtime.kernelDisplayName,
       pythonVersion: runtime.pythonVersion,
+      acceleratorLabel,
       profiles: [],
     };
     group.profiles.push(profile);
@@ -216,7 +225,7 @@ export function AdminProfileManager({
         });
       }
       setNotice(
-        `${group.displayName}의 CPU·Memory 조합 ${targets.length}개를 ${visible ? "공개" : "비공개"}했습니다.`,
+        `${group.displayName} ${group.acceleratorLabel}의 CPU·Memory 조합 ${targets.length}개를 ${visible ? "공개" : "비공개"}했습니다.`,
       );
       await Promise.all([load(), onProfilesChanged()]);
     } catch (requestError) {
@@ -235,8 +244,8 @@ export function AdminProfileManager({
     try {
       for (const template of missingTemplates) {
         await portalApi.createAdminProfile({
-          name: `${template.kernelDisplayName} · CPU ${template.cpuLimit} · ${formatMegabytes(template.memoryLimitMb)}`,
-          description: `Python ${template.pythonVersion} 검증 실행 조합`,
+          name: `${template.kernelDisplayName} · ${runtimeAcceleratorLabel(template)} · CPU ${template.cpuLimit} · ${formatMegabytes(template.memoryLimitMb)}`.slice(0, 80),
+          description: `Python ${template.pythonVersion} · ${runtimeAcceleratorLabel(template)} 검증 실행 조합`,
           runtimeProfileId: template.id,
           runtimeProfileVersion: template.version,
           enabled: true,
@@ -257,7 +266,7 @@ export function AdminProfileManager({
       <div className="admin-workspaces__heading">
         <div>
           <h3>개발환경 프로필</h3>
-          <p>검증된 Python 커널 × CPU × Memory의 모든 조합을 먼저 생성하고, 사용자에게 공개할 조합만 선택합니다. 이미지와 실행 명령은 화면에서 입력할 수 없습니다.</p>
+          <p>검증된 Python 커널 × 가속기 × CPU × Memory 조합을 먼저 생성하고, 사용자에게 공개할 조합만 선택합니다. 이미지와 실행 명령은 화면에서 입력할 수 없습니다.</p>
         </div>
         <span className="item-count" aria-label={`관리 프로필 ${profiles.length}개`}>
           {profiles.length}
@@ -296,7 +305,7 @@ export function AdminProfileManager({
               <article key={group.key}>
                 <div>
                   <strong>{group.displayName}</strong>
-                  <span>Python {group.pythonVersion} · {enabledCount}/{group.profiles.length}개 공개</span>
+                  <span>Python {group.pythonVersion} · {group.acceleratorLabel} · {enabledCount}/{group.profiles.length}개 공개</span>
                 </div>
                 <div className="admin-kernel-grid__actions">
                   <button
@@ -332,7 +341,7 @@ export function AdminProfileManager({
             >
               {(editingProfile ? [editingProfile.runtimeProfile] : missingTemplates).map((template) => (
                 <option key={templateKey(template)} value={templateKey(template)}>
-                  {template.kernelDisplayName} · Python {template.pythonVersion} · CPU {template.cpuLimit} · {formatMegabytes(template.memoryLimitMb)}
+                  {template.kernelDisplayName} · Python {template.pythonVersion} · {runtimeAcceleratorLabel(template)} · CPU {template.cpuLimit} · {formatMegabytes(template.memoryLimitMb)}
                 </option>
               ))}
             </select>
@@ -373,6 +382,7 @@ export function AdminProfileManager({
           <ul className="resource-list" aria-label="프로필 실행 템플릿 요약">
             <li>커널 {selectedTemplate.kernelDisplayName}</li>
             <li>Python {selectedTemplate.pythonVersion}</li>
+            <li>{runtimeAcceleratorLabel(selectedTemplate)}</li>
             <li>CPU {selectedTemplate.cpuLimit}</li>
             <li>메모리 {formatMegabytes(selectedTemplate.memoryLimitMb)}</li>
           </ul>
@@ -409,6 +419,8 @@ export function AdminProfileManager({
                     resourcePolicy.selectableCpuMillicores.includes(cpu) &&
                     resourcePolicy.selectableMemoryMb.includes(
                       profile.runtimeProfile.memoryLimitMb,
+                    ) && resourcePolicy.selectableGpuCounts.includes(
+                      profile.runtimeProfile.gpuCount,
                     ),
                   );
                   const effectivelySelectable = profile.effectiveSelectable ?? locallySelectable;
@@ -422,6 +434,7 @@ export function AdminProfileManager({
               <ul className="resource-list">
                 <li>{profile.runtimeProfile.kernelDisplayName}</li>
                 <li>Python {profile.runtimeProfile.pythonVersion}</li>
+                <li>{runtimeAcceleratorLabel(profile.runtimeProfile)}</li>
                 <li>CPU {profile.runtimeProfile.cpuLimit}</li>
                 <li>{formatMegabytes(profile.runtimeProfile.memoryLimitMb)}</li>
               </ul>

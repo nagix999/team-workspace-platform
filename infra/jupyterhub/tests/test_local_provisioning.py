@@ -196,6 +196,52 @@ class LocalDockerProvisionerTests(unittest.TestCase):
                 f"/var/lib/docker/volumes/{slot['volume_name']}/_data",
             )
 
+    def test_second_production_user_imports_first_production_manifest(self) -> None:
+        engine = FakeDockerEngine()
+        first_user_id = str(uuid.uuid4())
+        second_user_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            provisioner = LocalDockerProvisioner(
+                engine=engine,
+                profile_policy=self.policy,
+                state_dir=state_dir,
+                production_manifest=True,
+            )
+            first = provisioner.provision(user_id=first_user_id, username="alice")
+            second = provisioner.provision(user_id=second_user_id, username="bob")
+            first_retry = provisioner.provision(user_id=first_user_id, username="alice")
+
+        self.assertEqual(first_retry, first)
+        self.assertEqual(
+            [slot["project_id"] for slot in first["slots"]],
+            [10000, 10001, 10002, 10003, 10004],
+        )
+        self.assertEqual(
+            [slot["project_id"] for slot in second["slots"]],
+            [10005, 10006, 10007, 10008, 10009],
+        )
+
+    def test_tampered_persisted_production_manifest_fails_closed(self) -> None:
+        engine = FakeDockerEngine()
+        first_user_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            provisioner = LocalDockerProvisioner(
+                engine=engine,
+                profile_policy=self.policy,
+                state_dir=state_dir,
+                production_manifest=True,
+            )
+            provisioner.provision(user_id=first_user_id, username="alice")
+            output = state_dir / f"local-user-{first_user_id}.json"
+            value = json.loads(output.read_text())
+            value["slots"][0]["path"] = "/var/lib/docker/volumes/replaced/_data"
+            output.write_text(json.dumps(value))
+
+            with self.assertRaisesRegex(RuntimeError, "inventory digest is invalid"):
+                provisioner.provision(user_id=str(uuid.uuid4()), username="bob")
+
     def test_existing_volume_with_extra_or_conflicting_policy_fails_closed(
         self,
     ) -> None:

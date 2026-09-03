@@ -28,14 +28,61 @@ export function resolveWorkspaceProfile(
   kernelKey: string,
   cpuLimit: string,
   memoryLimitMb: number | null,
+  acceleratorKey?: string,
 ): WorkspaceProfile | null {
   const matches = profiles.filter((profile) =>
     workspaceKernelKey(profile) === kernelKey &&
     profile.cpuLimit === cpuLimit &&
-    profile.memoryLimitMb === memoryLimitMb);
+    profile.memoryLimitMb === memoryLimitMb &&
+    (acceleratorKey === undefined ||
+      workspaceAcceleratorKey(profile) === acceleratorKey));
   // A selector tuple must resolve to one immutable server-side offer. Duplicate
   // offers are ambiguous, so fail closed instead of depending on response order.
   return matches.length === 1 ? matches[0] : null;
+}
+
+export function workspaceAcceleratorKey(
+  profile: Pick<
+    WorkspaceProfile,
+    | "acceleratorKind"
+    | "gpuCount"
+    | "cudaVersion"
+    | "gpuFramework"
+    | "gpuFrameworkVersion"
+  >,
+): string {
+  return [
+    profile.acceleratorKind,
+    profile.gpuCount,
+    profile.cudaVersion ?? "-",
+    profile.gpuFramework ?? "-",
+    profile.gpuFrameworkVersion ?? "-",
+  ].join(":");
+}
+
+function defaultWorkspaceProfile(profiles: WorkspaceProfile[]): WorkspaceProfile | undefined {
+  return profiles.find((profile) => profile.acceleratorKind === "none") ?? profiles[0];
+}
+
+export function filterWorkspaceProfiles(
+  profiles: WorkspaceProfile[],
+  selection: {
+    acceleratorKey: string;
+    kernelKey?: string;
+    cpuLimit?: string;
+  },
+): WorkspaceProfile[] {
+  return profiles.filter((profile) =>
+    workspaceAcceleratorKey(profile) === selection.acceleratorKey &&
+    (selection.kernelKey === undefined ||
+      workspaceKernelKey(profile) === selection.kernelKey) &&
+    (selection.cpuLimit === undefined || profile.cpuLimit === selection.cpuLimit));
+}
+
+function acceleratorLabel(profile: WorkspaceProfile): string {
+  return profile.acceleratorKind === "nvidia"
+    ? `NVIDIA GPU 1개 · CUDA ${profile.cudaVersion} · PyTorch ${profile.gpuFrameworkVersion}`
+    : "CPU 전용";
 }
 
 export function workspaceKernelKey(
@@ -55,17 +102,42 @@ export function CreateWorkspace({
   onRetry,
   onCreate,
 }: CreateWorkspaceProps) {
+  const initialProfile = defaultWorkspaceProfile(profiles);
+  const [selectedAccelerator, setSelectedAccelerator] = useState(() =>
+    initialProfile ? workspaceAcceleratorKey(initialProfile) : "");
   const [selectedKernel, setSelectedKernel] = useState(() =>
-    profiles[0] ? workspaceKernelKey(profiles[0]) : "");
+    initialProfile ? workspaceKernelKey(initialProfile) : "");
   const [selectedCpu, setSelectedCpu] = useState(() =>
-    profiles[0]?.cpuLimit ?? "");
+    initialProfile?.cpuLimit ?? "");
   const [selectedMemory, setSelectedMemory] = useState<number | null>(() =>
-    profiles[0]?.memoryLimitMb ?? null);
+    initialProfile?.memoryLimitMb ?? null);
   const [workspaceName, setWorkspaceName] = useState("");
+
+  const acceleratorOptions = useMemo(() => {
+    const values = new Map<string, { key: string; label: string }>();
+    for (const profile of profiles) {
+      const key = workspaceAcceleratorKey(profile);
+      values.set(key, { key, label: acceleratorLabel(profile) });
+    }
+    return [...values.values()].sort((left, right) => {
+      const leftCpu = left.key.startsWith("none:");
+      const rightCpu = right.key.startsWith("none:");
+      if (leftCpu !== rightCpu) return leftCpu ? -1 : 1;
+      return left.key.localeCompare(right.key);
+    });
+  }, [profiles]);
+
+  useEffect(() => {
+    if (!acceleratorOptions.some((option) => option.key === selectedAccelerator)) {
+      setSelectedAccelerator(acceleratorOptions[0]?.key ?? "");
+    }
+  }, [acceleratorOptions, selectedAccelerator]);
 
   const kernelOptions = useMemo(() => {
     const values = new Map<string, { key: string; label: string; version: string }>();
-    for (const profile of profiles) {
+    for (const profile of filterWorkspaceProfiles(profiles, {
+      acceleratorKey: selectedAccelerator,
+    })) {
       const key = workspaceKernelKey(profile);
       values.set(key, {
         key,
@@ -75,7 +147,7 @@ export function CreateWorkspace({
     }
     return [...values.values()].sort((left, right) =>
       left.version.localeCompare(right.version) || left.key.localeCompare(right.key));
-  }, [profiles]);
+  }, [profiles, selectedAccelerator]);
 
   useEffect(() => {
     if (!kernelOptions.some((option) => option.key === selectedKernel)) {
@@ -83,23 +155,27 @@ export function CreateWorkspace({
     }
   }, [kernelOptions, selectedKernel]);
 
-  const cpuOptions = useMemo(() => [...new Set(profiles
-    .filter((profile) => workspaceKernelKey(profile) === selectedKernel)
+  const cpuOptions = useMemo(() => [...new Set(filterWorkspaceProfiles(profiles, {
+    acceleratorKey: selectedAccelerator,
+    kernelKey: selectedKernel,
+  })
     .map((profile) => profile.cpuLimit))]
     .sort((left, right) =>
       (cpuLimitToMillicores(left) ?? Number.MAX_SAFE_INTEGER) -
       (cpuLimitToMillicores(right) ?? Number.MAX_SAFE_INTEGER)),
-  [profiles, selectedKernel]);
+  [profiles, selectedAccelerator, selectedKernel]);
 
   useEffect(() => {
     if (!cpuOptions.includes(selectedCpu)) setSelectedCpu(cpuOptions[0] ?? "");
   }, [cpuOptions, selectedCpu]);
 
-  const memoryOptions = useMemo(() => [...new Set(profiles
-    .filter((profile) =>
-      workspaceKernelKey(profile) === selectedKernel && profile.cpuLimit === selectedCpu)
+  const memoryOptions = useMemo(() => [...new Set(filterWorkspaceProfiles(profiles, {
+    acceleratorKey: selectedAccelerator,
+    kernelKey: selectedKernel,
+    cpuLimit: selectedCpu,
+  })
     .map((profile) => profile.memoryLimitMb))].sort((left, right) => left - right),
-  [profiles, selectedCpu, selectedKernel]);
+  [profiles, selectedAccelerator, selectedCpu, selectedKernel]);
 
   useEffect(() => {
     if (selectedMemory === null || !memoryOptions.includes(selectedMemory)) {
@@ -113,8 +189,9 @@ export function CreateWorkspace({
       selectedKernel,
       selectedCpu,
       selectedMemory,
+      selectedAccelerator,
     ),
-    [profiles, selectedCpu, selectedKernel, selectedMemory],
+    [profiles, selectedAccelerator, selectedCpu, selectedKernel, selectedMemory],
   );
   const capacityUnknown = capacity === null;
   const userAtLimit = capacity
@@ -176,6 +253,22 @@ export function CreateWorkspace({
 
       {profiles.length > 0 ? (
         <div className="profile-axis-grid" aria-label="개발환경 설정 선택">
+          <label>
+            <span className="field-label">가속기</span>
+            <div className="select-wrap">
+              <select
+                id="accelerator-select"
+                value={selectedAccelerator}
+                disabled={controlsDisabled}
+                onChange={(event) => setSelectedAccelerator(event.target.value)}
+              >
+                {acceleratorOptions.map((option) => (
+                  <option key={option.key} value={option.key}>{option.label}</option>
+                ))}
+              </select>
+              <span aria-hidden="true">⌄</span>
+            </div>
+          </label>
           <label>
             <span className="field-label">Python 커널</span>
             <div className="select-wrap">
@@ -261,6 +354,13 @@ export function CreateWorkspace({
             <ul className="resource-list" aria-label="선택한 개발환경 설정">
               <li>기본 커널 {selected.kernelDisplayName}</li>
               <li>기본 노트북/터미널 Python {selected.pythonVersion}</li>
+              {selected.acceleratorKind === "nvidia" ? (
+                <li>
+                  NVIDIA GPU 1개 · CUDA {selected.cudaVersion} · PyTorch {selected.gpuFrameworkVersion}
+                </li>
+              ) : (
+                <li>가속기 CPU 전용</li>
+              )}
               <li>CPU {selected.cpuLimit}</li>
               <li>메모리 {formatMegabytes(selected.memoryLimitMb)}</li>
               {selected.privateDiskQuotaEnforced ? (

@@ -243,6 +243,7 @@ p {
   border-bottom: 1px solid transparent;
   cursor: pointer;
   font-size: 0.78rem;
+  text-decoration: none;
 }
 
 .text-button:hover {
@@ -1419,7 +1420,7 @@ p {
 .profile-axis-grid {
   margin-bottom: 1rem;
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.75fr) minmax(0, 0.9fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.7rem;
 }
 
@@ -1992,6 +1993,86 @@ p {
   line-height: 1.6;
 }
 
+.admin-egress {
+  display: grid;
+  gap: 1rem;
+}
+
+.admin-egress__status,
+.admin-egress__editor,
+.admin-egress__rules article {
+  padding: 1rem;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.admin-egress__status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.admin-egress__status--failed {
+  color: var(--red);
+  border-color: #e8b8b1;
+}
+
+.admin-egress__status p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.admin-egress__editor {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) minmax(8rem, 0.35fr) auto;
+  gap: 0.8rem;
+  align-items: end;
+}
+
+.admin-egress__editor label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.admin-egress__editor input {
+  min-height: 2.65rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 0.5rem;
+}
+
+.admin-egress__actions {
+  display: flex;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
+.admin-egress__rules {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.admin-egress__rules article,
+.admin-egress__rules article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.admin-egress__rules span {
+  color: var(--ink-soft);
+  font-size: 0.7rem;
+}
+
+@media (max-width: 760px) {
+  .admin-egress__editor {
+    grid-template-columns: 1fr;
+  }
+}
+
 .admin-resource-selectors {
   margin-top: 0.8rem;
   display: grid;
@@ -2054,6 +2135,84 @@ p {
 .admin-resource-values button:focus-visible {
   background: rgba(20, 91, 67, 0.12);
   outline: none;
+}
+
+.admin-kernel-policy {
+  margin-top: 1rem;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.62);
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+}
+
+.admin-kernel-policy h4,
+.admin-kernel-policy p {
+  margin: 0;
+}
+
+.admin-kernel-policy h4 {
+  font-size: 0.76rem;
+}
+
+.admin-kernel-policy > div:first-child p,
+.admin-kernel-policy__warning {
+  margin-top: 0.35rem;
+  color: var(--ink-soft);
+  font-size: 0.66rem;
+  line-height: 1.6;
+}
+
+.admin-kernel-policy__controls {
+  margin-top: 0.85rem;
+  display: grid;
+  grid-template-columns: minmax(10rem, 0.7fr) minmax(12rem, 1fr);
+  align-items: end;
+  gap: 0.8rem;
+}
+
+.admin-kernel-policy__controls label > span {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--ink-soft);
+  font-size: 0.63rem;
+  font-weight: 700;
+}
+
+.admin-kernel-policy__toggle {
+  min-height: 2.8rem;
+  padding: 0.65rem 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  background: white;
+  border: 1px solid var(--line-dark);
+  border-radius: 0.55rem;
+}
+
+.admin-kernel-policy__toggle > span {
+  margin: 0;
+}
+
+.admin-kernel-policy__warning {
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.capacity-kernel-policy {
+  margin: 1rem 0 0;
+  padding: 0.8rem;
+  color: var(--ink-soft);
+  background: rgba(223, 244, 233, 0.62);
+  border: 1px solid var(--mint-strong);
+  border-radius: 0.6rem;
+  font-size: 0.66rem;
+  line-height: 1.55;
+}
+
+.capacity-kernel-policy strong {
+  margin-bottom: 0.2rem;
+  display: block;
+  color: var(--forest);
 }
 
 .admin-settings > .button {
@@ -2298,6 +2457,7 @@ p {
   .environment-create,
   .admin-budget-fields,
   .admin-resource-selectors,
+  .admin-kernel-policy__controls,
   .admin-profile-editor__fields {
     grid-template-columns: 1fr;
   }

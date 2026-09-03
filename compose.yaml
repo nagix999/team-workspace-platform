@@ -328,6 +328,7 @@ services:
       # The only cross-user Hub credential is mounted into the non-HTTP worker.
       # API/frontend/migration containers never receive this file or value.
       JUPYTERHUB_ADMIN_LIFECYCLE_TOKEN_FILE: /run/platform-secrets/admin_lifecycle_token
+      PLATFORM_INTERNAL_EGRESS_POLICY_DIR: /var/lib/platform-egress-policy
     volumes:
       - platform_data:/var/lib/platform
       - ./secrets/oauth_client_secret:/run/platform-secrets/oauth_client_secret:ro
@@ -337,6 +338,11 @@ services:
       - ./secrets/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
       - ./.runtime:/runtime:ro
       - ./infra/jupyterhub/profiles.local-dev.json:/etc/platform/profiles.local-dev.json:ro
+      - egress_policy_desired:/var/lib/platform-egress-policy/desired:rw
+      - egress_policy_ack:/var/lib/platform-egress-policy/ack:ro
+    group_add:
+      - ${PLATFORM_SECRET_GID:?Run bash scripts/init-local.sh first}
+      - "2999"
     command: ["python", "-m", "app.worker", "--poll-seconds", "1"]
     # This process has no HTTP listener; inheriting the API image healthcheck
     # would mark a healthy worker unhealthy. Durable-operation liveness is an
@@ -413,6 +419,29 @@ services:
     restart: unless-stopped
     logging: *bounded-logs
 
+  egress-policy-init:
+    build:
+      context: ./infra/egress-proxy
+      args:
+        SQUID_BASE_IMAGE: ubuntu/squid:6.6-24.04_edge
+        ALLOW_MUTABLE_BASE_IMAGE: "true"
+    image: team-platform-egress-proxy:local
+    # uid 0 owns the fresh volume root and effective gid 2999 may be assigned
+    # without CAP_CHOWN; no capability is added to this one-shot initializer.
+    user: "0:2999"
+    entrypoint: ["/usr/local/bin/init-policy-volume"]
+    command: []
+    volumes:
+      - egress_policy_desired:/var/lib/platform-egress-policy/desired:rw
+      - egress_policy_ack:/var/lib/platform-egress-policy/ack:rw
+    network_mode: none
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: "no"
+
   egress-proxy:
     build:
       context: ./infra/egress-proxy
@@ -423,6 +452,13 @@ services:
     user: "13:13"
     volumes:
       - ./infra/egress-proxy/approved-domains.local-dev.txt:/etc/squid/approved-domains.txt:ro
+      - egress_policy_desired:/var/lib/platform-egress-policy/desired:ro
+      - egress_policy_ack:/var/lib/platform-egress-policy/ack:rw
+    group_add:
+      - "2999"
+    depends_on:
+      egress-policy-init:
+        condition: service_completed_successfully
     networks:
       jupyter:
         ipv4_address: 172.30.0.20
@@ -588,16 +624,27 @@ services:
 volumes:
   platform_data:
   jupyterhub_data:
+  egress_policy_desired:
+  egress_policy_ack:
 
 networks:
   # Docker Engine does not publish ports for a container attached only to an
   # --internal bridge. This ingress bridge is attached solely to the loopback-
   # published gateway; API, Hub and frontend remain on internal networks.
   ingress:
+    ipam:
+      config:
+        - subnet: 172.25.0.0/24
   edge:
     internal: true
+    ipam:
+      config:
+        - subnet: 172.26.0.0/24
   control:
     internal: true
+    ipam:
+      config:
+        - subnet: 172.27.0.0/24
   egress-out:
     ipam:
       config:

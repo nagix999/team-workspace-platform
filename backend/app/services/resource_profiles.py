@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from ..errors import AppError
 from ..models import WorkspaceProfile
+from ..accelerators import stored_profile_accelerator
 from ..profile_values import cpu_limit_to_millicores
 
 
@@ -40,6 +41,14 @@ _DIGEST_FIELDS = tuple(
         }
     )
 )
+
+
+def _digest_fields(raw: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        tuple(sorted((*_DIGEST_FIELDS, "accelerator")))
+        if "accelerator" in raw
+        else _DIGEST_FIELDS
+    )
 
 
 def _provider_options(profile: WorkspaceProfile) -> dict[str, Any]:
@@ -79,12 +88,13 @@ def is_dynamic_resource_profile(profile: WorkspaceProfile) -> bool:
 
 
 def _runtime_signature(raw: dict[str, Any]) -> str:
+    digest_fields = _digest_fields(raw)
     execution = {
         key: raw[key]
-        for key in _DIGEST_FIELDS
+        for key in digest_fields
         if key not in {"id", "version", "cpu_limit", "memory_limit_bytes"}
     }
-    if len(execution) != len(_DIGEST_FIELDS) - 4:
+    if len(execution) != len(digest_fields) - 4:
         raise AppError(
             500,
             "PROFILE_RESOURCE_INVALID",
@@ -109,8 +119,9 @@ def derived_profile_id(
 
 
 def _profile_digest(raw: dict[str, Any]) -> str:
+    digest_fields = _digest_fields(raw)
     canonical = json.dumps(
-        {key: raw[key] for key in _DIGEST_FIELDS},
+        {key: raw[key] for key in digest_fields},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -145,9 +156,21 @@ def ensure_resource_profile_matrix(
         )
     ).all()
     static_rows = [row for row in rows if not is_dynamic_resource_profile(row)]
-    by_kernel: dict[tuple[str, str], list[WorkspaceProfile]] = {}
+    by_kernel: dict[tuple[object, ...], list[WorkspaceProfile]] = {}
     for row in static_rows:
-        by_kernel.setdefault((row.kernel_name, row.python_version), []).append(row)
+        accelerator = stored_profile_accelerator(row)
+        by_kernel.setdefault(
+            (
+                row.kernel_name,
+                row.python_version,
+                accelerator.kind,
+                accelerator.count,
+                accelerator.cuda_version,
+                accelerator.framework,
+                accelerator.framework_version,
+            ),
+            [],
+        ).append(row)
     if not by_kernel:
         raise AppError(
             503, "RESOURCE_CATALOG_EMPTY", "No verified Python runtime is available"
@@ -156,17 +179,37 @@ def ensure_resource_profile_matrix(
         (
             row.kernel_name,
             row.python_version,
+            row.accelerator_kind,
+            row.gpu_count,
+            row.cuda_version,
+            row.gpu_framework,
+            row.gpu_framework_version,
             cpu_limit_to_millicores(row.cpu_limit),
             row.memory_limit_mb,
         ): row
         for row in rows
     }
-    for (kernel_name, python_version), bases in sorted(by_kernel.items()):
+    for family, bases in sorted(by_kernel.items(), key=lambda item: str(item[0])):
+        kernel_name = str(family[0])
+        python_version = str(family[1])
+        accelerator_kind = str(family[2])
+        gpu_count = int(family[3])
         missing = [
             (cpu, memory)
             for cpu in cpu_millicores
             for memory in memory_mb
-            if (kernel_name, python_version, cpu, memory) not in existing
+            if (
+                kernel_name,
+                python_version,
+                accelerator_kind,
+                gpu_count,
+                family[4],
+                family[5],
+                family[6],
+                cpu,
+                memory,
+            )
+            not in existing
         ]
         if not missing:
             continue
@@ -182,7 +225,17 @@ def ensure_resource_profile_matrix(
             )
         signature, (base, base_raw) = next(iter(families.items()))
         for cpu, memory in missing:
-            key = (kernel_name, python_version, cpu, memory)
+            key = (
+                kernel_name,
+                python_version,
+                accelerator_kind,
+                gpu_count,
+                family[4],
+                family[5],
+                family[6],
+                cpu,
+                memory,
+            )
             profile_id = derived_profile_id(
                 kernel_name=kernel_name,
                 runtime_signature=signature,
@@ -216,6 +269,11 @@ def ensure_resource_profile_matrix(
                 kernel_name=base.kernel_name,
                 kernel_display_name=base.kernel_display_name,
                 python_version=base.python_version,
+                accelerator_kind=base.accelerator_kind,
+                gpu_count=base.gpu_count,
+                cuda_version=base.cuda_version,
+                gpu_framework=base.gpu_framework,
+                gpu_framework_version=base.gpu_framework_version,
                 image_ref=base.image_ref,
                 cpu_limit=str(_cpu_json_value(cpu)),
                 memory_limit_mb=memory,

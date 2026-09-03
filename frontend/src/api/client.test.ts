@@ -5,6 +5,7 @@ import {
   normalizeAdminProfileCatalog,
   normalizeCapacity,
   normalizeEnvironmentList,
+  normalizeInternalEgressPolicy,
   normalizeOperation,
   normalizeProvisioning,
   normalizeProfiles,
@@ -15,6 +16,140 @@ import {
 } from "./client";
 
 describe("portal API normalization", () => {
+  it("strictly normalizes desired/applied internal egress state", () => {
+    const snapshot = normalizeInternalEgressPolicy({
+      policy: {
+        desired_revision: 4,
+        desired_digest: `sha256:${"a".repeat(64)}`,
+        applied_revision: 3,
+        applied_digest: `sha256:${"b".repeat(64)}`,
+        apply_status: "PENDING",
+        last_error_code: null,
+        last_error_summary: null,
+        updated_at: "2026-09-03T00:00:00",
+      },
+      rules: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        destination_cidr: "10.255.255.254/32",
+        port: 8000,
+        row_version: 2,
+        created_at: null,
+        updated_at: null,
+      }],
+    });
+
+    expect(snapshot).toMatchObject({
+      applyStatus: "PENDING",
+      desiredRevision: 4,
+      appliedRevision: 3,
+      rules: [{ destinationCidr: "10.255.255.254/32", port: 8000, rowVersion: 2 }],
+    });
+  });
+
+  it("rejects a falsely applied internal egress state", () => {
+    expect(() => normalizeInternalEgressPolicy({
+      policy: {
+        desired_revision: 4,
+        desired_digest: `sha256:${"a".repeat(64)}`,
+        applied_revision: 3,
+        applied_digest: `sha256:${"b".repeat(64)}`,
+        apply_status: "APPLIED",
+      },
+      rules: [],
+    })).toThrow();
+  });
+
+  it("binds every internal egress mutation to the loaded policy revision", async () => {
+    const responsePayload = {
+      policy: {
+        desired_revision: 7,
+        desired_digest: `sha256:${"a".repeat(64)}`,
+        applied_revision: null,
+        applied_digest: null,
+        apply_status: "PENDING",
+        last_error_code: null,
+        last_error_summary: null,
+        updated_at: "2026-09-03T00:00:00",
+      },
+      rules: [],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(JSON.stringify(responsePayload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+    const ruleId = "11111111-1111-4111-8111-111111111111";
+
+    try {
+      await portalApi.createAdminInternalEgressRule("10.255.255.254/32", 8000, 7);
+      await portalApi.updateAdminInternalEgressRule({
+        id: ruleId,
+        destinationCidr: "10.255.255.253/32",
+        port: 8443,
+        expectedVersion: 2,
+        expectedRevision: 7,
+      });
+      await portalApi.deleteAdminInternalEgressRule(ruleId, 2, 7);
+      await portalApi.retryAdminInternalEgressPolicy(7);
+
+      expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+        destination_cidr: "10.255.255.254/32",
+        port: 8000,
+        expected_revision: 7,
+      });
+      expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+        destination_cidr: "10.255.255.253/32",
+        port: 8443,
+        expected_version: 2,
+        expected_revision: 7,
+      });
+      expect(fetchMock.mock.calls[2]?.[0]).toBe(
+        `/api/v1/admin/internal-egress-policy/rules/${ruleId}?expected_revision=7&expected_version=2`,
+      );
+      expect(JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body))).toEqual({
+        expected_revision: 7,
+      });
+      expect(new Headers(fetchMock.mock.calls[3]?.[1]?.headers).get("Content-Type"))
+        .toBe("application/json");
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("rejects non-canonical, public, privileged, or duplicate internal rules", () => {
+    const base = {
+      policy: {
+        desired_revision: 1,
+        desired_digest: `sha256:${"a".repeat(64)}`,
+        applied_revision: null,
+        applied_digest: null,
+        apply_status: "PENDING",
+        last_error_code: null,
+      },
+    };
+    const rule = {
+      id: "11111111-1111-4111-8111-111111111111",
+      destination_cidr: "10.255.255.254/32",
+      port: 8000,
+      row_version: 1,
+    };
+    for (const invalidRule of [
+      { ...rule, destination_cidr: "10.025.1.1/32" },
+      { ...rule, destination_cidr: "10.255.255.256/32" },
+      { ...rule, destination_cidr: "203.0.113.10/32" },
+      { ...rule, port: 80 },
+      { ...rule, port: 3128 },
+      { ...rule, id: "not-a-uuid" },
+    ]) {
+      expect(() => normalizeInternalEgressPolicy({ ...base, rules: [invalidRule] })).toThrow();
+    }
+    expect(() => normalizeInternalEgressPolicy({
+      ...base,
+      rules: [rule, { ...rule, id: "22222222-2222-4222-8222-222222222222" }],
+    })).toThrow();
+  });
+
   it("normalizes the backend user and quota envelopes", () => {
     expect(normalizeUser({
       user: {
@@ -31,9 +166,11 @@ describe("portal API normalization", () => {
       global: {
         active: 7,
         limit: 15,
+        kernel_idle_timeout_seconds: 3600,
         resources: {
           cpu_millicores: { reserved: 3500, limit: 8000 },
           memory_mb: { reserved: 3072, limit: 4096 },
+          gpu_count: { reserved: 1, limit: 1 },
         },
       },
       execution_host_healthy: true,
@@ -47,6 +184,9 @@ describe("portal API normalization", () => {
       cpuBudgetMillicores: 8000,
       memoryReservedMb: 3072,
       memoryBudgetMb: 4096,
+      gpuReservedCount: 1,
+      gpuBudgetCount: 1,
+      kernelIdleTimeoutSeconds: 3600,
       executionHostHealthy: true,
     });
   });
@@ -62,6 +202,9 @@ describe("portal API normalization", () => {
       cpuBudgetMillicores: null,
       memoryReservedMb: null,
       memoryBudgetMb: null,
+      gpuReservedCount: null,
+      gpuBudgetCount: null,
+      kernelIdleTimeoutSeconds: null,
       executionHostHealthy: true,
     });
     expect(normalizeCapacity({})).toMatchObject({
@@ -71,6 +214,21 @@ describe("portal API normalization", () => {
     });
   });
 
+  it("does not present an invalid kernel idle timeout to users", () => {
+    expect(normalizeCapacity({
+      global: { kernel_idle_timeout_seconds: 299 },
+    }).kernelIdleTimeoutSeconds).toBeNull();
+    expect(normalizeCapacity({
+      global: { kernel_idle_timeout_seconds: 301 },
+    }).kernelIdleTimeoutSeconds).toBeNull();
+    expect(normalizeCapacity({
+      global: { kernel_idle_timeout_seconds: 604801 },
+    }).kernelIdleTimeoutSeconds).toBeNull();
+    expect(normalizeCapacity({
+      global: { kernel_idle_timeout_seconds: 0 },
+    }).kernelIdleTimeoutSeconds).toBe(0);
+  });
+
   it("keeps admin created, running, and reserved counts distinct", () => {
     expect(normalizeAdminCapacity({
       users: 10,
@@ -78,6 +236,7 @@ describe("portal API normalization", () => {
       resources: {
         cpu_millicores: { reserved: 6500, limit: 12000 },
         memory_mb: { reserved: 7168, limit: 16384 },
+        gpu_count: { reserved: 1, limit: 1 },
       },
     })).toEqual({
       users: 10,
@@ -89,6 +248,8 @@ describe("portal API normalization", () => {
       cpuBudgetMillicores: 12000,
       memoryReservedMb: 7168,
       memoryBudgetMb: 16384,
+      gpuReservedCount: 1,
+      gpuBudgetCount: 1,
     });
   });
 
@@ -99,16 +260,58 @@ describe("portal API normalization", () => {
       memory_budget_mb: 16384,
       selectable_cpu_millicores: [2000, 1000, 1000],
       selectable_memory_mb: [4096, 2048],
+      gpu_budget_count: 1,
+      selectable_gpu_counts: [1, 0, 1],
       available_cpu_millicores: [500, 1000, 2000, 4000],
       available_memory_mb: [1024, 2048, 4096, 8192],
-      hard_ceiling: { cpu_millicores: 16000, memory_mb: 32768 },
+      available_gpu_counts: [0, 1],
+      kernel_idle_timeout_seconds: 3600,
+      kernel_idle_timeout_bounds: {
+        min_seconds: 300,
+        max_seconds: 604800,
+        step_seconds: 60,
+      },
+      hard_ceiling: { cpu_millicores: 16000, memory_mb: 32768, gpu_count: 1 },
       updated_at: "2026-08-11T01:00:00Z",
     } })).toMatchObject({
       version: 4,
       selectableCpuMillicores: [1000, 2000],
       selectableMemoryMb: [2048, 4096],
+      gpuBudgetCount: 1,
+      selectableGpuCounts: [0, 1],
+      availableGpuCounts: [0, 1],
       maxCpuBudgetMillicores: 16000,
       maxMemoryBudgetMb: 32768,
+      maxGpuBudgetCount: 1,
+      kernelIdleTimeoutSeconds: 3600,
+      kernelIdleTimeoutBounds: {
+        minSeconds: 300,
+        maxSeconds: 604800,
+        stepSeconds: 60,
+      },
+    });
+  });
+
+  it("fails closed on an invalid kernel idle policy", () => {
+    expect(normalizeResourcePolicy({ resource_policy: {
+      version: 1,
+      cpu_budget_millicores: 8000,
+      memory_budget_mb: 8192,
+      selectable_cpu_millicores: [1000],
+      selectable_memory_mb: [1024],
+      kernel_idle_timeout_seconds: 299,
+      kernel_idle_timeout_bounds: {
+        min_seconds: 300,
+        max_seconds: 604800,
+        step_seconds: 60,
+      },
+    } })).toMatchObject({
+      kernelIdleTimeoutSeconds: null,
+      kernelIdleTimeoutBounds: {
+        minSeconds: 300,
+        maxSeconds: 604800,
+        stepSeconds: 60,
+      },
     });
   });
 
@@ -126,6 +329,36 @@ describe("portal API normalization", () => {
       selectableMemoryMb: [1024],
       availableCpuMillicores: [],
       availableMemoryMb: [],
+    });
+  });
+
+  it("defaults legacy policies to CPU-only and fails closed on oversized GPU values", () => {
+    expect(normalizeResourcePolicy({ resource_policy: {
+      version: 1,
+      cpu_budget_millicores: 8000,
+      memory_budget_mb: 8192,
+      selectable_cpu_millicores: [1000],
+      selectable_memory_mb: [1024],
+    } })).toMatchObject({
+      gpuBudgetCount: 0,
+      selectableGpuCounts: [0],
+      availableGpuCounts: [0],
+      maxGpuBudgetCount: 0,
+    });
+
+    expect(normalizeResourcePolicy({ resource_policy: {
+      version: 2,
+      cpu_budget_millicores: 8000,
+      memory_budget_mb: 8192,
+      gpu_budget_count: 7,
+      selectable_gpu_counts: [0, 1, 2],
+      available_gpu_counts: [0, 1, 2],
+      hard_ceiling: { gpu_count: 9 },
+    } })).toMatchObject({
+      gpuBudgetCount: 0,
+      selectableGpuCounts: [0, 1],
+      availableGpuCounts: [0, 1],
+      maxGpuBudgetCount: 0,
     });
   });
 
@@ -249,6 +482,11 @@ describe("portal API normalization", () => {
       memoryLimitMb: 1024,
       privateDiskLimitMb: null,
       privateDiskQuotaEnforced: false,
+      acceleratorKind: "none",
+      gpuCount: 0,
+      cudaVersion: null,
+      gpuFramework: null,
+      gpuFrameworkVersion: null,
     })]);
 
     expect(normalizeWorkspace({
@@ -291,6 +529,39 @@ describe("portal API normalization", () => {
       workspaceId: "workspace-1",
       status: "AUTH_REQUIRED",
     });
+  });
+
+  it("accepts an exact CUDA PyTorch profile and rejects partial accelerator metadata", () => {
+    const base = {
+      version: 1,
+      name: "Python CUDA",
+      kernel_name: "python312-cuda",
+      kernel_display_name: "Python 3.12 CUDA",
+      python_version: "3.12.13",
+      cpu_limit: "2.0",
+      memory_limit_mb: 4096,
+      private_disk_limit_mb: null,
+      private_disk_quota_enforced: false,
+      accelerator_kind: "nvidia",
+      gpu_count: 1,
+      cuda_version: "12.6",
+      gpu_framework: "pytorch",
+      gpu_framework_version: "2.7.1",
+    };
+    const profiles = normalizeProfiles({ items: [
+      { ...base, id: "python-cuda" },
+      { ...base, id: "missing-cuda", cuda_version: undefined },
+      { ...base, id: "bad-framework", gpu_framework: "tensorflow" },
+      { ...base, id: "shared-gpu", gpu_count: 2 },
+    ] });
+    expect(profiles).toEqual([expect.objectContaining({
+      id: "python-cuda",
+      acceleratorKind: "nvidia",
+      gpuCount: 1,
+      cudaVersion: "12.6",
+      gpuFramework: "pytorch",
+      gpuFrameworkVersion: "2.7.1",
+    })]);
   });
 
   it("drops malformed, disabled, and duplicate profile rows fail-closed", () => {
@@ -647,6 +918,55 @@ describe("portal API normalization", () => {
         value: "ai-labs",
         is_secret: false,
         expected_version: 3,
+      });
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
+  it("sends the kernel idle timeout in the versioned administrator policy", async () => {
+    const responsePolicy = {
+      version: 5,
+      cpu_budget_millicores: 8000,
+      memory_budget_mb: 8192,
+      selectable_cpu_millicores: [1000, 2000],
+      selectable_memory_mb: [1024, 2048],
+      available_cpu_millicores: [1000, 2000],
+      available_memory_mb: [1024, 2048],
+      kernel_idle_timeout_seconds: 7200,
+      kernel_idle_timeout_bounds: {
+        min_seconds: 300,
+        max_seconds: 604800,
+        step_seconds: 60,
+      },
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify({ resource_policy: responsePolicy }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    ));
+    try {
+      await expect(portalApi.updateAdminSettings({
+        version: 4,
+        cpuBudgetMillicores: 8000,
+        memoryBudgetMb: 8192,
+        selectableCpuMillicores: [1000, 2000],
+        selectableMemoryMb: [1024, 2048],
+        gpuBudgetCount: 1,
+        selectableGpuCounts: [0, 1],
+        kernelIdleTimeoutSeconds: 7200,
+      })).resolves.toMatchObject({ kernelIdleTimeoutSeconds: 7200 });
+      const [url, init] = fetchMock.mock.calls[0] ?? [];
+      expect(url).toBe("/api/v1/admin/settings");
+      expect(init?.method).toBe("PATCH");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        version: 4,
+        cpu_budget_millicores: 8000,
+        memory_budget_mb: 8192,
+        selectable_cpu_millicores: [1000, 2000],
+        selectable_memory_mb: [1024, 2048],
+        gpu_budget_count: 1,
+        selectable_gpu_counts: [0, 1],
+        kernel_idle_timeout_seconds: 7200,
       });
     } finally {
       fetchMock.mockRestore();

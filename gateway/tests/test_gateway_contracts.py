@@ -138,13 +138,16 @@ class DomainTestComposeContractTests(unittest.TestCase):
         environment = os.environ.copy()
         environment.update(
             {
-                "PLATFORM_GATEWAY_BIND_IP": "10.155.1.24",
+                "PLATFORM_GATEWAY_BIND_IP": "192.0.2.24",
                 "PLATFORM_TLS_CERT_FILE": "/tmp/fullchain.pem",
                 "PLATFORM_TLS_KEY_FILE": "/tmp/privkey.pem",
                 "PLATFORM_INGRESS_CIDRS_FILE": "/tmp/ingress-cidrs.txt",
                 "PLATFORM_TLS_GID": "1000",
                 "DOCKER_GID": "999",
                 "PLATFORM_SECRET_GID": "1000",
+                "PLATFORM_NVIDIA_GPU_DEVICE_ID": (
+                    "GPU-01234567-89ab-cdef-0123-456789abcdef"
+                ),
             }
         )
         result = subprocess.run(
@@ -172,7 +175,7 @@ class DomainTestComposeContractTests(unittest.TestCase):
             [
                 {
                     "mode": "ingress",
-                    "host_ip": "10.155.1.24",
+                    "host_ip": "192.0.2.24",
                     "target": 3030,
                     "published": "3030",
                     "protocol": "tcp",
@@ -190,13 +193,24 @@ class DomainTestComposeContractTests(unittest.TestCase):
         self.assertEqual(api["PLATFORM_INSECURE_LOCAL_DEV"], "false")
         self.assertEqual(api["PLATFORM_DOMAIN_TEST"], "false")
         self.assertEqual(api["PLATFORM_ALLOW_SAME_SITE_USER_CONTENT"], "true")
-        self.assertEqual(api["FORWARDED_ALLOW_IPS"], "172.38.0.10")
+        self.assertEqual(api["FORWARDED_ALLOW_IPS"], "172.29.3.10")
+        for service in ("migrate", "bootstrap-profile", "api", "worker"):
+            self.assertEqual(
+                config["services"][service]["environment"][
+                    "PLATFORM_NVIDIA_GPU_DEVICE_IDS"
+                ],
+                "GPU-01234567-89ab-cdef-0123-456789abcdef",
+            )
         hub = config["services"]["jupyterhub"]["environment"]
         self.assertEqual(hub["PLATFORM_ENV"], "production")
         self.assertEqual(hub["JUPYTERHUB_SUBDOMAIN_HOST"], "https://cyberailabs.team")
         self.assertEqual(
             hub["PLATFORM_PRODUCTION_DOCKER_VOLUME_PROVISIONING_ENABLED"],
             "true",
+        )
+        self.assertEqual(
+            hub["JUPYTERHUB_NVIDIA_GPU_DEVICE_ID"],
+            "GPU-01234567-89ab-cdef-0123-456789abcdef",
         )
         published_services = {
             name for name, service in config["services"].items() if service.get("ports")
@@ -440,13 +454,52 @@ class ProductionTransitionContractTests(unittest.TestCase):
 
 
 class NginxContractTests(unittest.TestCase):
+    def test_hub_account_navigation_is_exact_in_every_runtime_mode(self) -> None:
+        for name, portal_root in (
+            ("dev.conf", "http://platform.localhost:8080/"),
+            ("domain-test.conf", "https://platform.workspace.test/"),
+            ("production.conf", "https://__PORTAL_HOST__/"),
+        ):
+            with self.subTest(name=name):
+                config = (GATEWAY / name).read_text(encoding="utf-8")
+                password_change = re.search(
+                    r"location = /hub/change-password\s*\{(?P<body>.*?)"
+                    r"(?=\n\s*location )",
+                    config,
+                    re.DOTALL,
+                )
+                self.assertIsNotNone(password_change)
+                body = password_change.group("body") if password_change else ""
+                self.assertRegex(
+                    body,
+                    r"limit_except GET POST\s*\{\s*deny all;\s*\}",
+                )
+                self.assertIn("proxy_pass http://jupyterhub:8000;", body)
+                self.assertRegex(
+                    config,
+                    r"location \^~ /hub/change-password/\s*\{\s*return 404;\s*\}",
+                )
+                self.assertRegex(
+                    config,
+                    r"location = /hub/spawn\s*\{\s*return 303 "
+                    + re.escape(portal_root)
+                    + r"\s*;?\s*\}",
+                )
+                self.assertRegex(
+                    config,
+                    r"location ~ \^/hub/\(spawn\|token\|admin\)\(/\|\$\)",
+                )
+
     def test_domain_test_and_production_fail_closed(self) -> None:
         domain = (GATEWAY / "domain-test.conf").read_text(encoding="utf-8")
         production = (GATEWAY / "production.conf").read_text(encoding="utf-8")
         proxy = (GATEWAY / "proxy-https.conf").read_text(encoding="utf-8")
         entrypoint = (GATEWAY / "entrypoint-production.sh").read_text(encoding="utf-8")
 
-        for config in (domain, production):
+        for config, portal_root in (
+            (domain, "https://platform.workspace.test/"),
+            (production, "https://__PORTAL_HOST__/"),
+        ):
             self.assertIn("listen 3030 ssl default_server", config)
             self.assertIn("ssl_reject_handshake on", config)
             self.assertIn("client_max_body_size 2g", config)
@@ -479,6 +532,34 @@ class NginxContractTests(unittest.TestCase):
                 r"(?s:.*?)access_log /var/log/nginx/access\.log safe_path;"
                 r"(?s:.*?)error_log /var/log/nginx/error\.log crit;",
             )
+            password_change = re.search(
+                r"location = /hub/change-password\s*\{(?P<body>.*?)"
+                r"(?=\n\s*location )",
+                config,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(password_change)
+            password_change_body = (
+                password_change.group("body") if password_change else ""
+            )
+            self.assertIn("proxy_pass http://jupyterhub:8000;", password_change_body)
+            self.assertIn("limit_req zone=hub_login", password_change_body)
+            self.assertRegex(
+                password_change_body,
+                r"limit_except GET POST\s*\{\s*deny all;\s*\}",
+            )
+            self.assertRegex(
+                config,
+                r"location \^~ /hub/change-password/\s*\{\s*return 404;\s*\}",
+            )
+            spawn_fallback = re.search(
+                r"location = /hub/spawn\s*\{(?P<body>.*?)\n\s*\}",
+                config,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(spawn_fallback)
+            self.assertIn(f"return 303 {portal_root};", spawn_fallback.group("body"))
+            self.assertRegex(config, r"location ~ \^/hub/\(spawn\|token\|admin\)")
         self.assertNotIn("company-vpn-allowlist", domain)
         self.assertIn("include /tmp/company-vpn-allowlist.conf", production)
         self.assertIn("if ($platform_ingress_allowed = 0) { return 444; }", production)
@@ -760,7 +841,7 @@ class DomainTestDatabaseSnapshotTests(unittest.TestCase):
             parent.mkdir(mode=0o700)
             bundle = self.module.prepare_bundle(parent, "domain-test-safe")
             for filename, revision in (
-                ("platform.sqlite", "0004"),
+                ("platform.sqlite", "0005"),
                 ("jupyterhub.sqlite", "4621fec11365"),
             ):
                 self._database(bundle / filename, revision)
@@ -769,7 +850,7 @@ class DomainTestDatabaseSnapshotTests(unittest.TestCase):
             self.assertEqual(bundle.stat().st_mode & 0o777, 0o700)
             self.assertEqual((bundle / "manifest.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual(
-                manifest["files"]["platform.sqlite"]["schema_revision"], "0004"
+                manifest["files"]["platform.sqlite"]["schema_revision"], "0005"
             )
             self.module.verify_bundle(bundle)
 
@@ -811,7 +892,7 @@ class DomainTestDatabaseSnapshotTests(unittest.TestCase):
             root = Path(directory)
             source = root / "live.sqlite"
             output = root / "snapshot.sqlite"
-            self._database(source, "0004")
+            self._database(source, "0005")
             real_connect = self.module._connect_snapshot_source
             attempts = 0
 
@@ -839,7 +920,7 @@ class DomainTestDatabaseSnapshotTests(unittest.TestCase):
                     snapshot.execute(
                         "SELECT version_num FROM alembic_version"
                     ).fetchone(),
-                    ("0004",),
+                    ("0005",),
                 )
 
     def test_group_access_and_symlink_bundle_are_rejected(self) -> None:

@@ -1,0 +1,191 @@
+{
+  "schema_version": 3,
+  "shared_volume": {
+    "name": "jupyter-shared",
+    "mount_path": "/home/jovyan/shared",
+    "gid": 100
+  },
+  "profiles": [
+    {
+      "id": "python312-cpu1-mem1024",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cpu_limit": 1,
+      "memory_limit_bytes": 1073741824,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312",
+      "accelerator": {
+        "kind": "none",
+        "count": 0,
+        "sharing": "none",
+        "cuda_version": null,
+        "framework": null,
+        "framework_version": null
+      }
+    },
+    {
+      "id": "python313-cpu2-mem2048",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 2147483648,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3",
+      "accelerator": {
+        "kind": "none",
+        "count": 0,
+        "sharing": "none",
+        "cuda_version": null,
+        "framework": null,
+        "framework_version": null
+      }
+    },
+    {
+      "id": "python313-cpu4-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cpu_limit": 4,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 134217728,
+      "shm_size_bytes": 134217728,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.13.14",
+      "kernels": [
+        {
+          "name": "python3",
+          "display_name": "Python 3 (ipykernel)",
+          "language": "python",
+          "python_version": "3.13.14",
+          "executable": "/opt/conda/bin/python"
+        },
+        {
+          "name": "python312",
+          "display_name": "Python 3.12 (platform)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python3",
+      "accelerator": {
+        "kind": "none",
+        "count": 0,
+        "sharing": "none",
+        "cuda_version": null,
+        "framework": null,
+        "framework_version": null
+      }
+    },
+    {
+      "id": "python312-cuda-cpu2-mem4096",
+      "version": 1,
+      "enabled": true,
+      "selectable": true,
+      "config_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "cpu_limit": 2,
+      "memory_limit_bytes": 4294967296,
+      "pids_limit": 256,
+      "private_disk_hard_limit_bytes": 1073741824,
+      "private_disk_quota_enforced": false,
+      "writable_layer_size_bytes": 536870912,
+      "tmpfs_size_bytes": 268435456,
+      "shm_size_bytes": 268435456,
+      "log_max_size_bytes": 5242880,
+      "log_max_files": 2,
+      "private_mount_path": "/home/jovyan/work",
+      "uid": 1000,
+      "gid": 100,
+      "python_version": "3.12.13",
+      "kernels": [
+        {
+          "name": "python312-cuda",
+          "display_name": "Python 3.12 (PyTorch CUDA 12.6)",
+          "language": "python",
+          "python_version": "3.12.13",
+          "executable": "/opt/conda/envs/python312/bin/python"
+        }
+      ],
+      "default_kernel": "python312-cuda",
+      "accelerator": {
+        "kind": "nvidia",
+        "count": 1,
+        "sharing": "exclusive",
+        "cuda_version": "12.6",
+        "framework": "pytorch",
+        "framework_version": "2.7.1"
+      }
+    }
+  ]
+}

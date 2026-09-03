@@ -10,6 +10,7 @@ from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..config import Settings
+from ..accelerators import stored_profile_accelerator
 from ..db import begin_immediate
 from ..domain import (
     DesiredState,
@@ -51,6 +52,7 @@ class ActiveReservations:
     count: int
     cpu_millicores: int
     memory_mb: int
+    gpu_count: int
 
 
 def _audit(
@@ -226,6 +228,7 @@ class WorkspaceService:
         *,
         cpu_budget_millicores: int,
         memory_budget_mb: int,
+        gpu_budget_count: int,
     ) -> None:
         if reservations.count >= self.settings.max_active_workspaces:
             raise AppError(
@@ -245,15 +248,72 @@ class WorkspaceService:
                 "PROFILE_RESOURCE_INVALID",
                 "Pinned workspace profile resource values are invalid",
             )
+        try:
+            requested_gpu = stored_profile_accelerator(profile).count
+        except ValueError as exc:
+            raise AppError(
+                500,
+                "PROFILE_RESOURCE_INVALID",
+                "Pinned workspace profile accelerator values are invalid",
+            ) from exc
         if (
             reservations.cpu_millicores + requested_cpu > cpu_budget_millicores
             or reservations.memory_mb + profile.memory_limit_mb > memory_budget_mb
+            or reservations.gpu_count + requested_gpu > gpu_budget_count
         ):
             raise AppError(
                 429,
                 "RESOURCE_CAPACITY_LIMIT",
-                "Aggregate workspace CPU or memory capacity would be exceeded",
+                "Aggregate workspace CPU, memory or GPU capacity would be exceeded",
             )
+
+    def _assign_gpu_if_required(
+        self, db: Session, workspace: Workspace, profile: WorkspaceProfile
+    ) -> None:
+        try:
+            gpu_count = stored_profile_accelerator(profile).count
+        except ValueError as exc:
+            raise AppError(
+                500,
+                "PROFILE_RESOURCE_INVALID",
+                "Pinned workspace profile accelerator values are invalid",
+            ) from exc
+        if gpu_count == 0:
+            if workspace.assigned_gpu_device_id is not None:
+                raise AppError(
+                    500,
+                    "GPU_ALLOCATION_INVARIANT_FAILED",
+                    "A CPU workspace unexpectedly retains a GPU allocation",
+                )
+            return
+        if len(self.settings.nvidia_gpu_device_ids) != 1:
+            raise AppError(
+                503,
+                "GPU_HOST_UNAVAILABLE",
+                "No verified NVIDIA GPU is configured for this deployment",
+            )
+        device_id = self.settings.nvidia_gpu_device_ids[0]
+        if workspace.assigned_gpu_device_id == device_id:
+            return
+        if workspace.assigned_gpu_device_id is not None:
+            raise AppError(
+                500,
+                "GPU_ALLOCATION_INVARIANT_FAILED",
+                "Workspace GPU allocation does not match the host inventory",
+            )
+        owner = db.scalar(
+            select(Workspace.id).where(
+                Workspace.assigned_gpu_device_id == device_id,
+                Workspace.id != workspace.id,
+            )
+        )
+        if owner is not None:
+            raise AppError(
+                429,
+                "GPU_CAPACITY_LIMIT",
+                "The configured NVIDIA GPU is already allocated",
+            )
+        workspace.assigned_gpu_device_id = device_id
 
     def create(
         self,
@@ -455,6 +515,10 @@ class WorkspaceService:
             in {ObservedState.STOPPED.value, ObservedState.NOT_FOUND.value}
             and observation_fresh
         )
+        if target == DesiredState.STOPPED and no_op:
+            # A fresh non-running Hub observation is the only safe point at
+            # which the exclusive physical device can be returned.
+            workspace.assigned_gpu_device_id = None
         if target == DesiredState.RUNNING and not no_op:
             profile = db.get(
                 WorkspaceProfile, (workspace.profile_id, workspace.profile_version)
@@ -472,7 +536,9 @@ class WorkspaceService:
                     profile,
                     cpu_budget_millicores=policy.cpu_budget_millicores,
                     memory_budget_mb=policy.memory_budget_mb,
+                    gpu_budget_count=policy.gpu_budget_count,
                 )
+                self._assign_gpu_if_required(db, workspace, profile)
             except AppError:
                 db.rollback()
                 raise
@@ -824,11 +890,34 @@ def _active_reservation_conditions(
 def active_reservations(
     db: Session, *, exclude_workspace_id: str | None = None
 ) -> ActiveReservations:
+    active_conditions = _active_reservation_conditions(
+        exclude_workspace_id=exclude_workspace_id
+    )
+    # GPU admission has a stronger lifetime than CPU/memory admission.  A
+    # terminal start failure can leave Hub's state ambiguous while the desired
+    # state is still RUNNING, so the exact physical-device assignment remains
+    # the durable lease until a confirmed stop/not-found transition releases
+    # it.  Count that lease directly instead of inferring GPU usage from the
+    # lifecycle operation/state predicate below.
+    active_runtime = and_(*active_conditions)
+    row_conditions: list[object] = [
+        or_(
+            Workspace.archived_at.is_(None),
+            Workspace.assigned_gpu_device_id.is_not(None),
+        )
+    ]
+    if exclude_workspace_id is not None:
+        # active_conditions already excludes this workspace, but this broader
+        # query also includes inactive rows which retain a GPU lease.
+        row_conditions.append(Workspace.id != exclude_workspace_id)
     rows = db.execute(
         select(
             Workspace.id,
             WorkspaceProfile.cpu_limit,
             WorkspaceProfile.memory_limit_mb,
+            WorkspaceProfile.gpu_count,
+            Workspace.assigned_gpu_device_id,
+            active_runtime.label("active_runtime"),
         )
         .select_from(Workspace)
         .outerjoin(
@@ -838,19 +927,49 @@ def active_reservations(
                 Workspace.profile_version == WorkspaceProfile.version,
             ),
         )
-        .where(
-            *_active_reservation_conditions(exclude_workspace_id=exclude_workspace_id)
-        )
+        .where(*row_conditions)
     ).all()
+    active_count = 0
     cpu_millicores = 0
     memory_mb = 0
-    for _workspace_id, cpu_limit, profile_memory_mb in rows:
-        if cpu_limit is None or profile_memory_mb is None or profile_memory_mb <= 0:
+    gpu_count = 0
+    for (
+        _workspace_id,
+        cpu_limit,
+        profile_memory_mb,
+        profile_gpu_count,
+        assigned_gpu_device_id,
+        is_active_runtime,
+    ) in rows:
+        if assigned_gpu_device_id is not None:
+            if profile_gpu_count != 1:
+                raise AppError(
+                    500,
+                    "GPU_ALLOCATION_INVARIANT_FAILED",
+                    "A physical GPU is assigned to a non-GPU workspace",
+                )
+            gpu_count += 1
+        elif is_active_runtime and profile_gpu_count == 1:
+            raise AppError(
+                500,
+                "GPU_ALLOCATION_INVARIANT_FAILED",
+                "An active GPU workspace has no physical GPU assignment",
+            )
+
+        if not is_active_runtime:
+            continue
+        if (
+            cpu_limit is None
+            or profile_memory_mb is None
+            or profile_memory_mb <= 0
+            or profile_gpu_count not in {0, 1}
+        ):
             raise AppError(
                 500,
                 "PROFILE_RESOURCE_INVALID",
                 "An active reservation has invalid pinned profile resources",
             )
+        active_count += 1
         try:
             cpu_millicores += cpu_limit_to_millicores(cpu_limit)
         except ValueError as exc:
@@ -861,9 +980,10 @@ def active_reservations(
             ) from exc
         memory_mb += profile_memory_mb
     return ActiveReservations(
-        count=len(rows),
+        count=active_count,
         cpu_millicores=cpu_millicores,
         memory_mb=memory_mb,
+        gpu_count=gpu_count,
     )
 
 

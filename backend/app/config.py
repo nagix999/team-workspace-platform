@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .accelerators import configured_gpu_device_ids
+
 
 _DEV_KEY = base64.urlsafe_b64encode(bytes(range(32))).decode()
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
@@ -169,6 +171,7 @@ class Settings:
     admin_usernames: tuple[str, ...] = ()
     enforce_safe_sqlite: bool = False
     execution_host_healthy: bool = True
+    nvidia_gpu_device_ids: tuple[str, ...] = ()
     insecure_local_dev: bool = False
     domain_test: bool = False
     forwarded_allow_ips: tuple[str, ...] = ("127.0.0.1",)
@@ -179,6 +182,7 @@ class Settings:
     deletion_lease_seconds: int = 5 * 60
     deletion_max_attempts: int = 3
     workspace_deletion_enabled: bool = False
+    internal_egress_policy_dir: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -280,6 +284,9 @@ class Settings:
             ),
             enforce_safe_sqlite=_bool_env("PLATFORM_ENFORCE_SAFE_SQLITE", False),
             execution_host_healthy=_bool_env("PLATFORM_EXECUTION_HOST_HEALTHY", True),
+            nvidia_gpu_device_ids=configured_gpu_device_ids(
+                os.getenv("PLATFORM_NVIDIA_GPU_DEVICE_IDS", "")
+            ),
             insecure_local_dev=insecure_local_dev,
             domain_test=domain_test,
             forwarded_allow_ips=_comma_values("FORWARDED_ALLOW_IPS", "127.0.0.1"),
@@ -299,6 +306,9 @@ class Settings:
             deletion_max_attempts=_int_env("PLATFORM_DELETION_MAX_ATTEMPTS", 3),
             workspace_deletion_enabled=_bool_env(
                 "PLATFORM_WORKSPACE_DELETION_ENABLED", False
+            ),
+            internal_egress_policy_dir=(
+                os.getenv("PLATFORM_INTERNAL_EGRESS_POLICY_DIR", "").strip() or None
             ),
         )
 
@@ -395,6 +405,13 @@ class Settings:
             raise RuntimeError(
                 "PLATFORM_WORKSPACE_MEMORY_BUDGET_MB must be greater than 0"
             )
+        if len(self.nvidia_gpu_device_ids) > 1 or any(
+            configured_gpu_device_ids(device_id) != (device_id,)
+            for device_id in self.nvidia_gpu_device_ids
+        ):
+            raise RuntimeError(
+                "only one canonical physical NVIDIA GPU UUID is supported"
+            )
         if self.session_idle_seconds > self.session_absolute_seconds:
             raise RuntimeError("session idle expiry cannot exceed absolute expiry")
         if self.worker_max_attempts < 2:
@@ -438,6 +455,17 @@ class Settings:
             )
         if self.deletion_lease_seconds <= 0 or self.deletion_max_attempts <= 0:
             raise RuntimeError("workspace deletion lease and attempts must be positive")
+        if self.internal_egress_policy_dir is not None:
+            runtime_dir = self.internal_egress_policy_dir
+            if (
+                not os.path.isabs(runtime_dir)
+                or os.path.normpath(runtime_dir) != runtime_dir
+                or runtime_dir == "/"
+                or "\x00" in runtime_dir
+            ):
+                raise RuntimeError(
+                    "PLATFORM_INTERNAL_EGRESS_POLICY_DIR must be a canonical absolute directory"
+                )
         if len(self.internal_hmac_key.encode("utf-8")) < 32:
             raise RuntimeError("PLATFORM_INTERNAL_HMAC_KEY must be at least 32 bytes")
         if not 0 < self.hub_progress_sample_seconds <= 5:

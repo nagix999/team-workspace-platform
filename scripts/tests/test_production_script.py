@@ -19,6 +19,10 @@ class ProductionHostContractTests(unittest.TestCase):
         self.project = Path(self.temporary_directory.name)
         (self.project / "scripts").mkdir()
         shutil.copy2(PRODUCTION_SCRIPT, self.project / "scripts" / "production.sh")
+        shutil.copy2(
+            ROOT / "scripts" / "check_production_subnet_conflicts.py",
+            self.project / "scripts" / "check_production_subnet_conflicts.py",
+        )
         self.fake_bin = self.project / "fake-bin"
         self.fake_bin.mkdir()
         self.docker_log = self.project / "docker.log"
@@ -52,6 +56,9 @@ case "${1:-}" in
         ;;
     esac
     ;;
+  network)
+    test "${2:-} ${3:-} ${4:-}" = "ls --quiet --no-trunc" || exit 95
+    ;;
   *) exit 97 ;;
 esac
 """,
@@ -61,7 +68,11 @@ esac
             """#!/bin/sh
 set -eu
 printf '%s\n' "$*" >>"${FAKE_IP_LOG:?}"
-printf '%s\n' "${FAKE_IP_OUTPUT:-}"
+if [ "${1:-}" = -j ]; then
+  printf '%s\n' '[]'
+else
+  printf '%s\n' "${FAKE_IP_OUTPUT:-}"
+fi
 """,
         )
         self.environment = os.environ.copy()
@@ -82,7 +93,7 @@ printf '%s\n' "${FAKE_IP_OUTPUT:-}"
             "\n".join(
                 (
                     "PRODUCTION_COMPOSE_PROJECT_NAME=test-production",
-                    "PLATFORM_GATEWAY_BIND_IP=10.155.1.24",
+                    "PLATFORM_GATEWAY_BIND_IP=192.0.2.24",
                     f"PLATFORM_TLS_CERT_FILE={self.cert_file}",
                     f"PLATFORM_TLS_KEY_FILE={self.key_file}",
                     f"PLATFORM_INGRESS_CIDRS_FILE={self.ingress_file}",
@@ -133,6 +144,21 @@ printf '%s\n' "${FAKE_IP_OUTPUT:-}"
             stderr=subprocess.DEVNULL,
         )
         self.key_file.chmod(0o600)
+
+    def test_gpu_opt_in_requires_an_absolute_regular_policy_before_docker(self) -> None:
+        env_file = self.project / ".env.production"
+        env_file.write_text(
+            env_file.read_text(encoding="utf-8")
+            + "PLATFORM_GPU_RUNTIME_CONFIG_FILE=/missing/gpu-runtime.json\n",
+            encoding="utf-8",
+        )
+
+        result = self._run_preflight()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GPU runtime policy must be one readable absolute", result.stderr)
+        self.assertFalse(self.docker_log.exists())
+        self.assertFalse(self.ip_log.exists())
 
     def test_engine_26_is_rejected_before_any_other_host_or_docker_check(self) -> None:
         self.environment["FAKE_DOCKER_VERSION"] = "26.1.4"
@@ -206,7 +232,7 @@ printf '%s\n' "${FAKE_IP_OUTPUT:-}"
                 result = self._run_preflight()
 
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("this host does not own 10.155.1.24", result.stderr)
+                self.assertIn("this host does not own 192.0.2.24", result.stderr)
                 self.assertNotIn("or newer is required", result.stderr)
                 self.assertTrue(self.ip_log.exists())
 
@@ -260,13 +286,40 @@ printf '%s\n' "${FAKE_IP_OUTPUT:-}"
         self.assertIn("Docker Compose returned an unrecognized version", result.stderr)
         self.assertFalse(self.ip_log.exists())
 
+    def test_gateway_bind_ip_rejects_noncanonical_and_unsafe_addresses(self) -> None:
+        env_file = self.project / ".env.production"
+        original = env_file.read_text(encoding="utf-8")
+        for address in (
+            "REPLACE_WITH_INTERNAL_SERVER_IP",
+            "0.0.0.0",
+            "127.0.0.1",
+            "224.0.0.1",
+            "192.000.002.024",
+            "999.1.1.1",
+            "2001:db8::1",
+        ):
+            with self.subTest(address=address):
+                env_file.write_text(
+                    original.replace("192.0.2.24", address), encoding="utf-8"
+                )
+                self.ip_log.unlink(missing_ok=True)
+
+                result = self._run_preflight()
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "PLATFORM_GATEWAY_BIND_IP must be a canonical IPv4 address",
+                    result.stderr,
+                )
+                self.assertFalse(self.ip_log.exists())
+
     @unittest.skipUnless(shutil.which("openssl"), "OpenSSL is unavailable")
     def test_apex_and_wildcard_certificate_covers_portal_without_explicit_san(
         self,
     ) -> None:
         self._generate_certificate(("cyberailabs.team", "*.cyberailabs.team"))
         self.environment["FAKE_IP_OUTPUT"] = (
-            "2: eth0    inet 10.155.1.24/24 brd 10.155.1.255 scope global eth0"
+            "2: eth0    inet 192.0.2.24/24 brd 192.0.2.255 scope global eth0"
         )
         self.environment["FAKE_ACTIVE_SINGLEUSER"] = "active-workspace"
 
@@ -282,7 +335,7 @@ printf '%s\n' "${FAKE_IP_OUTPUT:-}"
     def test_explicit_portal_san_does_not_replace_required_wildcard(self) -> None:
         self._generate_certificate(("cyberailabs.team", "platform.cyberailabs.team"))
         self.environment["FAKE_IP_OUTPUT"] = (
-            "2: eth0    inet 10.155.1.24/24 brd 10.155.1.255 scope global eth0"
+            "2: eth0    inet 192.0.2.24/24 brd 192.0.2.255 scope global eth0"
         )
 
         result = self._run_preflight()
@@ -881,6 +934,59 @@ printf '%s\n' "$*" >>"${FAKE_SLEEP_LOG:?}"
             [f"stop {self.container_id}"],
         )
         self.assertEqual(self.state_file.read_text(encoding="utf-8").strip(), "exited")
+
+
+class ProductionGpuOrchestrationContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.script = PRODUCTION_SCRIPT.read_text(encoding="utf-8")
+
+    def test_gpu_is_explicit_opt_in_and_one_validated_uuid_is_exported(self) -> None:
+        load_environment = self.script.split("load_environment() {", 1)[1].split(
+            "\n}\n\ncompose()", 1
+        )[0]
+
+        self.assertIn(
+            '"${PLATFORM_GPU_RUNTIME_CONFIG_FILE:-disabled}"', load_environment
+        )
+        self.assertIn("--print-device-id", load_environment)
+        self.assertIn("require_regular_file", load_environment)
+        self.assertIn("export PLATFORM_NVIDIA_GPU_DEVICE_ID", load_environment)
+        self.assertNotIn("NVIDIA_VISIBLE_DEVICES", load_environment)
+
+    def test_cuda_runtime_probe_precedes_policy_generation_and_db_mutation(
+        self,
+    ) -> None:
+        prepare = self.script.split("prepare_images_and_policy() {", 1)[1].split(
+            "\n}\n\ndatabase_volume_names()", 1
+        )[0]
+        start_offset = self.script.index("\nstart() {")
+        start = self.script[
+            start_offset : self.script.index("\nstop() {", start_offset)
+        ]
+
+        cpu_build = prepare.index("compose build singleuser-image")
+        cuda_build = prepare.index("docker build \\")
+        cuda_probe = prepare.index("infra/host/check_gpu_runtime.py", cuda_build)
+        generate = prepare.index("generate_production_profile_policy.py", cuda_probe)
+        image_check = prepare.index("profile_image_check.py", generate)
+        self.assertLess(cpu_build, cuda_build)
+        self.assertLess(cuda_build, cuda_probe)
+        self.assertLess(cuda_probe, generate)
+        self.assertLess(generate, image_check)
+        self.assertIn('cpu_image_hex="${image_id#sha256:}"', prepare)
+        self.assertIn('[[ "${gpu_image_id}" =~ ^sha256:', prepare)
+        self.assertIn("io.team-workspace.cpu-base.image-id", prepare)
+        self.assertIn('--gpu-image-id "${gpu_image_id}"', prepare)
+
+        preflight_offset = self.script.index("preflight_impl() {")
+        self.assertLess(
+            self.script.index("prepare_images_and_policy", preflight_offset),
+            self.script.index("production_database_is_idle", preflight_offset),
+        )
+        self.assertLess(
+            start.index("preflight_impl"), start.index("migration_started=true")
+        )
 
 
 if __name__ == "__main__":

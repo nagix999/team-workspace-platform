@@ -33,7 +33,7 @@ UNCONSUMED_AUTH_ID = "66666666-6666-6666-6666-666666666666"
 PROFILE_DIGEST = "sha256:" + "a" * 64
 
 
-def _database(tmp_path: Path, *, revision: str = "0004") -> Path:
+def _database(tmp_path: Path, *, revision: str = "0007") -> Path:
     path = tmp_path / "platform.db"
     engine = create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(engine)
@@ -162,6 +162,7 @@ def _database(tmp_path: Path, *, revision: str = "0004") -> Path:
                     profile_config_digest=PROFILE_DIGEST,
                     user_environment_generation=1,
                     workspace_environment_generation=3,
+                    kernel_idle_timeout_seconds=7_200,
                     expires_at=now + timedelta(minutes=5),
                     consumed_at=consumed_at,
                 )
@@ -207,7 +208,7 @@ def test_dry_run_lists_targets_without_mutating_database(tmp_path):
     assert result == {
         "action": "quiesce-stopped-intent",
         "applied": False,
-        "schema_revision": "0004",
+        "schema_revision": "0007",
         "target_count": 1,
         "workspace_ids": [WORKSPACE_ID],
     }
@@ -257,14 +258,15 @@ def test_apply_updates_only_intent_versions_unconsumed_auth_and_audit(tmp_path):
         assert tuple(operation[:3]) == ("START", "SUCCEEDED", 1)
         authorizations = connection.execute(
             text(
-                "SELECT id, consumed_at, revoked_at FROM spawn_authorizations "
-                "ORDER BY id"
+                "SELECT id, consumed_at, revoked_at, "
+                "kernel_idle_timeout_seconds FROM spawn_authorizations ORDER BY id"
             )
         ).all()
         consumed = next(row for row in authorizations if row.id == CONSUMED_AUTH_ID)
         unconsumed = next(row for row in authorizations if row.id == UNCONSUMED_AUTH_ID)
         assert consumed.consumed_at is not None and consumed.revoked_at is None
         assert unconsumed.consumed_at is None and unconsumed.revoked_at is not None
+        assert all(row.kernel_idle_timeout_seconds == 7_200 for row in authorizations)
         audit = connection.execute(
             text(
                 "SELECT actor_user_id, action, result, request_id, safe_metadata_json "
@@ -381,7 +383,7 @@ def test_busy_or_unsupported_state_fails_closed(
 
 
 def test_exact_database_revision_is_required(tmp_path):
-    path = _database(tmp_path, revision="0003")
+    path = _database(tmp_path, revision="0004")
 
     with pytest.raises(OfflineMaintenanceError) as caught:
         quiesce_stopped_intent(path)
