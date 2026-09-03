@@ -12,6 +12,9 @@ secret과 명시적인 network/storage policy mode를 확정해야 Hub가 시작
 
 ## 이미지와 버전
 
+- production Docker Engine: 기능 호환 하한 27.1.2; 27.5.1 이상 또는 현재 지원되는 최신 보안
+  patch를 강력 권장. Engine 28+는 base isolated-gateway 계약, Engine 27은 Compose
+  2.24.4+ compatibility overlay의 `inhibit_ipv4` 계약을 사용
 - Hub: `jupyterhub==5.5.0`
 - NativeAuthenticator: `1.3.0`
 - DockerSpawner: `14.0.0`
@@ -149,11 +152,13 @@ service에만 mount하고 image/Git에 넣지 않는다.
 
 `compose-internal-trusted-v1`에서는 spawn ticket을 소비하기 전과 container create 직전에
 Hub가 Docker API로 network를 inspect한다. 이름/bridge/local scope, `internal=true`, IPv6
-off, ICC on, IPv4/IPv6 isolated gateway option, policy label, subnet/ip-range와 reserved proxy
-endpoint가 하나라도 다르면 fail-closed로 spawn을 거부한다. 이 검사는 플랫폼이 host
-iptables/nftables를 읽거나 수정하지 않는다. Docker daemon 자체가 bridge 구현을 위해
-host netfilter 규칙을 관리하는 것은 Docker의 정상 동작이며 플랫폼 전용
-`DOCKER-USER` rule 설치와는 구분한다.
+off, policy label, subnet/ip-range와 reserved proxy endpoint를 fail-closed로 검증한다.
+Option은 Engine 28+ base의 `enable_icc=true` + IPv4/IPv6 isolated-gateway exact set이거나
+Engine 27 overlay의 `enable_icc=true` + `inhibit_ipv4=true` exact set이어야 한다. 현재
+Engine major version과 다른 option 조합은 거부한다. 이 검사는 플랫폼이 host
+iptables/nftables를 읽거나 수정하지 않는다. Docker daemon 자체가 bridge 구현을 위해 host
+netfilter 규칙을 관리하는 것은 필수 정상 동작이며 플랫폼 전용 `DOCKER-USER` rule 설치와는
+구분한다. Docker daemon의 firewall rule 관리를 비활성화해서는 안 된다.
 
 Single-user의 Hub connect URL은 reserved literal IPv4를 사용하고 Docker host config의
 DNS는 container loopback(`127.0.0.1`)으로 고정한다. 따라서 사용자 코드가 Docker embedded
@@ -203,8 +208,9 @@ root를 정책 UID/GID와 `0700`으로 초기화·검증한다. backend가 manif
 후에만 archive/slot 재사용을 허용한다.
 
 production에서는 profile image가 digest-pinned이고 host에 이미 존재해야 하며 agent가 pull하지
-않는다. local/domain-test에서만 allowlist image의 제한 pull을 허용한다. 이 저장소에는 아직
-production Compose가 없으므로 이는 config/code/unit-test 계약이지 운영 준비 완료 선언이 아니다.
+않는다. local/domain-test에서만 allowlist image의 제한 pull을 허용한다. Production
+Compose와 persistent checkpoint mount가 구현돼 있지만, 실제 운영 host의
+mount/backup/crash-recovery 시험과 승인은 별도 출시 gate다.
 
 Docker socket은 `cap_drop`, non-root, read-only rootfs로 축소할 수 없는 host-root 상당의
 권한이다. 이 구현은 이미 socket을 보유한 Hub trust boundary 안에 provisioning/deletion
@@ -315,11 +321,24 @@ constant-time signature 비교, 짧은 clock skew, nonce replay 금지를 모두
 
 ## Compose network와 legacy host 도구
 
-기본 `compose-internal-trusted-v1` network는 `docker compose up`이 생성한다. 별도 root
+기본 `compose-internal-trusted-v1` network는 Compose가 생성한다. Production에서는
+`make production-*`/`scripts/production.sh`가 Engine별 Compose 파일을 자동 선택한다. 별도 root
 bootstrap, sudo 또는 host firewall health manifest가 필요하지 않으며 JupyterHub가 매
 spawn마다 Docker inspect 결과를 검증한다. 로컬의 새 execution/egress subnet은 이전
 host-firewall profile의 subnet과 겹치지 않아 기존 external network와 stale
 `DOCKER-USER` rule을 운영자가 그대로 두어도 새 stack의 packet을 선택하지 않는다.
+
+Production 운영 스크립트는 Docker Engine major version을 검사한다. Engine 28+은
+base `compose.production.yaml`의 `internal + IPv6 off + ICC + IPv4/IPv6 isolated-gateway`를
+그대로 사용한다. Engine 27은 `compose.production.docker27.yaml`을 자동으로
+추가하고 Compose `!override`로 `driver_opts`를 `ICC + inhibit_ipv4`의 exact set으로
+교체한다. Engine 27에서는 Docker Compose 2.24.4 이상을 사용하고 raw base Compose
+명령 대신 `make production-*` 또는 `scripts/production.sh`를 사용한다.
+
+Base의 isolated option을 유지하므로 기존 Engine 28 network은 upgrade 시 config 차이 없이
+계속 사용할 수 있다. 이는 Compose가 network를 불필요하게 재생성하거나 network ID를
+바꾸는 위험을 피한다. Network option은 immutable이므로 실행 중 network에 다른
+version의 option을 덧붙이거나 network를 수동 삭제하지 않는다.
 
 아래 network/firewall 명령은 host 수정이 가능한 이전 `legacy-host-firewall-v1` 배포를
 재현하기 위해서만 보존한다. 기본 로컬, domain-test 및 새 운영 Compose에서 실행하지 않는다.
@@ -378,7 +397,9 @@ IPv4/IPv6 대역을 거부한다. 사용자 container에는 외부 route가 없�
 
 ## 검증
 
-네트워크 계약은 Linux의 실제 Docker Engine 28+에서 출시 spike를 수행해야 한다.
+네트워크 계약은 Linux의 실제 Docker Engine 27.1.2+에서 출시 spike를 수행해야 한다.
+27.1.2는 기능 호환 하한이며 현재 지원·보안 권장 release라는 뜻이 아니다. 27.5.1 미만은
+preflight 경고 대상으로 두고 가능한 경우 현재 지원되는 최신 patch를 사용한다.
 저장소에서 가능한 정적 계약 시험은 다음과 같다.
 
 ```bash
@@ -386,3 +407,21 @@ python3 -m unittest discover -s infra/jupyterhub/tests -v
 python3 -m unittest discover -s infra/host/tests -v
 python3 -m py_compile infra/jupyterhub/*.py infra/host/*.py
 ```
+
+정적 Compose 출력만으로 host의 live network 상태를 대신하지 않는다. production stack을
+시작한 실제 host에서 다음을 확인한다.
+
+```bash
+docker network inspect platform-jupyter-compose-production \
+  --format 'internal={{.Internal}} ipv6={{.EnableIPv6}} options={{json .Options}} labels={{json .Labels}} ipam={{json .IPAM.Config}}'
+network_id="$(docker network inspect platform-jupyter-compose-production --format '{{.Id}}')"
+bridge_name="br-${network_id:0:12}"
+ip -4 -o address show dev "${bridge_name}"
+ip -6 -o address show scope global dev "${bridge_name}"
+```
+
+두 `ip ... address` 명령은 아무 주소도 출력하지 않아야 한다. option은 Engine
+28+에서 `enable_icc+gateway_mode_ipv4/ipv6=isolated`, Engine 27에서
+`enable_icc+inhibit_ipv4` exact set이어야 한다. 이어 실제 single-user에서
+host gateway·host 관리 주소·사내망·metadata·direct IP/DNS egress가 실패하고, Hub와 승인된
+HTTP(S) proxy 목적지만 성공하는지 확인한다. Docker restart 후 같은 검사를 반복한다.

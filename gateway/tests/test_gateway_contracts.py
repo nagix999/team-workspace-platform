@@ -399,6 +399,14 @@ class NginxContractTests(unittest.TestCase):
         self.assertIn("PLATFORM_PORTAL_HOST", entrypoint)
         self.assertIn("PLATFORM_HUB_HOST", entrypoint)
         self.assertIn("PLATFORM_USER_DOMAIN", entrypoint)
+        self.assertIn(
+            'openssl x509 -in "${cert_path}" -noout -checkhost "${portal_host}"',
+            entrypoint,
+        )
+        self.assertIn(
+            "TLS leaf certificate does not cover portal host ${portal_host}",
+            entrypoint,
+        )
         self.assertIn("include /tmp/platform-server.conf", main_config)
         self.assertNotIn("platform.example.com", production)
         self.assertNotIn("hub.example.net", production)
@@ -420,7 +428,14 @@ class NginxContractTests(unittest.TestCase):
             "PLATFORM_GATEWAY_MODE does not match the baked Nginx server config",
             entrypoint,
         )
-        self.assertIn("$0 == required { found = 1 }", entrypoint)
+        exact_san_checks = entrypoint.split("for required_san in", 1)[1].split(
+            "cert_public_key_digest=", 1
+        )[0]
+        self.assertIn('"${hub_san}"', exact_san_checks)
+        self.assertIn('"${wildcard_hub_san}"', exact_san_checks)
+        self.assertNotIn('"${portal_san}"', exact_san_checks)
+        self.assertNotIn("portal_san=", entrypoint)
+        self.assertIn("$0 == required { found = 1 }", exact_san_checks)
 
 
 @unittest.skipUnless(docker_daemon_available(), "a reachable Docker daemon is required")

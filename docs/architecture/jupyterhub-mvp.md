@@ -478,12 +478,12 @@ health/alert로 감지한다.
 | `jupyter` | jupyterhub, egress-proxy, DockerSpawner가 만든 사용자 container | 외부 route 없는 Hub proxy·single-user 내부 통신 |
 | `egress-out` | egress-proxy만 | proxy의 통제된 외부 repository 연결 |
 
-- Compose가 exact name의 `jupyter` bridge를 `internal=true`, `com.docker.network.bridge.enable_icc=true`, IPv4/IPv6 isolated gateway와 IPv6 비활성으로 만든다. 고정 subnet과 dynamic `ip_range` 밖에 Hub/egress-proxy 주소를 두고 `host.docker.internal`/`host-gateway`는 추가하지 않는다. 사용자 container는 이 network 하나에만 붙고 egress-proxy만 `egress-out`에 dual-home한다. 이 mode를 지원하는 보안 패치된 Docker Engine 28+를 고정한다.
+- Compose가 exact name의 `jupyter` bridge를 `internal=true`, IPv6 off, ICC on으로 만든다. Engine 28+은 base `compose.production.yaml`의 exact IPv4/IPv6 isolated-gateway option set을 사용하고, Engine 27은 운영 스크립트가 `compose.production.docker27.yaml`을 자동 추가해 `driver_opts`를 exact `enable_icc+inhibit_ipv4` set으로 교체한다. Engine 27 overlay는 Docker Compose 2.24.4 이상을 요구한다. 27.1.2는 기능 호환 하한이고 27.5.1 이상 또는 현재 지원되는 보안 patch를 권장한다. Base isolated 정의를 유지해 기존 Engine 28 network의 불필요한 재생성과 network ID 변경을 피한다. 고정 subnet과 dynamic `ip_range` 밖에 Hub/egress-proxy 주소를 두고 `host.docker.internal`/`host-gateway`는 추가하지 않는다. 사용자 container는 이 network 하나에만 붙고 egress-proxy만 `egress-out`에 dual-home한다.
 - host에는 gateway의 `80/443`만 publish한다. Hub API, proxy API, FastAPI, SQLite port는 publish하지 않는다.
 - 사용자 container를 `control` network에 직접 연결하지 않는다.
 - Docker bridge는 Kubernetes NetworkPolicy 같은 세밀한 ACL을 제공하지 않는다. ICC on이므로 상호 신뢰하는 사용자 container끼리는 열린 port에 접근할 수 있음을 수용한다. private data 격리는 다른 사용자의 volume을 mount하지 않는 방식으로 유지한다. 이 전제가 바뀌면 KubeSpawner/NetworkPolicy로 전환한다.
-- JupyterHub는 ticket 소비 전과 create 직전에 Docker API로 이름, internal/IPv6/isolated/ICC option, label, subnet/ip-range와 reserved egress-proxy endpoint를 검사하고 drift 시 spawn을 거부한다. 정상 절차는 host firewall이나 `network_health` manifest를 요구하지 않는다.
-- 플랫폼은 `DOCKER-USER`/iptables/nftables 규칙을 설치·변경하지 않는다. Docker daemon이 bridge 구현을 위해 host netfilter를 자체 관리하는 것은 정상 동작으로 구분한다. Squid는 승인 domain의 80/443만 허용하고 DNS 결과가 사설·link-local·metadata·특수 대역이면 거부한다. [ADR-0006](../adr/0006-trusted-network-shared-storage.md)에 수용 위험과 전환 조건을 기록한다.
+- JupyterHub는 ticket 소비 전과 create 직전에 Docker API로 이름, internal/IPv6/ICC, 승인된 no-host-address option set, label, subnet/ip-range와 reserved egress-proxy endpoint를 검사하고 drift 시 spawn을 거부한다. 정상 절차는 host firewall이나 `network_health` manifest를 요구하지 않는다.
+- 플랫폼은 `DOCKER-USER`/iptables/nftables 규칙을 설치·변경하지 않는다. Docker daemon이 bridge 격리를 위해 host netfilter를 자체 관리하는 것은 필요한 정상 동작이므로 Docker firewall 관리를 끄지 않는다. Squid는 승인 domain의 80/443만 허용하고 DNS 결과가 사설·link-local·metadata·특수 대역이면 거부한다. [ADR-0006](../adr/0006-trusted-network-shared-storage.md)에 수용 위험과 전환 조건을 기록한다.
 - 사용자 container는 `cap_drop=ALL`로 실행해 특히 `NET_RAW`, `NET_ADMIN`을 갖지 못하게 한다. 출시 전에 single-user의 host/사내망/direct Internet 실패와 승인 proxy 목적지 성공을 실제 Engine에서 시험한다.
 
 ### 7.3 Docker socket 신뢰 경계
@@ -593,7 +593,8 @@ complete한 뒤에만 workspace를 archive하고 slot을 재사용한다. crash�
 `jupyter-shared`는 이 절차 대상이 아니며 name/label 검증에서 거부한다. backup 없는 삭제는
 복구할 수 없음을 명시하며 wildcard, 경로 glob, force remove나 project 전체 volume prune을
 사용하지 않는다. production에서는 digest-pinned/preloaded helper image만 허용하고 자동 pull하지
-않는다. 현재 production Compose는 없으므로 실제 운영 mount/backup/crash 시험은 별도 출시 gate다.
+않는다. Production Compose와 persistent checkpoint mount가 구현돼 있으며, 실제 운영
+host의 mount/backup/crash-recovery 시험은 별도 출시 gate다.
 
 ### 7.7 Reverse proxy 필수 검증
 
@@ -982,7 +983,7 @@ sequenceDiagram
 | 동시에 생성 버튼 여러 번 클릭 | 중복 컨테이너·quota 우회 | idempotency key, DB unique index, workspace별 operation lock |
 | 삭제 tombstone과 이미 시작된 spawn의 경합 | 삭제 뒤 container 재생성 또는 잘못된 volume wipe | 첫 transaction에서 tombstone/spec version 증가/ticket 철회, worker drain, Hub pending·container·mount quiet 확인 뒤 exact slot 처리 |
 | 15개 active 한도 도달 | 새 환경 시작 실패·retry 폭주 | Hub `active_server_limit=15`, 429 명시 표시, 자동 retry 금지, 사용량 알림과 포털 수동 stop |
-| Compose execution network option drift | host service/direct egress 우회 | 매 spawn Docker inspect fail-closed, `internal`+isolated gateway+IPv6 off, literal Hub IP·loopback DNS, `cap_drop=ALL`, 실제 연결 시험 |
+| Compose execution network option drift | host service/direct egress 우회 | 매 spawn Docker inspect fail-closed, `internal`+IPv6 off과 Engine 28+ isolated / Engine 27 `inhibit_ipv4` exact set, literal Hub IP·loopback DNS, `cap_drop=ALL`, 실제 host bridge/연결 시험 |
 | quota 없는 volume 또는 log로 host disk/inode 고갈 | 다른 사용자와 control plane 장애 | disk/inode 모니터링·경보, 부족 시 새 spawn 차단, control-plane 예약 공간, bounded log/tmpfs와 backup/정리 runbook |
 | internal network의 embedded DNS 외부 전달 | DNS 기반 데이터 반출 | literal Hub IP, single-user loopback-only DNS, user external DNS 실패와 authoritative canary 무조회 시험; 외부 이름 해석은 allowlist proxy만 수행 |
 | FastAPI 재시작 | 메모리 작업 유실 | durable operation table와 worker reclaim |
@@ -1067,7 +1068,7 @@ Compose 선택과 전체 active 15개는 확정됐지만 CPU/RAM workload와 총
 완료된 결정은 `ID/password`, 등록 사용자 10명, 사용자당 workspace 5개, 전체 active server 15개, 포털 진행 표시, `Docker Compose + DockerSpawner`, private/shared volume 분리, 사내망 차단과 package용 외부 egress다. 구현 전 남은 gate는 다음과 같다.
 
 1. 실제 workload를 측정해 환경별 CPU/RAM/PID, 15개 동시 실행 compute와 최대 50개 보존 volume의 총 사용량을 감당할 host 사양·disk/inode 경보 임계치 확정
-2. JupyterHub 5.5.0, NativeAuthenticator, DockerSpawner, JupyterLab, isolated gateway를 지원하는 보안 패치 Docker Engine 28+ exact version/network backend와 실제 SQLite runtime 고정; image digest 기록
+2. JupyterHub 5.5.0, NativeAuthenticator, DockerSpawner, JupyterLab, `internal+IPv6-off+ICC`와 Engine 28+ isolated / Engine 27 `inhibit_ipv4` exact set을 검증한 Docker Engine 27.1.2+ exact version/network backend와 실제 SQLite runtime 고정; Engine 27은 Compose 2.24.4+ overlay 렌더링도 검증하고, 27.1.2는 기능 호환 하한으로만 허용하며 27.5.1+ 또는 현재 지원되는 보안 patch를 권장하고 image digest 기록
 3. 전용 host, DNS/TLS, backup 위치, secret 생성·복구 절차 확정
 4. 다음 spike 통과
    - 비공개 admin bootstrap → 승인 사용자의 실제 로그인 성공 → platform `PROVISIONING` 생성 → one-shot slot provision/manifest import → `ACTIVE` 전환 → 10명 온보딩 뒤 signup 닫기; 준비 전 workspace create는 `PROVISIONING_REQUIRED`
@@ -1089,7 +1090,7 @@ Compose 선택과 전체 active 15개는 확정됐지만 CPU/RAM workload와 총
    - host disk/inode 임계치 경보, 부족 시 새 spawn 차단, control-plane 예약 공간과 private/shared backup·restore/정리 runbook이 실제 고갈 시험에서 동작함
    - token 없는 Hub URL에서 기존 Hub session 또는 ID/password 로그인 후 자신의 JupyterLab으로 이동
    - stop/start 후 persistent volume의 파일이 유지됨
-   - Docker restart 뒤 Compose network가 exact internal/isolated/IPv6-off/ICC-on 계약으로 복구되고 option/label/subnet/proxy endpoint drift 상태에서는 ticket 소비 전부터 새 spawn이 차단됨
+   - Docker restart 뒤 Compose network가 exact internal/IPv6-off/ICC-on과 승인된 no-host-address option set으로 복구되고 실제 host bridge에 IPv4/routable IPv6 주소가 없으며 option/label/subnet/proxy endpoint drift 상태에서는 ticket 소비 전부터 새 spawn이 차단됨
    - start/worker retry 중 관리자 삭제가 tombstone 이후 재실행되지 않고 exact workspace slot만 wipe/re-provision함
    - API/worker/Hub 재시작 후 상태가 수렴하고 만료 token 작업은 `AUTH_REQUIRED`가 됨
    - start/consume/pre-spawn과 경합해 offboarding해도 첫 transaction의 `DISABLED`/`spec_version`/ticket revoke 이후 새 container가 남지 않고, 과거 portal/Hub cookie, OAuth/API token, URL과 WebSocket 접근이 실패함

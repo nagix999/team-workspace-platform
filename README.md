@@ -5,7 +5,7 @@
 Compose를 결합해 소규모 팀이 하나의 Linux 호스트에서 개발환경을 일관되게 제공하는 것을
 목표로 합니다.
 
-> **현재 상태: v0.1.2 Technical Preview**
+> **현재 상태: v0.1.3 Technical Preview**
 >
 > 로컬 통합환경과 `cyberailabs.team` 단일 호스트 운영 구성을 함께 제공합니다. 운영 구성도
 > 조직의 TLS 인증서, 접근 CIDR, VIP/NAT와 백업 책임을 대신하지 않으므로 실제 공개 전에는
@@ -244,8 +244,11 @@ Kubernetes 전환이 필요합니다.
 ### 요구사항
 
 - Linux
-- Docker Engine 28 이상
-- Docker Compose v2
+- 로컬/domain-test: Docker Engine 28 이상
+- production: Docker Engine 27.1.2 이상(기능 호환 하한); 27.5.1 이상 또는 현재 지원되는 최신
+  보안 패치 release를 강력 권장
+- Docker Compose v2; Docker Engine 27에서는 compatibility overlay의 `!override`를 지원하는
+  Docker Compose 2.24.4 이상
 - Python 3.10 이상
 - OpenSSL
 
@@ -338,9 +341,11 @@ subdomain과 WebSocket을 검증할 수 있습니다. 실제 조직 도메인 �
 설정하고, 생성된 로컬 CA는 격리된 테스트 브라우저 profile에서만 신뢰하세요.
 
 ```bash
+ADMIN_USERNAME='<ADMIN_USERNAME>'
+TEST_USERNAME='<TEST_USERNAME>'
 make domain-test-tls
-make domain-test-preflight USERS=platform-admin,alice
-make domain-test-up USERS=platform-admin,alice
+make domain-test-preflight USERS="${ADMIN_USERNAME},${TEST_USERNAME}"
+make domain-test-up USERS="${ADMIN_USERNAME},${TEST_USERNAME}"
 ```
 
 이 전환기는 실행 workspace나 진행 중인 operation이 있으면 중단합니다. 전환 직전 Platform
@@ -360,7 +365,7 @@ make domain-test-down
 코드를 내부 운영 서버로 옮긴 뒤의 설치, DNS/VIP, 공인 인증서 발급, 최초 관리자·사용자
 생성, 검증, 갱신, backup과 장애 복구 절차는
 [운영 서버 전체 배포 가이드](docs/operations/production-deployment-ko.md)를 기준으로 합니다.
-기존 `10.155.1.24` 운영 서버에서 새 Git release를 적용할 때는
+기존 `<INTERNAL_SERVER_IP>` 운영 서버에서 새 Git release를 적용할 때는
 [Git 업데이트 후 운영 적용 절차](docs/operations/production-update-after-git-ko.md)를 사용합니다.
 운영 container만 모두 삭제되어 DB의 실행 의도가 남은 경우도 같은 문서의 offline quiesce
 복구 절차를 따르며, DB나 workspace volume을 직접 수정하거나 삭제하지 않습니다.
@@ -371,15 +376,40 @@ make domain-test-down
 - JupyterHub: `https://cyberailabs.team`
 - 사용자 서버: `https://<username>.cyberailabs.team`
 
-HostingKR 권한 DNS에는 apex(`@`/빈 이름), `platform`, `*` A record가 모두
-`123.214.65.254`를 가리켜야 합니다. VIP는 TLS를 종료하지 않고 TCP/443을 production host의
-`10.155.1.24:3030`으로 전달합니다. Gateway만 이 host port를 publish하며 플랫폼은 운영
-host의 방화벽 규칙을 설치하거나 변경하지 않습니다. 상위 VIP/네트워크 ACL은 별도입니다.
+HostingKR 권한 DNS에는 apex(`@`/빈 이름)와 `*` A record가
+`<PUBLIC_VIP>`를 가리켜야 합니다. 별도 `platform` A record는 필수가 아니며, `platform`
+이름에 다른 record가 전혀 없으면 루트 wildcard가 `platform.cyberailabs.team`도 응답합니다.
+`platform` 이름에 record를 따로 둔다면 그 이름도 같은 VIP로 해석되어야 합니다. 포털 URL
+자체는 계속 `https://platform.cyberailabs.team`을 사용합니다. VIP는 TLS를 종료하지 않고
+TCP/443을 production host의 `<INTERNAL_SERVER_IP>:3030`으로 전달합니다. Gateway만 이 host port를
+publish하며 플랫폼은 운영 host의 방화벽 규칙을 설치하거나 변경하지 않습니다. 상위
+VIP/네트워크 ACL은 별도입니다.
 
-인증서 leaf SAN은 정확히 `cyberailabs.team`, `platform.cyberailabs.team`,
-`*.cyberailabs.team`을 포함해야 합니다. wildcard 발급은 DNS-01이 필요합니다. HostingKR에서
-수동 발급한다면 `_acme-challenge` TXT 갱신과 만료 전 갱신을 운영 일정으로 관리하고,
-가능하면 DNS API가 있는 별도 challenge zone을 CNAME 위임해 자동화합니다.
+인증서 leaf SAN은 `cyberailabs.team`과 `*.cyberailabs.team`을 포함해야 합니다. wildcard SAN이
+포털의 `platform.cyberailabs.team`과 한 단계 사용자 hostname을 모두 보호합니다. wildcard
+발급은 DNS-01이 필요합니다. HostingKR에서 수동 발급한다면 `_acme-challenge` TXT 갱신과 만료
+전 갱신을 운영 일정으로 관리하고, 가능하면 DNS API가 있는 별도 challenge zone을 CNAME
+위임해 자동화합니다.
+
+Production 배포 스크립트는 Docker Engine major version을 검사해 실행망 정의를 자동
+선택합니다. Engine 28 이상은 base `compose.production.yaml`의 `internal=true`, IPv6
+off, ICC on, IPv4/IPv6 `gateway_mode=isolated` exact set을 사용합니다. Engine 27은
+`compose.production.docker27.yaml`을 자동으로 덧대어 `driver_opts`를 ICC on과
+`inhibit_ipv4=true` exact set으로 교체합니다. 운영 명령은 `make production-*`나
+`scripts/production.sh`를 사용하고 Engine 27에서 base Compose 파일만 직접 실행하지 않습니다.
+
+Base의 Engine 28 `isolated` 정의를 유지하면 기존 28 운영 network의 config가 바뀌지
+않아 Compose가 불필요하게 network를 재생성하지 않습니다. Network option은 immutable이므로
+실행 중 수동으로 option을 바꾸거나 network를 삭제하지 않습니다.
+
+27.1.2는 현재 지원되거나 최신 보안 release라는 뜻이 아닙니다. 사내 제약 때문에 당장 upgrade할
+수 없는 기존 host의 기능 호환 하한이며, preflight는 27.5.1 미만을 경고합니다. 가능한 즉시
+27.5.1 이상 또는 조직이 승인한 현재 지원 release로 올립니다.
+
+플랫폼은 host firewall rule을 설치·수정하지 않지만 Docker daemon이 bridge 격리를 위해
+관리하는 firewall/netfilter rule은 필요합니다. Docker의 firewall 관리를 끄지 말고, 실제
+운영 host에서 network inspect, bridge 주소 부재, single-user의 host·사내망·direct egress
+실패와 승인 proxy 성공을 모두 확인해야 합니다.
 
 production host에서만 다음 순서로 실행합니다.
 
@@ -391,7 +421,8 @@ make production-up
 make production-ps
 ```
 
-`production-preflight`는 host가 `10.155.1.24`를 실제 보유하는지, TLS SAN·키·유효기간,
+`production-preflight`는 host가 `.env.production`의 `PLATFORM_GATEWAY_BIND_IP`로 설정한
+내부 IP를 실제 보유하는지, TLS SAN·키·유효기간,
 source CIDR allowlist, 실행 중 workspace/다른 local stack 부재, immutable base와 모든 profile
 image 계약을 확인합니다. single-user image는 해당 host에서 빌드한 exact Docker image ID로
 고정하며, 새 image 배포 때 이전 runtime version을 정책에 남겨 기존 중지 환경도 재시작할 수
@@ -400,6 +431,9 @@ image 계약을 확인합니다. single-user image는 해당 host에서 빌드�
 기존 production DB가 있으면 `production-up`은 writer를 중지하고 두 SQLite DB를 online backup
 bundle로 검증한 뒤 migration/profile import를 실행합니다. DB 변경 뒤 실패하면 자동으로
 오래된 container를 억지 재기동하지 않고 복구 명령을 출력합니다.
+DB 작업 후에는 내부 service를 먼저 시작하고 live execution-network·host bridge·
+non-root probe를 검증한 뒤에만 Gateway를 publish/start합니다. 이 검증이 실패하면
+Gateway는 외부에 공개되지 않습니다.
 
 ```bash
 make production-restore BACKUP=/absolute/path/to/verified-backup-bundle
@@ -426,6 +460,8 @@ make production-restore BACKUP=/absolute/path/to/verified-backup-bundle
 | `make production-init` | 운영 전용 secret/runtime/.env 초기화 |
 | `make production-preflight` | 운영 host·TLS·CIDR·image·idle 사전검사 |
 | `make production-up` / `make production-down` | backup 포함 운영 stack 시작 / 종료 |
+| `make production-logs` | Engine별 Compose 선택을 적용한 운영 로그 follow |
+| `make production-recreate-gateway` | TLS 교체 후 Gateway 강제 재생성·health 검증 |
 | `make production-bootstrap-admin` | fresh 운영 DB의 최초 관리자 계정 생성 |
 | `make production-create-user USERNAME=alice` | signup을 열지 않고 승인 사용자 생성 |
 
@@ -442,12 +478,14 @@ make production-restore BACKUP=/absolute/path/to/verified-backup-bundle
 │   ├── egress-proxy/        # Squid allowlist proxy
 │   └── host/                # 선택적 legacy host 도구와 volume helper
 ├── scripts/                 # 초기화, 배포, backup/restore 전환 도구
+│   └── validate_production_network.py # 실시간 운영 network 검증기
 ├── docs/
 │   ├── architecture/        # 전체 아키텍처와 위협 모델
 │   └── adr/                 # 주요 설계 결정 기록
 ├── compose.yaml             # loopback 로컬 통합 구성
-├── compose.domain-test.yaml # HTTPS 도메인 사전검증 overlay
-└── compose.production.yaml  # cyberailabs.team 단일 호스트 운영 구성
+├── compose.domain-test.yaml          # HTTPS 도메인 사전검증 overlay
+├── compose.production.yaml           # Engine 28+ 기본 운영 구성
+└── compose.production.docker27.yaml  # Engine 27 자동 compatibility overlay
 ```
 
 ## 검증
@@ -473,16 +511,17 @@ make test
 
 ## 운영 준비 조건
 
-`compose.yaml`은 loopback 로컬 통합용이고 `compose.production.yaml`은 별도의 운영
-stack입니다. 운영 공개 전 최소한 다음 항목을 실제 조직 환경에서 검증해야 합니다.
+`compose.yaml`은 loopback 로컬 통합용이고 production은 Engine 28+ base
+`compose.production.yaml`과 Engine 27 compatibility overlay로 구성된 별도 stack입니다.
+운영 공개 전 최소한 다음 항목을 실제 조직 환경에서 검증해야 합니다.
 
-- ADR-0009의 DNS apex/portal/wildcard, wildcard TLS, HTTPS-only `__Host-` cookie
+- ADR-0009의 DNS apex/root-wildcard와 portal 해석, wildcard TLS, HTTPS-only `__Host-` cookie
 - digest-pinned image와 dependency·취약점 검토 및 SBOM
 - 실제 host 사양에 맞춘 CPU/RAM/동시 실행 부하 시험
 - host disk·inode 모니터링, control-plane 예약 공간과 용량 고갈 대응
 - Platform DB, Hub DB, private/shared volume과 secret의 backup·복구 훈련
 - 승인된 package/Git allowlist와 사내망·metadata·direct egress 차단 시험
-- Docker restart 뒤 network/volume 계약 및 전체 브라우저 E2E
+- Docker restart 뒤 live network inspect·bridge 주소·연결 차단, volume 계약 및 전체 브라우저 E2E
 - 사용자 보존 기간, 퇴사자 처리, 감사 보존과 삭제 승인 정책
 
 단일 호스트 장애는 전체 서비스 장애가 됩니다. 다중 호스트, HA, GPU, 비신뢰 사용자 간
@@ -507,6 +546,8 @@ stack입니다. 운영 공개 전 최소한 다음 항목을 실제 조직 환�
 `v0.1.1`은 `cyberailabs.team` 운영 배포 계약과 안전한 Git 업데이트 절차를 추가합니다.
 `v0.1.2`는 운영 container가 모두 사라진 경우를 위한 백업·감사 기반 offline 복구,
 실행 의도 불일치 상태의 UI 복구 동작과 검증된 SQLite runtime을 추가합니다.
+`v0.1.3`은 Docker Engine 27.1.2 운영 호환 overlay, apex/wildcard 2-SAN TLS 계약과
+실시간 execution-network/bridge 검증을 추가합니다.
 `0.x` 기간에는 API, migration과 운영 절차가 호환성 없이 변경될 수 있습니다. runtime profile
 같은 실행 정책은 기존 row를 직접 수정하지 않고 새 version으로 추가하는 원칙을 유지합니다.
 

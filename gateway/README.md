@@ -57,7 +57,7 @@ make domain-test-up USERS=alice,bob
 기존 stack을 먼저 `down`해야 한다. named DB/user volume은 보존되고 Compose 소유 Jupyter
 network는 재생성된다. 실행 중인 workspace를 모두 중지하고 점검 창에서만 전환한다. 끝나면
 전환기를 통해 domain-test network/container를 먼저 내리고 domain-test overlay 없이 기존
-local stack을 명시적으로 재생성한다. `jupyter`는 이제 Compose 소유 internal/isolated
+local stack을 명시적으로 재생성한다. `jupyter`는 이제 Compose 소유 internal/no-host-address
 bridge이며 두 전환은 host firewall을 읽거나 변경하지 않고 sudo도 요청하지 않는다.
 `down -v`는 사용하지 않으며 raw Compose 명령으로 idle gate를 우회하거나 두 모드를 동시에
 실행하지 않는다.
@@ -77,7 +77,8 @@ TLS handshake 거절이다.
 따른다.
 
 `production.conf`는 환경변수로 받은 exact host 세 개를 시작 시 렌더링한다. 이 저장소의
-standalone `compose.production.yaml`은 다음 계약으로 고정돼 있다.
+production stack은 Engine 28+ base Compose와 Engine 27 자동 compatibility overlay 모두에서
+다음 Gateway 계약으로 고정돼 있다.
 
 - `platform.cyberailabs.team`: Portal/API
 - `cyberailabs.team`: JupyterHub
@@ -95,6 +96,10 @@ make production-preflight
 make production-up
 ```
 
+`production-up`은 내부 service를 먼저 시작한 뒤 live execution-network/host bridge와
+hardened non-root probe를 검증한다. 이 검증이 통과한 뒤에만 Gateway를 publish/start하고
+서버 내부 HTTPS health를 확인하며, 실패한 Gateway는 다시 중지한다.
+
 API의 `FORWARDED_ALLOW_IPS`에는 production edge network의 Gateway 고정 IP
 `172.38.0.10` 하나만 들어간다. VIP는 TLS passthrough/DNAT-only로 전달하고 가능하면
 SNAT하지 않아야 `$remote_addr` 기반 회사/VPN allowlist와 감사 IP가 일치한다.
@@ -106,9 +111,19 @@ CIDR만 한 줄에 하나씩 허용한다. 시작 스크립트가 이를 `allow`
 우회할 수 없다. 파일 누락, 빈 목록, 잘못된 값과 `0.0.0.0/0`은 Gateway 시작 실패가 된다.
 이 애플리케이션 방어와 별개로 VIP/상위 네트워크 ACL에도 같은 allowlist를 적용한다.
 플랫폼 배포 절차가 운영 host firewall 규칙을 설치하거나 변경하지는 않는다.
+Production 스크립트는 Engine 28 이상에서 base Compose의 ICC on과 IPv4/IPv6
+isolated-gateway exact set을 사용하고, Engine 27에서 `compose.production.docker27.yaml`을
+자동으로 덧대어 ICC on과 `inhibit_ipv4=true` exact set으로 교체한다. 두 경우 모두
+`internal=true`와 IPv6 off가 필수이며 Docker daemon이 자체 bridge firewall/netfilter rule을
+정상 관리해야 하며,
+플랫폼이 별도 `DOCKER-USER` rule을 설치하지 않는다는 것과 Docker firewall을 끄는 것은
+다른 의미다. Production 기능 호환 하한은 Engine 27.1.2지만 이는 현재 지원되는 보안 release를
+뜻하지 않는다. Engine 27 overlay는 Docker Compose 2.24.4 이상을 요구하며, Engine은
+27.5.1 이상 또는 조직이 승인한 현재 지원 release를 권장한다.
 
 운영 Gateway image build에서는 `GATEWAY_BASE_IMAGE`를 반드시
-`repository@sha256:<64 lowercase hex>`로 전달한다. 시작 시 leaf SAN 세 개, 유효기간,
+`repository@sha256:<64 lowercase hex>`로 전달한다. 시작 시 production leaf의 apex/wildcard
+SAN 두 개, 유효기간,
 개인키 mode, certificate/key 일치와 `nginx -t`를 검증하며 하나라도 틀리면 시작하지 않는다.
 빌드한 image에는 선택된 server config mode가 별도 marker로 고정된다. 런타임
 `PLATFORM_GATEWAY_MODE`가 이 값과 정확히 다르면 시작을 거부하며, mutable base image 예외는

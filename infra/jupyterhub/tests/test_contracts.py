@@ -15,7 +15,7 @@ import uuid
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1215,20 +1215,115 @@ class DockerNetworkPolicyTests(unittest.IsolatedAsyncioTestCase):
             egress_proxy_url="http://172.30.0.20:3128",
         )
 
+    def spawner_for(
+        self,
+        inspected: dict | None = None,
+        *,
+        version: str = "28.0.0",
+        os_name: str = "linux",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            docker=AsyncMock(
+                side_effect=[
+                    {"Version": version, "Os": os_name},
+                    self.inspected if inspected is None else inspected,
+                ]
+            )
+        )
+
     async def test_compose_internal_network_is_inspected_without_host_manifest(
         self,
     ) -> None:
-        spawner = SimpleNamespace(docker=AsyncMock(return_value=self.inspected))
+        spawner = self.spawner_for()
         with (
             patch.object(spawn_guard, "_get_config", return_value=self.config),
             patch.object(spawn_guard, "_health_manifest") as health_manifest,
         ):
             await spawn_guard.assert_network_policy(spawner)
 
-        spawner.docker.assert_awaited_once_with(
-            "inspect_network", "platform-jupyter-compose-local"
+        self.assertEqual(
+            spawner.docker.await_args_list,
+            [
+                call("version"),
+                call("inspect_network", "platform-jupyter-compose-local"),
+            ],
         )
         health_manifest.assert_not_called()
+
+    async def test_inhibit_ipv4_contract_is_accepted_on_engine_27(self) -> None:
+        self.inspected["Options"] = {
+            "com.docker.network.bridge.enable_icc": "true",
+            "com.docker.network.bridge.inhibit_ipv4": "true",
+        }
+        for version in ("27.1.2", "27.1.2-1~ubuntu.24.04~noble", "27.5.0"):
+            spawner = self.spawner_for(version=version)
+            with (
+                self.subTest(version=version),
+                patch.object(spawn_guard, "_get_config", return_value=self.config),
+            ):
+                await spawn_guard.assert_network_policy(spawner)
+
+    async def test_network_contract_is_bound_to_minimum_engine_version(self) -> None:
+        inhibit = deepcopy(self.inspected)
+        inhibit["Options"] = {
+            "com.docker.network.bridge.enable_icc": "true",
+            "com.docker.network.bridge.inhibit_ipv4": "true",
+        }
+        for version, inspected in (
+            ("26.1.4", inhibit),
+            ("27.0.0", inhibit),
+            ("27.1.1", inhibit),
+            ("27.5.1", self.inspected),
+        ):
+            spawner = self.spawner_for(inspected, version=version)
+            with (
+                self.subTest(version=version, options=inspected["Options"]),
+                patch.object(spawn_guard, "_get_config", return_value=self.config),
+                self.assertRaises(spawn_guard.SpawnGuardError),
+            ):
+                await spawn_guard.assert_network_policy(spawner)
+
+    async def test_unreviewed_gateway_option_combinations_are_rejected(self) -> None:
+        for options in (
+            {
+                "com.docker.network.bridge.enable_icc": "true",
+                "com.docker.network.bridge.inhibit_ipv4": "false",
+            },
+            {
+                "com.docker.network.bridge.enable_icc": "true",
+                "com.docker.network.bridge.inhibit_ipv4": "true",
+                "com.docker.network.bridge.gateway_mode_ipv4": "nat",
+            },
+            {
+                "com.docker.network.bridge.enable_icc": "true",
+                "com.docker.network.bridge.gateway_mode_ipv4": "routed",
+                "com.docker.network.bridge.gateway_mode_ipv6": "routed",
+            },
+        ):
+            inspected = deepcopy(self.inspected)
+            inspected["Options"] = options
+            spawner = self.spawner_for(inspected, version="28.0.0")
+            with (
+                self.subTest(options=options),
+                patch.object(spawn_guard, "_get_config", return_value=self.config),
+                self.assertRaises(spawn_guard.SpawnGuardError),
+            ):
+                await spawn_guard.assert_network_policy(spawner)
+
+    async def test_docker_server_identity_is_fail_closed(self) -> None:
+        for version, os_name in (
+            ("27.5", "linux"),
+            ("27.5.1-rc.1", "linux"),
+            ("27.5.1", "windows"),
+        ):
+            spawner = self.spawner_for(version=version, os_name=os_name)
+            with (
+                self.subTest(version=version, os_name=os_name),
+                patch.object(spawn_guard, "_get_config", return_value=self.config),
+                self.assertRaises(spawn_guard.SpawnGuardError),
+            ):
+                await spawn_guard.assert_network_policy(spawner)
+            spawner.docker.assert_awaited_once_with("version")
 
     async def test_compose_network_rejects_unsafe_identity_or_missing_proxy(
         self,
@@ -1245,7 +1340,7 @@ class DockerNetworkPolicyTests(unittest.IsolatedAsyncioTestCase):
                 inspected["Containers"].pop("proxy-container-id")
             else:
                 inspected["Containers"].pop("hub-container-id")
-            spawner = SimpleNamespace(docker=AsyncMock(return_value=inspected))
+            spawner = self.spawner_for(inspected)
             with (
                 self.subTest(mutation=mutation),
                 patch.object(spawn_guard, "_get_config", return_value=self.config),
@@ -1262,7 +1357,7 @@ class DockerNetworkPolicyTests(unittest.IsolatedAsyncioTestCase):
             name="ws-0123456789abcdef0123456789abcdef",
             user=SimpleNamespace(name="alice"),
             log=SimpleNamespace(warning=lambda *args, **kwargs: None),
-            docker=AsyncMock(return_value=inspected),
+            docker=self.spawner_for(inspected).docker,
         )
         signed_post = AsyncMock()
         with (

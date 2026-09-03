@@ -1,4 +1,4 @@
-.PHONY: init-local production-init production-preflight production-up production-down production-ps production-bootstrap-admin production-create-user production-offline-quiesce-dry-run production-offline-quiesce production-restore legacy-host-network-create legacy-host-firewall-apply build up down logs ps list-users provision-user profile-matrix-check profile-image-check profile-deploy domain-test-tls domain-test-preflight domain-test-up domain-test-down domain-test-restore test-backend test-infra test-gateway test-frontend test config
+.PHONY: init-local production-init production-preflight production-up production-down production-ps production-logs production-recreate-gateway production-bootstrap-admin production-create-user production-offline-quiesce-dry-run production-offline-quiesce production-restore legacy-host-network-create legacy-host-firewall-apply build up down logs ps list-users provision-user profile-matrix-check profile-image-check profile-deploy domain-test-tls domain-test-preflight domain-test-up domain-test-down domain-test-restore test-backend test-infra test-gateway test-frontend test config
 
 LOCAL_PROJECT_ID_START ?= 10000
 # Comma-separated usernames for domain-test checks. Keep defaults minimal so
@@ -22,6 +22,12 @@ production-down:
 
 production-ps:
 	bash scripts/production.sh ps
+
+production-logs:
+	bash scripts/production.sh logs
+
+production-recreate-gateway:
+	bash scripts/production.sh recreate-gateway
 
 production-bootstrap-admin:
 	PRODUCTION_REQUIRE_EMPTY=true bash scripts/production.sh create-user
