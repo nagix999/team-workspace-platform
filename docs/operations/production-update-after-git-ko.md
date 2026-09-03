@@ -169,7 +169,7 @@ make production-logs
 확인 기준은 다음과 같다.
 
 - `api`, `jupyterhub`, `reconciler`, `frontend`, `egress-proxy`, `gateway`가 healthy
-- `worker`가 running
+- `worker`가 healthy (PID 1 operation-worker liveness 검사)
 - `migrate`, `bootstrap-profile`, `singleuser-image`가 exit code 0
 - Gateway 이외의 host published port가 없음
 - Gateway가 정확히 `10.155.1.24:3030`을 publish
@@ -231,6 +231,13 @@ make production-create-user USERNAME=alice
 
 DB mutation 전에 실패하면 배포 스크립트가 원래 실행 중이던 service를 재시작한다. 원인을
 로그에서 확인한 뒤 수정한다.
+
+`team-workspace-production-worker-1 has no healthcheck configured`가 나오면 worker 장애나
+workspace busy 상태가 아니라, worker healthcheck가 빠진 과거 Compose 파일과 `--wait`가 함께
+사용된 것이다. `v0.1.4` 이상에는 HTTP listener 대신 PID 1 operation-worker의 liveness를
+검사하는 전용 healthcheck가 포함된다. 운영 파일을 수동 편집하지 말고 검토된 최신 release를
+적용한 뒤 `docker compose ... config`의 `services.worker.healthcheck.test`가
+`python -c "import os; os.kill(1, 0)"`인지 확인한다.
 
 DB migration/profile import 이후 실패하면 같은 명령을 무작정 반복하지 않는다. 출력된
 `production database backup` 경로와 `restore with` 안내를 보존하고, 실패 시점과 DB revision을

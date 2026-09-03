@@ -5,7 +5,7 @@
 Compose를 결합해 소규모 팀이 하나의 Linux 호스트에서 개발환경을 일관되게 제공하는 것을
 목표로 합니다.
 
-> **현재 상태: v0.1.3 Technical Preview**
+> **현재 상태: v0.1.4 Technical Preview**
 >
 > 로컬 통합환경과 `cyberailabs.team` 단일 호스트 운영 구성을 함께 제공합니다. 운영 구성도
 > 조직의 TLS 인증서, 접근 CIDR, VIP/NAT와 백업 책임을 대신하지 않으므로 실제 공개 전에는
@@ -548,6 +548,8 @@ make test
 실행 의도 불일치 상태의 UI 복구 동작과 검증된 SQLite runtime을 추가합니다.
 `v0.1.3`은 Docker Engine 27.1.2 운영 호환 overlay, apex/wildcard 2-SAN TLS 계약과
 실시간 execution-network/bridge 검증을 추가합니다.
+`v0.1.4`는 HTTP listener가 없는 operation worker에 명시적인 process-liveness healthcheck를
+추가해 지원 범위의 Docker Compose에서 `production-up --wait`가 안정적으로 동작하게 합니다.
 `0.x` 기간에는 API, migration과 운영 절차가 호환성 없이 변경될 수 있습니다. runtime profile
 같은 실행 정책은 기존 row를 직접 수정하지 않고 새 version으로 추가하는 원칙을 유지합니다.
 

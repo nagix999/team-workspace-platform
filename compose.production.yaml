@@ -211,8 +211,17 @@ services:
       - ./secrets/production/admin_lifecycle_token:/run/platform-secrets/admin_lifecycle_token:ro
       - ./.runtime/production/profiles.json:/etc/platform/profiles.production.json:ro
     command: ["python", "-m", "app.worker", "--poll-seconds", "1"]
+    # Compose releases before the upstream disabled-healthcheck wait fix fail
+    # instead of falling back to the container's running state when this
+    # service is included in `compose up --wait`.  The worker has no HTTP
+    # listener, so expose its actual contract explicitly: PID 1 (the worker
+    # process) must still be alive.
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
     depends_on:
       bootstrap-profile:
         condition: service_completed_successfully
