@@ -7,6 +7,10 @@
 > 2026-08-11 이후 host `DOCKER-USER` 운영과 private/shared hard quota 결정은
 > [ADR-0006](0006-trusted-network-shared-storage.md)이 대체한다. 나머지 단일 호스트,
 > DockerSpawner, volume ownership 및 control-plane 결정은 계속 유효하다.
+> 따라서 아래 Docker 28 isolated gateway, host firewall health와 `DOCKER-USER` 규칙은
+> `legacy-host-firewall-v1`의 역사적 계약에만 적용된다. 현재 production Compose의
+> Engine 28+ base isolated-gateway / Engine 27 `inhibit_ipv4` compatibility overlay 계약에는
+> ADR-0006을 적용한다.
 > 2026-08-11 이후 exact workspace volume의 자동 wipe/recreate 절차는
 > [ADR-0007](0007-admin-runtime-and-environment-management.md)이 아래 수동 삭제 결정을
 > 대체한다.

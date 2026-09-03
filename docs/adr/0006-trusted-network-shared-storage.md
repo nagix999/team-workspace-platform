@@ -24,10 +24,28 @@ CPU, memory, PID와 전체 동시 실행량 제한은 유지한다. 사용자 �
 
 - `internal=true`
 - IPv6 endpoint 비활성화
-- Docker 28의 IPv4/IPv6 isolated gateway mode
 - inter-container communication(ICC)은 활성화
+- Docker Engine 28 이상: IPv4/IPv6 `gateway_mode=isolated`로 host-side gateway 주소 할당 금지
+- Docker Engine 27: `com.docker.network.bridge.inhibit_ipv4=true`로 host-side IPv4 주소 할당 금지
 - JupyterHub, single-user container와 dual-homed egress proxy만 연결
 - 사용자 container에는 port publish, host network, `host-gateway`, Docker socket을 허용하지 않음
+
+Base `compose.production.yaml`은 Engine 28 이상의 exact isolated-gateway option set을
+유지한다. Engine 27에서는 운영 스크립트가
+`compose.production.docker27.yaml`을 자동 추가하고 Compose `!override`로 base `driver_opts`
+전체를 ICC on과 `inhibit_ipv4=true` exact set으로 교체한다. 따라서 Engine 27은
+`!override`를 지원하는 Docker Compose 2.24.4 이상을 요구하며, base 파일만 직접
+실행하는 절차를 허용하지 않는다.
+
+Base의 Engine 28 정의를 변경하지 않으면 기존 28 운영 network에 config 차이가
+생기지 않아 Compose의 불필요한 network 재생성과 network ID 교체를 피할 수 있다.
+Docker network option은 immutable이므로 실행 중 endpoint가 있는 network를 수동
+삭제하거나 다른 major version의 option set으로 교체하지 않는다. 두 버전 모두
+`internal=true`, IPv6 off와 해당 Engine의 exact option set이 유지될 때만 승인한다.
+
+27.1.2는 기존 운영 host를 위한 기능 호환 하한이지 현재 지원 또는 보안 권장 version이라는
+뜻이 아니다. 27.5.1 미만에서는 명확히 경고하고, 가능하면 27.5.1 이상 또는 조직이 승인한 현재
+지원 release를 사용한다.
 
 플랫폼의 정상 설치·시작·domain-test 절차는 host firewall을 읽거나 변경하는
 `apply_jupyter_firewall.py`, `firewall-apply` 또는 동등한 명령을 호출하지 않는다. 기존
@@ -36,6 +54,8 @@ host-firewall 도구는 이전 강화 모드의 참고·수동 선택지로만 �
 Docker Engine은 bridge network를 구현하기 위해 host의 netfilter 규칙을 자체 관리할 수
 있다. 이 결정은 Docker daemon의 정상 동작까지 금지한다는 뜻이 아니라, 플랫폼이
 `DOCKER-USER` 등에 자체 규칙을 설치하거나 그 규칙에 가용성을 의존하지 않는다는 뜻이다.
+Docker daemon의 firewall/netfilter rule 관리는 끄지 않으며, 정적 Compose 확인만으로
+격리를 증명하지 않고 실제 host의 bridge 주소와 연결 실패를 출시 gate에서 확인한다.
 
 ICC를 켜므로 같은 실행망의 사용자 container는 서로의 열린 TCP/UDP port에 접근할 수
 있다. private volume은 다른 container에 mount되지 않아 파일시스템 namespace 격리는
@@ -97,8 +117,11 @@ filesystem 또는 예약 공간, shared/private backup과 복구 시험은 운�
 ## 출시 gate
 
 - 정상 `up`, domain-test 전환과 Docker 재시작 절차가 sudo/firewall 명령을 호출하지 않는다.
-- 실행망 inspect 결과가 internal, IPv6 off, isolated gateway, ICC on 및 예상 label/subnet과
-  일치하지 않으면 spawn을 거부한다.
+- 실행망 inspect 결과가 internal, IPv6 off, 예상 label/subnet과 Engine 28+ base의
+  `enable_icc+IPv4/IPv6 isolated` exact set 또는 Engine 27 overlay의
+  `enable_icc+inhibit_ipv4` exact set에 일치하지 않으면 spawn을 거부한다.
+- 실제 host bridge에 IPv4나 routable IPv6 주소가 없고, Docker restart 뒤에도 이 조건과
+  single-user의 host·사내망·direct Internet 차단이 유지된다.
 - single-user에서 host·사내망·direct Internet 연결은 실패하고 승인된 proxy 목적지는
   성공한다.
 - 두 사용자 container가 서로의 network port에는 접근할 수 있다는 잔여 위험을 운영자가

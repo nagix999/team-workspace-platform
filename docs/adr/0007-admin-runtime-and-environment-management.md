@@ -110,11 +110,10 @@ prune, 강제 remove와 shared volume 삭제는 사용하지 않는다.
 
 ## 운영 상태와 잔여 위험
 
-현재 저장소의 `compose.yaml`은 loopback local integration 전용이다. production Compose는
-아직 없으므로 위 production deletion은 설정 검증·agent 코드·unit test가 구현된 상태일 뿐
-운영 배포 준비 완료를 뜻하지 않는다. 운영 배포 전에는 persistent checkpoint mount,
-digest-pinned/preloaded image, Docker socket 경계, DB/volume backup, disk/inode 경보와 실제
-crash-recovery 시험을 별도로 승인해야 한다.
+현재 저장소에는 loopback local integration용 `compose.yaml`과 별도 production Compose가
+모두 있다. Production deletion은 persistent checkpoint mount와 digest-pinned/preloaded image를
+포함하지만, 운영 배포 준비 완료를 자동으로 뜻하지는 않는다. Docker socket 경계,
+DB/volume backup, disk/inode 경보와 실제 crash-recovery 시험을 별도로 승인해야 한다.
 
 Docker socket은 여전히 host-root 상당 권한이며 삭제는 backup이 없으면 복구 불가능하다.
 checkpoint는 remove 전/후 crash의 중복 파기를 막지만 악의적인 host root나 Docker daemon

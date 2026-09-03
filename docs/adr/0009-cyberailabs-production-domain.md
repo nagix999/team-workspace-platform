@@ -19,10 +19,13 @@ Hub를 도메인 apex에 배치해 HostingKR의 한 단계 wildcard만 사용한
 - `cyberailabs.team`: JupyterHub
 - `<username>.cyberailabs.team`: single-user Jupyter server
 
-권한 DNS의 apex, `platform`, `*` A record는 모두 VIP를 가리킨다. 인증서는 apex, portal,
-wildcard 세 SAN을 포함하며 Gateway Nginx가 production host에서 TLS를 종료한다. VIP는 HTTP를
-해석하지 않는 TCP pass-through/DNAT-only 구성이고 외부 443을 내부 3030으로 전달한다.
-Gateway 이외 service는 host port를 publish하지 않는다.
+권한 DNS의 apex와 `*` A record는 VIP를 가리킨다. 별도 `platform` A record는 선택 사항이다.
+`platform` 이름에 다른 record가 없으면 root wildcard가 `platform.cyberailabs.team`을
+응답하며, 명시 record를 둔다면 같은 VIP로 해석되게 한다. 포털 URL은 DNS record 구성과
+무관하게 계속 `platform.cyberailabs.team`이다. 인증서는 apex와 wildcard 두 SAN을 포함하며
+wildcard SAN이 portal과 한 단계 사용자 hostname을 보호한다. Gateway Nginx가 production
+host에서 TLS를 종료한다. VIP는 HTTP를 해석하지 않는 TCP pass-through/DNAT-only 구성이고
+외부 443을 내부 3030으로 전달한다. Gateway 이외 service는 host port를 publish하지 않는다.
 
 운영 Gateway는 세 hostname, SNI와 Host 일치, TLS key/SAN/유효기간, 회사/VPN source CIDR을
 fail-closed로 확인한다. API는 고정 Gateway container IP 하나의 forwarded header만 신뢰한다.
@@ -56,9 +59,10 @@ API/worker/user container에는 Docker socket을 주지 않는다. HMAC으로 �
 
 ## 출시 gate
 
-- 권한 DNS의 apex/portal/random wildcard A가 VIP와 일치한다.
+- 권한 DNS의 apex와 root wildcard를 통한 portal/random hostname이 VIP와 일치한다.
 - 인증서 SAN, key, 유효기간과 Gateway Host/SNI 거부 시험이 통과한다.
 - VIP 443→host 3030 WebSocket, OAuth callback, 2 GiB upload 경로가 통과한다.
 - Gateway 외 published port가 없고 회사/VPN 밖 source가 거부된다.
-- backup→migration/profile import→health와 실제 restore 훈련이 통과한다.
+- backup→migration/profile import→내부 service 시작→live execution-network/bridge/probe
+  검증→Gateway 시작→HTTPS health와 실제 restore 훈련이 통과한다.
 - 사용자 두 명의 origin/cookie 분리, private/shared volume 및 cross-user 접근 경계를 재검증한다.

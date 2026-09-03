@@ -59,7 +59,6 @@ case "${gateway_mode}" in
             "${user_domain}"|*."${user_domain}") ;;
             *) fail "PLATFORM_HUB_HOST must equal or be below PLATFORM_USER_DOMAIN" ;;
         esac
-        portal_san="DNS:${portal_host}"
         hub_san="DNS:${hub_host}"
         wildcard_hub_san="DNS:*.${user_domain}"
         user_domain_regex="$(printf '%s' "${user_domain}" | sed 's/\./\\./g')"
@@ -115,7 +114,7 @@ case "${gateway_mode}" in
         mv /tmp/company-vpn-allowlist.conf.tmp /tmp/company-vpn-allowlist.conf
         ;;
     domain-test)
-        portal_san='DNS:platform.workspace.test'
+        portal_host='platform.workspace.test'
         hub_san='DNS:hub.workspace.test'
         wildcard_hub_san='DNS:*.hub.workspace.test'
         cp /etc/platform-gateway/server.conf.template /tmp/platform-server.conf
@@ -142,6 +141,8 @@ openssl pkey -in "${key_path}" -passin pass: -noout >/dev/null 2>&1 \
     || fail "TLS private key must be parseable and unencrypted"
 openssl x509 -in "${cert_path}" -noout -checkend "${minimum_validity}" >/dev/null 2>&1 \
     || fail "TLS certificate is expired or expires inside the required validity window"
+openssl x509 -in "${cert_path}" -noout -checkhost "${portal_host}" >/dev/null 2>&1 \
+    || fail "TLS leaf certificate does not cover portal host ${portal_host}"
 
 san_csv="$(
     openssl x509 -in "${cert_path}" -noout -ext subjectAltName 2>/dev/null \
@@ -149,7 +150,6 @@ san_csv="$(
         | tr -d '[:space:]'
 )"
 for required_san in \
-    "${portal_san}" \
     "${hub_san}" \
     "${wildcard_hub_san}"
 do

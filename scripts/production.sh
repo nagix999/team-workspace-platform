@@ -8,12 +8,15 @@ cd "${project_dir}"
 
 readonly env_file="${project_dir}/.env.production"
 readonly compose_file="${project_dir}/compose.production.yaml"
+readonly docker27_compose_file="${project_dir}/compose.production.docker27.yaml"
 readonly policy_file="${project_dir}/.runtime/production/profiles.json"
 readonly candidate_policy_file="${project_dir}/.runtime/production/profiles.candidate.json"
 readonly template_file="${project_dir}/infra/jupyterhub/profiles.local-dev.json"
 readonly production_runtime_dir="${project_dir}/.runtime/production"
 readonly backup_parent="${project_dir}/.runtime/production/backups"
 readonly operator_lock_file="${project_dir}/.runtime/production/operator.lock"
+compose_file_args=(-f "${compose_file}")
+production_network_isolation_mode=isolated
 
 die() { echo >&2 "production: $*"; exit 1; }
 
@@ -37,7 +40,7 @@ load_environment() {
 }
 
 compose() {
-  docker compose --env-file "${env_file}" -f "${compose_file}" "$@"
+  docker compose --env-file "${env_file}" "${compose_file_args[@]}" "$@"
 }
 
 acquire_operator_lock() {
@@ -54,7 +57,153 @@ require_regular_file() {
     || die "${label} must be one readable absolute regular non-symlink file: ${path}"
 }
 
+validate_docker_engine_contract() {
+  local server_version server_major server_minor server_patch
+  if ! server_version="$(docker version --format '{{.Server.Version}}' 2>/dev/null)"; then
+    die "could not query the Docker Server Engine version"
+  fi
+  if [[ ! "${server_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z][0-9A-Za-z._-]*|-[0-9][0-9A-Za-z._+~:-]*)?$ ]]; then
+    die "Docker Server Engine returned an unrecognized version"
+  fi
+  server_major="${BASH_REMATCH[1]}"
+  server_minor="${BASH_REMATCH[2]}"
+  server_patch="${BASH_REMATCH[3]}"
+  if ((
+    10#${server_major} < 27
+    || (
+      10#${server_major} == 27
+      && (
+        10#${server_minor} < 1
+        || (10#${server_minor} == 1 && 10#${server_patch} < 2)
+      )
+    )
+  )); then
+    die "Docker Server Engine 27.1.2 or newer is required by the production network contract (found ${server_version})"
+  fi
+  if ((
+    10#${server_major} == 27
+    && (
+      10#${server_minor} < 5
+      || (10#${server_minor} == 5 && 10#${server_patch} < 1)
+    )
+  )); then
+    echo >&2 "production: WARNING: Docker Server Engine ${server_version} is supported, but upgrade to the final patched 27.5.1 release is strongly recommended"
+  fi
+  compose_file_args=(-f "${compose_file}")
+  production_network_isolation_mode=isolated
+  if ((10#${server_major} == 27)); then
+    validate_docker_compose_override_contract
+    compose_file_args+=(-f "${docker27_compose_file}")
+    production_network_isolation_mode=inhibit-ipv4
+  fi
+}
+
+validate_docker_compose_override_contract() {
+  local compose_version compose_major compose_minor compose_patch
+  if ! compose_version="$(docker compose version --short 2>/dev/null)"; then
+    die "could not query the Docker Compose version required for Engine 27"
+  fi
+  if [[ ! "${compose_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\+[0-9A-Za-z][0-9A-Za-z._-]*|-[0-9][0-9A-Za-z._+~:-]*)?$ ]]; then
+    die "Docker Compose returned an unrecognized version"
+  fi
+  compose_major="${BASH_REMATCH[1]}"
+  compose_minor="${BASH_REMATCH[2]}"
+  compose_patch="${BASH_REMATCH[3]}"
+  if ((
+    10#${compose_major} < 2
+    || (
+      10#${compose_major} == 2
+      && (
+        10#${compose_minor} < 24
+        || (10#${compose_minor} == 24 && 10#${compose_patch} < 4)
+      )
+    )
+  )); then
+    die "Docker Compose 2.24.4 or newer is required for the Engine 27 compatibility overlay (found ${compose_version})"
+  fi
+}
+
+production_network_contract() {
+  python3 scripts/validate_production_network.py "$@" \
+    --network-name platform-jupyter-compose-production \
+    --compose-project "${PRODUCTION_COMPOSE_PROJECT_NAME}" \
+    --isolation-mode "${production_network_isolation_mode}" \
+    --subnet 172.40.0.0/24 \
+    --ip-range 172.40.0.128/25 \
+    --required-endpoint 172.40.0.10 \
+    --required-endpoint 172.40.0.20
+}
+
+validate_gateway_health() {
+  curl --fail --silent --show-error \
+    --connect-to platform.cyberailabs.team:443:"${PLATFORM_GATEWAY_BIND_IP}":3030 \
+    https://platform.cyberailabs.team/healthz >/dev/null
+  curl --fail --silent --show-error \
+    --connect-to cyberailabs.team:443:"${PLATFORM_GATEWAY_BIND_IP}":3030 \
+    https://cyberailabs.team/healthz >/dev/null
+}
+
+stop_gateway_fail_closed() {
+  local running
+  compose stop gateway >/dev/null 2>&1 || return 1
+  running="$(compose ps --status running -q gateway 2>/dev/null)" || return 1
+  [[ -z "${running}" ]]
+}
+
+stop_gateway_or_die() {
+  stop_gateway_fail_closed \
+    || die "could not stop gateway or verify that its public listener is closed"
+}
+
+start_gateway_checked() {
+  if ! compose up -d --no-deps --wait "$@" gateway; then
+    if stop_gateway_fail_closed; then
+      echo >&2 "production: gateway startup failed; gateway was stopped"
+    else
+      echo >&2 "production: CRITICAL: gateway startup failed and its stopped state could not be verified"
+    fi
+    return 1
+  fi
+  if ! validate_gateway_health; then
+    if stop_gateway_fail_closed; then
+      echo >&2 "production: gateway health validation failed; gateway was stopped"
+    else
+      echo >&2 "production: CRITICAL: gateway health validation failed and its stopped state could not be verified"
+    fi
+    return 1
+  fi
+}
+
+require_running_control_plane() {
+  local service container_id
+  for service in api frontend egress-proxy jupyterhub; do
+    container_id="$(compose ps --status running -q "${service}")"
+    [[ "${container_id}" =~ ^[0-9a-f]{12,64}$ ]] \
+      || die "production service ${service} must be running before recreating gateway"
+  done
+}
+
+restart_account_control_plane_checked() {
+  if ! compose up -d --wait jupyterhub reconciler worker >/dev/null; then
+    echo >&2 "production: account-administration control-plane restart failed"
+    stop_gateway_fail_closed \
+      || echo >&2 "production: CRITICAL: gateway stopped state could not be verified"
+    return 1
+  fi
+  if ! production_network_contract validate \
+    --probe-image team-workspace-backend:production
+  then
+    echo >&2 "production: account-administration network validation failed"
+    stop_gateway_fail_closed \
+      || echo >&2 "production: CRITICAL: gateway stopped state could not be verified"
+    return 1
+  fi
+  start_gateway_checked
+}
+
 validate_host_contract() {
+  local certificate_sans cert_key file_key key_mode san
+  validate_docker_engine_contract
   [[ "${PLATFORM_GATEWAY_BIND_IP}" == "10.155.1.24" ]] \
     || die "PLATFORM_GATEWAY_BIND_IP must remain 10.155.1.24 for the reviewed VIP contract"
   ip -4 -o address show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${PLATFORM_GATEWAY_BIND_IP}" \
@@ -71,9 +220,15 @@ validate_host_contract() {
   cert_key="$(openssl x509 -in "${PLATFORM_TLS_CERT_FILE}" -pubkey -noout | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256)"
   file_key="$(openssl pkey -in "${PLATFORM_TLS_KEY_FILE}" -passin pass: -pubout -outform DER 2>/dev/null | openssl dgst -sha256)"
   [[ -n "${cert_key}" && "${cert_key}" == "${file_key}" ]] || die "TLS certificate and key do not match"
-  for san in 'DNS:cyberailabs.team' 'DNS:platform.cyberailabs.team' 'DNS:*.cyberailabs.team'; do
+  openssl x509 -in "${PLATFORM_TLS_CERT_FILE}" -noout \
+    -checkhost platform.cyberailabs.team >/dev/null \
+    || die "TLS certificate does not cover portal host platform.cyberailabs.team"
+  certificate_sans="$(
     openssl x509 -in "${PLATFORM_TLS_CERT_FILE}" -noout -ext subjectAltName \
-      | tr -d '[:space:]' | tr ',' '\n' | grep -Fxq "${san}" \
+      | sed '1d' | tr -d '[:space:]'
+  )" || die "TLS certificate SAN extension could not be read"
+  for san in 'DNS:cyberailabs.team' 'DNS:*.cyberailabs.team'; do
+    tr ',' '\n' <<<"${certificate_sans}" | grep -Fxq "${san}" \
       || die "TLS certificate is missing SAN ${san}"
   done
   awk '
@@ -269,6 +424,8 @@ preflight_impl() {
   load_environment
   validate_host_contract
   require_idle
+  compose config --quiet
+  production_network_contract prepare
   validate_database_inventory
   prepare_images_and_policy
   production_database_is_idle \
@@ -282,27 +439,64 @@ preflight() {
 }
 
 start() {
-  local policy_existed_before=false
+  local policy_existed_before=false old_gateway_running=false service old_running_output
+  local -a old_running_services=() old_internal_services=()
   acquire_operator_lock
   preflight_impl
   [[ ! -e "${policy_file}" ]] || policy_existed_before=true
-  mapfile -t old_running < <(compose ps --status running -q)
-  compose stop gateway worker reconciler api jupyterhub frontend egress-proxy >/dev/null || true
+  old_running_output="$(compose ps --status running --services)" \
+    || die "could not inventory the original production services"
+  if [[ -n "${old_running_output}" ]]; then
+    mapfile -t old_running_services <<<"${old_running_output}"
+  fi
+  for service in "${old_running_services[@]}"; do
+    if [[ "${service}" == gateway ]]; then
+      old_gateway_running=true
+    else
+      old_internal_services+=("${service}")
+    fi
+  done
+  restart_original_services() {
+    if [[ "${#old_internal_services[@]}" -gt 0 ]]; then
+      compose up -d --no-deps --no-recreate --wait \
+        "${old_internal_services[@]}" >/dev/null || return 1
+    fi
+    if [[ "${old_gateway_running}" == true ]]; then
+      production_network_contract validate \
+        --probe-image team-workspace-backend:production || return 1
+      start_gateway_checked --no-recreate || return 1
+    fi
+  }
+  report_pre_mutation_failure() {
+    local reason="$1"
+    if restart_original_services; then
+      die "${reason}; original services were restarted"
+    fi
+    stop_gateway_fail_closed \
+      || echo >&2 "production: CRITICAL: gateway stopped state could not be verified"
+    die "${reason}; safe restart failed and gateway was not reopened"
+  }
+  stop_gateway_or_die
+  if ! compose stop gateway worker reconciler api jupyterhub frontend egress-proxy >/dev/null; then
+    report_pre_mutation_failure "could not stop the original control plane"
+  fi
   if ! production_database_is_idle; then
-    [[ "${#old_running[@]}" == 0 ]] || docker start "${old_running[@]}" >/dev/null
-    die "database became busy during the maintenance transition; original containers were restarted"
+    report_pre_mutation_failure \
+      "database became busy during the maintenance transition"
   fi
   if ! snapshot_existing_databases; then
-    [[ "${#old_running[@]}" == 0 ]] || docker start "${old_running[@]}" >/dev/null
-    die "database snapshot failed; original containers were restarted"
+    report_pre_mutation_failure "database snapshot failed"
   fi
   migration_started=false
   restore_on_failure() {
     status=$?
     trap - EXIT
+    if [[ "${migration_started}" == true ]] && ! stop_gateway_fail_closed; then
+      echo >&2 "production: CRITICAL: failed deployment did not prove that gateway is stopped"
+    fi
     if [[ "${migration_started}" == false ]]; then
-      [[ "${#old_running[@]}" == 0 ]] \
-        || docker start "${old_running[@]}" >/dev/null || true
+      restart_original_services \
+        || echo >&2 "production: original services could not be restarted safely"
     elif [[ "${PRODUCTION_FRESH_DATABASES:-false}" == true ]]; then
       compose down >/dev/null 2>&1 || true
       while read -r fresh_volume; do
@@ -325,14 +519,12 @@ start() {
     --output "${policy_file}"
   compose run --rm --no-deps migrate
   compose run --rm --no-deps bootstrap-profile
-  compose up -d --build --wait
+  compose up -d --build --wait \
+    api worker reconciler frontend egress-proxy jupyterhub
+  production_network_contract validate \
+    --probe-image team-workspace-backend:production
+  start_gateway_checked || die "gateway did not start safely"
   compose ps
-  curl --fail --silent --show-error \
-    --connect-to platform.cyberailabs.team:443:"${PLATFORM_GATEWAY_BIND_IP}":3030 \
-    https://platform.cyberailabs.team/healthz >/dev/null
-  curl --fail --silent --show-error \
-    --connect-to cyberailabs.team:443:"${PLATFORM_GATEWAY_BIND_IP}":3030 \
-    https://cyberailabs.team/healthz >/dev/null
   echo "production control plane is healthy on ${PLATFORM_GATEWAY_BIND_IP}:3030"
   trap - EXIT
 }
@@ -340,8 +532,44 @@ start() {
 stop() {
   acquire_operator_lock
   load_environment
+  validate_docker_engine_contract
   require_idle
   compose down
+}
+
+show_status() {
+  load_environment
+  validate_docker_engine_contract
+  compose ps
+}
+
+logs() {
+  load_environment
+  validate_docker_engine_contract
+  compose logs -f --tail=200
+}
+
+recreate_gateway() {
+  recreate_gateway_failure() {
+    local status=$?
+    trap - EXIT
+    if ! stop_gateway_fail_closed; then
+      echo >&2 "production: CRITICAL: gateway recreation failure did not prove that gateway is stopped"
+    fi
+    exit "${status}"
+  }
+  acquire_operator_lock
+  load_environment
+  validate_host_contract
+  trap recreate_gateway_failure EXIT
+  stop_gateway_or_die
+  require_running_control_plane
+  production_network_contract validate \
+    --probe-image team-workspace-backend:production
+  start_gateway_checked --force-recreate \
+    || die "gateway did not recreate safely"
+  trap - EXIT
+  echo "production gateway was recreated and is healthy"
 }
 
 create_user() {
@@ -364,16 +592,20 @@ create_user() {
     || die "JupyterHub is not running; run make production-up first"
   [[ "${PRODUCTION_REQUIRE_EMPTY:-false}" != "true" || "${PRODUCTION_TARGET_USERNAME}" == "${PLATFORM_ADMIN_USERNAME}" ]] \
     || die "only the configured admin can be the initial account"
+  production_network_contract validate \
+    --probe-image team-workspace-backend:production
 
-  compose stop gateway worker reconciler jupyterhub >/dev/null
+  stop_gateway_or_die
   restart_after_user_admin() {
     status=$?
     trap - EXIT
-    compose up -d --wait jupyterhub reconciler worker gateway >/dev/null \
+    restart_account_control_plane_checked \
       || echo >&2 "production: control-plane restart after account administration failed"
     exit "${status}"
   }
   trap restart_after_user_admin EXIT
+  compose stop worker reconciler jupyterhub >/dev/null \
+    || die "could not stop the account-administration control plane"
   snapshot_existing_databases \
     || die "database snapshot failed before account administration"
   [[ "${PRODUCTION_REQUIRE_EMPTY:-false}" != "true" ]] || require_empty_flag+=(--require-empty)
@@ -383,7 +615,8 @@ create_user() {
     --admin-username "${PLATFORM_ADMIN_USERNAME}" \
     "${require_empty_flag[@]}"
   trap - EXIT
-  compose up -d --wait jupyterhub reconciler worker gateway >/dev/null
+  restart_account_control_plane_checked \
+    || die "control-plane restart after account administration failed"
   echo "production account is ready: ${PRODUCTION_TARGET_USERNAME}"
 }
 
@@ -391,6 +624,7 @@ offline_quiesce() {
   local mode="$1" bundle_basename
   acquire_operator_lock
   load_environment
+  validate_docker_engine_contract
   [[ "${mode}" == "dry-run" || "${mode}" == "apply" ]] \
     || die "offline quiesce mode must be dry-run or apply"
   if [[ "${mode}" == "apply" ]]; then
@@ -438,6 +672,7 @@ restore() {
   local platform_identity hub_identity
   acquire_operator_lock
   load_environment
+  validate_docker_engine_contract
   : "${PRODUCTION_BACKUP_DIR:?Set PRODUCTION_BACKUP_DIR to a verified backup bundle}"
   require_idle
   python3 scripts/domain_test_database_snapshot.py verify --bundle "${PRODUCTION_BACKUP_DIR}" >/dev/null
@@ -477,10 +712,12 @@ case "${1:-}" in
   preflight) preflight ;;
   up) start ;;
   down) stop ;;
-  ps) load_environment; compose ps ;;
+  ps) show_status ;;
+  logs) logs ;;
+  recreate-gateway) recreate_gateway ;;
   create-user) create_user ;;
   offline-quiesce-dry-run) offline_quiesce dry-run ;;
   offline-quiesce) offline_quiesce apply ;;
   restore) restore ;;
-  *) die "usage: scripts/production.sh preflight|up|down|ps|create-user|offline-quiesce-dry-run|offline-quiesce|restore" ;;
+  *) die "usage: scripts/production.sh preflight|up|down|ps|logs|recreate-gateway|create-user|offline-quiesce-dry-run|offline-quiesce|restore" ;;
 esac

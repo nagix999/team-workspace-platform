@@ -61,13 +61,14 @@ merge commit을 운영 서버에서 직접 만들거나 `git reset --hard`, `git
 ```bash
 git diff --stat ORIG_HEAD HEAD
 git diff ORIG_HEAD HEAD -- \
-  .env.production.example compose.production.yaml \
-  scripts/init-production.sh scripts/production.sh \
+  .env.production.example compose.production.yaml compose.production.docker27.yaml \
+  scripts/init-production.sh scripts/production.sh scripts/validate_production_network.py \
   backend/alembic infra/jupyterhub gateway
 ```
 
-배포 tag에는 최소한 `compose.production.yaml`, `scripts/production.sh`와 이 문서가 포함되어
-있어야 한다. 과거 tag가 이 운영 구성을 포함하지 않으면 그 tag를 운영에 배포하지 않는다.
+배포 tag에는 최소한 `compose.production.yaml`, `compose.production.docker27.yaml`,
+`scripts/production.sh`, `scripts/validate_production_network.py`와 이 문서가 포함되어야
+한다. 과거 tag가 이 운영 구성을 포함하지 않으면 그 tag를 운영에 배포하지 않는다.
 
 ## 3. 운영 설정 병합
 
@@ -93,13 +94,33 @@ diff -u .env.production.example .env.production || true
 - `PLATFORM_ADMIN_USERNAME`
 - Docker socket, secret, TLS 파일의 숫자 GID
 
+Docker Server Engine의 기능 호환 하한은 27.1.2다. 27.1.2는 현재 지원·보안 권장 release라는
+뜻이 아니며 preflight는 27.5.1 미만에서 경고한다. 가능한 즉시 27.5.1 이상 또는 조직이 승인한
+현재 지원 release로 올린다. 플랫폼은 host firewall을 설치하지 않지만 Docker daemon이
+bridge용 firewall/netfilter rule을 관리하는 기능은 끄면 안 된다. Engine 27은
+compatibility overlay의 `!override`를 위해 Docker Compose 2.24.4 이상을 요구한다.
+
+```bash
+docker version --format 'Server={{.Server.Version}} API={{.Server.APIVersion}}'
+docker compose version
+```
+
+운영 스크립트는 Engine을 검사해 28+에서 base Compose의 exact ICC + IPv4/IPv6
+isolated-gateway set, 27에서 base + compatibility overlay의 exact ICC + `inhibit_ipv4`
+set을 자동 선택한다. Base의 isolated 정의를 유지하면 기존 Engine 28 network에 config
+차이가 생기지 않아 불필요한 network 재생성과 network ID 변경을 피한다. Docker network
+option은 제자리에서 바꿀 수 없으므로 운영 Compose를 수동 주석 처리하거나 실행 중
+network를 삭제하지 않는다. 모든 운영 조작은 `make production-*`를 사용한다.
+
 `PLATFORM_PUBLIC_VIP` 설정은 필요하지 않다. 공인 `123.214.65.254:443`에서
 `10.155.1.24:3030`으로의 전달은 방화벽/VIP 장비의 L4 NAT 계약이며 애플리케이션은 공인 VIP를
 bind하거나 라우팅 판단에 사용하지 않는다. 예전 `.env.production`에 해당 key가 남아 있다면
 혼동을 피하려고 제거한다.
 
-인증서와 source CIDR 파일은 Git으로 배포하지 않는다. 만료, SAN, key 권한과 서버 주소를
-확인한다.
+인증서와 source CIDR 파일은 Git으로 배포하지 않는다. 운영 leaf에
+`DNS:cyberailabs.team`과 `DNS:*.cyberailabs.team` SAN이 모두 있는지와 만료, key 권한, 서버
+주소를 확인한다. wildcard SAN이 `platform.cyberailabs.team`을 보호하며 포털 URL은 그대로
+유지한다.
 
 ```bash
 openssl x509 -in /etc/team-workspace/tls/fullchain.pem \
@@ -131,16 +152,18 @@ make production-preflight
 make production-up
 ```
 
-`production-up`은 preflight를 다시 실행하고, writer를 중지한 직후 DB idle을 한 번 더 확인한 뒤
-Platform/Hub DB online backup, migration, profile import, image build와 전체 health 검사를 수행한다.
+`production-up`은 preflight에서 image/Compose 계약을 다시 검사하고, writer를 중지한
+직후 DB idle을 한 번 더 확인한 뒤 Platform/Hub DB online backup, migration과 profile
+import를 수행한다. 그런 다음 내부 service를 먼저 시작하고 live execution-network,
+host bridge·non-root probe를 검증한 뒤에만 Gateway를 publish/start하여 HTTPS health를
+확인한다. Network 검증이 실패하면 Gateway는 시작되지 않는다.
 출력된 backup bundle 경로와 배포한 Git commit을 변경 기록에 남긴다.
 
 ## 5. 배포 직후 확인
 
 ```bash
 make production-ps
-docker compose --env-file .env.production -f compose.production.yaml \
-  logs --since=15m api jupyterhub reconciler worker gateway egress-proxy
+make production-logs
 ```
 
 확인 기준은 다음과 같다.
@@ -162,6 +185,22 @@ curl --fail --silent --show-error \
   --connect-to cyberailabs.team:443:10.155.1.24:3030 \
   https://cyberailabs.team/healthz
 ```
+
+실제 execution bridge도 확인한다.
+
+```bash
+docker network inspect platform-jupyter-compose-production \
+  --format 'internal={{.Internal}} ipv6={{.EnableIPv6}} options={{json .Options}} labels={{json .Labels}} ipam={{json .IPAM.Config}}'
+network_id="$(docker network inspect platform-jupyter-compose-production --format '{{.Id}}')"
+bridge_name="br-${network_id:0:12}"
+ip -4 -o address show dev "${bridge_name}"
+ip -6 -o address show scope global dev "${bridge_name}"
+```
+
+두 address 명령의 출력은 비어 있어야 한다. option은 Engine 28+에서
+`enable_icc+IPv4/IPv6 isolated`, Engine 27에서 `enable_icc+inhibit_ipv4` exact set이어야
+한다. 실제 workspace에서도
+host·사내망·metadata·direct IP/DNS egress가 실패하고 승인 proxy만 성공하는지 확인한다.
 
 그다음 실제 허용된 사내 PC에서 다음 smoke test를 수행한다.
 

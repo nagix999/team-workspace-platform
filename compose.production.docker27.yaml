@@ -1,0 +1,8 @@
+# Compatibility overlay for Docker Engine 27.1.2 through 27.x. The production
+# operator script selects this file automatically and requires Compose 2.24.4+
+# so the mapping is replaced rather than merged with the Engine 28 options.
+networks:
+  jupyter:
+    driver_opts: !override
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.inhibit_ipv4: "true"

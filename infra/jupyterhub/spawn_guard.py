@@ -45,6 +45,10 @@ SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 VOLUME_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
 ENVIRONMENT_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 ENVIRONMENT_DIGEST_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
+DOCKER_STABLE_VERSION_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:\+[0-9A-Za-z][0-9A-Za-z._-]*|-[0-9][0-9A-Za-z._+~:-]*)?$"
+)
 
 MAX_ENVIRONMENT_VARIABLES = 128
 MAX_ENVIRONMENT_VALUE_BYTES = 16 * 1024
@@ -113,7 +117,11 @@ COMPOSE_INTERNAL_NETWORK_POLICY = "compose-internal-trusted-v1"
 LEGACY_HOST_FIREWALL_NETWORK_POLICY = "legacy-host-firewall-v1"
 UNLIMITED_DOCKER_VOLUME_STORAGE_POLICY = "docker-volume-unlimited-v1"
 LEGACY_XFS_QUOTA_STORAGE_POLICY = "legacy-xfs-project-quota-v1"
-COMPOSE_INTERNAL_NETWORK_OPTIONS = {
+COMPOSE_INTERNAL_INHIBIT_IPV4_OPTIONS = {
+    "com.docker.network.bridge.enable_icc": "true",
+    "com.docker.network.bridge.inhibit_ipv4": "true",
+}
+COMPOSE_INTERNAL_ISOLATED_OPTIONS = {
     "com.docker.network.bridge.enable_icc": "true",
     "com.docker.network.bridge.gateway_mode_ipv4": "isolated",
     "com.docker.network.bridge.gateway_mode_ipv6": "isolated",
@@ -511,9 +519,27 @@ def _canonical_network(value: Any, where: str) -> ipaddress.IPv4Network:
     return network
 
 
+def validate_docker_server_version(value: Any) -> tuple[int, int, int]:
+    """Return a stable Linux Docker Engine version supported by this policy."""
+
+    if not isinstance(value, dict) or value.get("Os") != "linux":
+        raise SpawnGuardError("Docker server platform is unsupported")
+    raw_version = value.get("Version")
+    if not isinstance(raw_version, str):
+        raise SpawnGuardError("Docker server version is invalid")
+    matched = DOCKER_STABLE_VERSION_RE.fullmatch(raw_version)
+    if matched is None:
+        raise SpawnGuardError("Docker server version is invalid")
+    version = tuple(int(part) for part in matched.groups()[:3])
+    if version < (27, 1, 2):
+        raise SpawnGuardError("Docker Engine 27.1.2 or newer is required")
+    return version
+
+
 def validate_compose_internal_network(
     inspected: Any,
     *,
+    docker_server_version: tuple[int, int, int],
     network_name: str,
     subnet: str,
     dynamic_ip_range: str,
@@ -536,7 +562,14 @@ def validate_compose_internal_network(
         raise SpawnGuardError("Docker execution network identity is unsafe")
 
     options = inspected.get("Options")
-    if options != COMPOSE_INTERNAL_NETWORK_OPTIONS:
+    if options == COMPOSE_INTERNAL_INHIBIT_IPV4_OPTIONS:
+        pass
+    elif options == COMPOSE_INTERNAL_ISOLATED_OPTIONS:
+        if docker_server_version < (28, 0, 0):
+            raise SpawnGuardError(
+                "Docker isolated gateway mode requires Engine 28 or newer"
+            )
+    else:
         raise SpawnGuardError("Docker execution network isolation options drifted")
     labels = inspected.get("Labels")
     if not isinstance(labels, dict) or any(
@@ -610,11 +643,17 @@ async def assert_network_policy(spawner: Any) -> None:
     if config.network_policy_mode != COMPOSE_INTERNAL_NETWORK_POLICY:
         raise SpawnGuardError("execution network policy mode is unsupported")
     try:
+        version_info = await spawner.docker("version")
+    except Exception:
+        raise SpawnGuardError("Docker server version is unavailable") from None
+    docker_server_version = validate_docker_server_version(version_info)
+    try:
         inspected = await spawner.docker("inspect_network", config.network_name)
     except Exception:
         raise SpawnGuardError("Docker execution network is unavailable") from None
     validate_compose_internal_network(
         inspected,
+        docker_server_version=docker_server_version,
         network_name=config.network_name,
         subnet=config.network_subnet,
         dynamic_ip_range=config.network_dynamic_ip_range,

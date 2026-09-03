@@ -29,7 +29,7 @@ Gateway의 source CIDR allowlist로 적용한다.
 
 - 서버 담당자: `10.155.1.24` Linux/Docker/디스크/backup
 - 네트워크 담당자: `123.214.65.254:443 → 10.155.1.24:3030` TCP 전달
-- DNS 담당자: HostingKR의 apex, `platform`, `*` A record와 DNS-01 TXT
+- DNS 담당자: HostingKR의 apex와 `*` A record, 선택적 `platform` A record, DNS-01 TXT
 - 인증서 담당자: 발급, 만료 알림, 갱신과 개인키 보관
 - 서비스 관리자: `PLATFORM_ADMIN_USERNAME`과 사용자 등록/퇴사 처리
 - 접근정책 담당자: 회사/VPN 원본 CIDR 또는 VIP의 정확한 SNAT CIDR
@@ -50,8 +50,9 @@ disk 고갈 감시와 새 환경 생성 중단 절차가 필수다.
 운영 서버에 다음이 필요하다.
 
 - Linux 전용 호스트
-- Docker Engine 28 이상
-- Docker Compose v2
+- Docker Engine 27.1.2 이상(기능 호환 하한)
+- Docker Engine 27.5.1 이상 또는 현재 지원되는 최신 보안 패치 release 강력 권장
+- Docker Compose v2; Engine 27은 compatibility overlay의 `!override`를 지원하는 2.24.4 이상
 - Git, Make, Python 3.10 이상, OpenSSL, curl, `flock`(util-linux)
 - DNS 확인용 `dig` 또는 동등 도구
 - 인증서 발급용 Certbot 또는 호환 ACME client
@@ -72,6 +73,10 @@ git --version
 Docker daemon 접근을 위해 운영자를 `docker` 그룹에 추가했다면 완전히 로그아웃한 뒤 다시
 로그인한다. Docker socket 권한은 사실상 host root 권한이므로 일반 사용자에게 부여하지 않는다.
 
+플랫폼은 host firewall rule을 설치하지 않지만 Docker daemon의 bridge firewall/netfilter
+관리는 필요하다. Docker daemon을 `iptables=false` 같은 firewall 비활성 설정으로 실행하지
+않는다. 조직 표준 daemon 설정과 실제 packet 차단은 서버 담당자가 검토한다.
+
 서버 주소와 3030 port도 확인한다.
 
 ```bash
@@ -85,7 +90,8 @@ ss -ltnp
 ## 3. 검토된 소스코드 배치
 
 임의의 최신 `main` 대신 검토한 release tag 또는 commit을 사용한다. 배포 tag는
-`compose.production.yaml`과 이 문서를 포함해야 한다. 아래
+`compose.production.yaml`, `compose.production.docker27.yaml`, `scripts/production.sh`,
+`scripts/validate_production_network.py`와 이 문서를 포함해야 한다. 아래
 `REVIEWED_RELEASE_TAG` 문자열을 그대로 실행하지 않는다.
 
 ```bash
@@ -100,21 +106,26 @@ git status --short
 `git status --short` 출력이 없어야 한다. 운영 서버에서 소스코드를 직접 수정하지 않는다.
 release에 서명이나 조직 checksum이 있다면 이 단계에서 함께 검증한다.
 
-운영용 Compose는 `compose.production.yaml` 단독으로 사용한다. `compose.yaml`이나
-`compose.domain-test.yaml`과 합치지 않는다.
+운영용 Compose는 `make production-*`/`scripts/production.sh`로만 조작한다. 스크립트가 Engine
+28+에서 base `compose.production.yaml`만, Engine 27에서 base와
+`compose.production.docker27.yaml`을 자동 선택한다. `compose.yaml`이나
+`compose.domain-test.yaml`과 합치지 않고 Engine 27에서 base만 직접 실행하지 않는다.
 
 ## 4. DNS와 VIP 설정
 
 HostingKR 권한 DNS에 다음 A record를 둔다.
 
-| 이름 | 유형 | 값 |
-| --- | --- | --- |
-| `@` 또는 빈 이름 | A | `123.214.65.254` |
-| `platform` | A | `123.214.65.254` |
-| `*` | A | `123.214.65.254` |
+| 이름 | 유형 | 값 | 필요 여부 |
+| --- | --- | --- | --- |
+| `@` 또는 빈 이름 | A | `123.214.65.254` | 필수 |
+| `*` | A | `123.214.65.254` | 필수 |
+| `platform` | A | `123.214.65.254` | 선택 |
 
-이 구성에서는 Hub가 apex를 사용하므로 `hub` 또는 `*.hub` record가 필요하지 않다. 임의 사용자
-ID가 한 단계 wildcard에 매칭된다.
+별도 `platform` A record는 없어도 된다. `platform` 이름에 다른 record가 전혀 없으면 root
+wildcard가 `platform.cyberailabs.team`에도 응답한다. `platform` 이름에 record를 따로 둔다면
+wildcard에 기대지 말고 그 이름도 같은 VIP로 해석되게 한다. 포털 URL은 record 유무와 무관하게
+계속 `https://platform.cyberailabs.team`이다. Hub가 apex를 사용하므로 `hub` 또는 `*.hub`
+record도 필요하지 않다. 임의 사용자 ID가 한 단계 wildcard에 매칭된다.
 
 ```bash
 dig +short A cyberailabs.team
@@ -178,25 +189,23 @@ sudo certbot certonly \
   --agree-tos \
   -m YOUR_REAL_EMAIL \
   -d cyberailabs.team \
-  -d platform.cyberailabs.team \
   -d '*.cyberailabs.team'
 ```
 
 Certbot이 멈추면 HostingKR의 **네임서버/DNS → 새 DNS 레코드 추가**에서 TXT를 선택하고
-화면에 표시된 이름과 값을 정확히 등록한다. 보통 다음 이름을 사용한다.
+화면에 표시된 이름과 값을 정확히 등록한다. apex와 wildcard challenge 모두 보통 다음 이름을
+사용한다.
 
 ```text
 _acme-challenge.cyberailabs.team
-_acme-challenge.platform.cyberailabs.team
 ```
 
 apex와 wildcard가 서로 다른 TXT 값을 같은 `_acme-challenge` 이름에 요구할 수 있다. 이때
 기존 값을 덮어쓰지 말고 두 TXT 값을 동시에 유지한다. HostingKR가 zone suffix를 자동으로
-붙이는 화면이면 이름 칸에는 `_acme-challenge` 또는 `_acme-challenge.platform`만 입력한다.
+붙이는 화면이면 이름 칸에는 `_acme-challenge`만 입력한다.
 
 ```bash
 dig +short TXT _acme-challenge.cyberailabs.team
-dig +short TXT _acme-challenge.platform.cyberailabs.team
 ```
 
 Certbot이 요청한 모든 값이 보인 뒤 Enter를 누른다. 발급 성공 후 challenge TXT는 제거할 수
@@ -244,11 +253,12 @@ getent group team-workspace-tls
 stat -c '%a %U:%G %n' /etc/team-workspace/tls/privkey.pem
 ```
 
-SAN에는 다음 세 값이 모두 있어야 한다.
+SAN에는 다음 두 값이 모두 있어야 한다. `*.cyberailabs.team`이
+`platform.cyberailabs.team`과 한 단계 사용자 hostname을 모두 보호하므로 portal SAN을 따로
+요청하지 않는다.
 
 ```text
 DNS:cyberailabs.team
-DNS:platform.cyberailabs.team
 DNS:*.cyberailabs.team
 ```
 
@@ -353,7 +363,9 @@ make production-preflight
 사전검사는 다음을 fail-closed로 확인한다.
 
 - 서버가 `10.155.1.24`를 실제 보유함
-- 인증서/개인키 일치, key mode/GID, 24시간 이상 유효, 세 SAN
+- Docker Server Engine이 기능 호환 하한 27.1.2 이상임; 27.5.1 미만 경고를 검토함
+- Engine 27이면 Docker Compose 2.24.4+와 compatibility overlay 렌더링이 유효함
+- 인증서/개인키 일치, key mode/GID, 24시간 이상 유효, apex/wildcard 두 SAN
 - 유효하고 비어 있지 않은 source CIDR allowlist
 - 실행 중 single-user container와 local/domain-test stack 부재
 - Platform/Hub DB volume이 둘 다 존재하거나 둘 다 존재하지 않음
@@ -378,14 +390,37 @@ make production-ps
 
 `production-up`은 preflight를 다시 실행하고 다음 순서로 진행한다.
 
-1. 기존 DB가 있으면 Platform/Hub SQLite online backup 생성
-2. production profile policy를 exact single-user image ID에 결속
-3. Alembic migration과 profile import
-4. API, Hub, reconciler, worker, frontend, proxy, Gateway 시작
-5. container health와 서버 내부 HTTPS health 확인
+1. Host·TLS·Engine/Compose·image/Compose 계약과 DB idle을 다시 사전 검사
+2. 기존 Gateway와 제어면 내부 service를 중지하고 DB idle을 다시 확인
+3. 기존 DB가 있으면 Platform/Hub SQLite online backup 생성
+4. Production profile policy를 exact single-user image ID에 결속하고 Alembic migration과
+   profile import 실행
+5. API, JupyterHub, reconciler, worker, frontend, egress proxy 등 내부 service를 먼저
+   시작하고 health 대기
+6. Live execution network의 exact option/label/IPAM/reserved endpoint, host bridge 주소 부재와
+   non-root·no-capability·no-default-route probe를 검증
+7. 6번이 통과한 뒤에만 Gateway를 publish/start하고 HTTPS health 확인
+
+6번이 실패하면 Gateway는 시작되지 않아 잘못된 execution network 상태가 외부에
+공개되지 않는다. Gateway 시작 후 HTTPS health가 실패하면 스크립트가 Gateway를
+다시 중지한다.
 
 새 설치면 DB volume 두 개를 새로 만든다. 기존 운영 DB 변경 뒤 실패하면 script가 출력한 backup
 경로를 보존하고 무작정 `production-up`을 반복하지 않는다.
+
+`production-up`은 Engine major version을 검사해 network 정의를 자동 선택한다. Engine 28+은
+base Compose의 `internal=true`, IPv6 off, ICC on, IPv4/IPv6 isolated-gateway exact set을
+사용한다. Engine 27은 compatibility overlay의 `!override`로 base `driver_opts` 전체를
+ICC on과 `inhibit_ipv4=true` exact set으로 교체한다. Preflight와 live validator는 현재
+Engine에 해당하는 exact set만 허용한다.
+
+Base의 Engine 28 isolated 정의를 그대로 유지하므로 기존 28 운영 network은 config 차이
+없이 계속 사용된다. 이는 Compose의 불필요한 immutable-network 재생성과 network ID
+변경을 피한다. 실행 중 network의 option을 수동 수정하거나 network를 삭제하지 않는다.
+
+27.1.2는 현재 지원·보안 권장 release가 아니라 기존 host의 기능 호환 하한이다. Preflight가
+27.5.1 미만 경고를 출력해도 다른 계약이 모두 맞으면 진행할 수 있지만, 경고를 변경 기록에
+남기고 가능한 즉시 27.5.1 이상 또는 조직이 승인한 현재 지원 release로 upgrade한다.
 
 상태는 모든 장기 실행 service가 healthy이고 worker가 running이어야 한다. `migrate`,
 `bootstrap-profile`, `singleuser-image`는 exit code 0인 one-shot container다.
@@ -393,9 +428,28 @@ make production-ps
 상세 로그는 다음으로 본다.
 
 ```bash
-docker compose --env-file .env.production -f compose.production.yaml \
-  logs --tail=200 api jupyterhub reconciler worker gateway egress-proxy
+make production-logs
 ```
+
+`production-logs`는 Engine 27 overlay를 자동 적용하고 최근 200줄을 follow한다. 종료할 때
+`Ctrl-C`를 눌러도 service는 중지되지 않는다.
+
+정적 Compose 렌더링과 container health만으로 실행망 격리를 판단하지 않는다. 실제 운영 host에서
+live network와 bridge 주소를 확인한다.
+
+```bash
+docker network inspect platform-jupyter-compose-production \
+  --format 'internal={{.Internal}} ipv6={{.EnableIPv6}} options={{json .Options}} labels={{json .Labels}} ipam={{json .IPAM.Config}}'
+network_id="$(docker network inspect platform-jupyter-compose-production --format '{{.Id}}')"
+bridge_name="br-${network_id:0:12}"
+ip -4 -o address show dev "${bridge_name}"
+ip -6 -o address show scope global dev "${bridge_name}"
+```
+
+두 `ip ... address` 명령은 아무 주소도 출력하지 않아야 한다. `Options`는 Engine 28+에서
+`enable_icc=true + gateway_mode_ipv4/ipv6=isolated`, Engine 27에서
+`enable_icc=true + inhibit_ipv4=true` exact set이어야 한다. 다른 option, IPv4
+주소 또는 routable IPv6 주소가 보이면 공개하지 않는다.
 
 ## 12. 최초 관리자와 사용자 계정 생성
 
@@ -440,7 +494,7 @@ curl --fail --silent --show-error https://alice.cyberailabs.team/healthz
 ```
 
 - 세 주소 모두 공개 CA 신뢰 오류 없이 200
-- 인증서의 apex/portal/wildcard SAN 확인
+- 인증서의 apex/wildcard SAN과 portal/user hostname의 wildcard 적용 확인
 - 등록하지 않은 nested hostname과 잘못된 Host/SNI 거부
 - 회사/VPN 밖 source는 연결 거부
 - Gateway 외 host published port 없음
@@ -463,6 +517,7 @@ curl --fail --silent --show-error https://alice.cyberailabs.team/healthz
 - `/home/jovyan/work` private data 영속성
 - `/home/jovyan/shared` 팀 공유 read/write와 재시작 후 보존
 - 직접 사내망/인터넷 연결 차단 및 승인된 PyPI/Git만 proxy를 통해 성공
+- host gateway·host 관리 주소·metadata·직접 DNS 연결 차단
 - 중지, 재시작, 관리자 cross-user 열기/중지와 감사 이벤트
 - 삭제 후 named server 제거, private volume wipe/re-provision 및 UI 수렴
 
@@ -479,8 +534,7 @@ curl --fail --silent --show-error https://alice.cyberailabs.team/healthz
 
 ```bash
 make production-ps
-docker compose --env-file .env.production -f compose.production.yaml \
-  logs --since=30m api jupyterhub reconciler worker gateway
+make production-logs
 df -h
 df -i
 docker system df
@@ -528,14 +582,13 @@ sudo mv /etc/team-workspace/tls/privkey.pem.new \
 
 ```bash
 make production-preflight
-docker compose --env-file .env.production -f compose.production.yaml \
-  up -d --no-deps --force-recreate gateway
+make production-recreate-gateway
 curl --fail --silent --show-error https://platform.cyberailabs.team/healthz
 ```
 
-장기적으로는 등록업체를 이전하지 않고도 `_acme-challenge`와
-`_acme-challenge.platform`만 DNS API가 있는 validation zone으로 CNAME/NS 위임해 갱신을
-자동화할 수 있다. DNS API key는 전체 zone 권한이 아닌 최소 권한을 사용한다.
+장기적으로는 등록업체를 이전하지 않고도 `_acme-challenge`를 DNS API가 있는 validation
+zone으로 CNAME/NS 위임해 갱신을 자동화할 수 있다. DNS API key는 전체 zone 권한이 아닌 최소
+권한을 사용한다.
 
 ## 16. 애플리케이션 업그레이드
 
@@ -600,7 +653,9 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 | TLS file이 symlink라 거부됨 | Certbot `live`를 직접 지정하지 말고 전용 regular file로 복사 |
 | `PLATFORM_TLS_GID does not match` | key의 숫자 GID와 `.env.production` 비교 |
 | 외부에서 444/timeout | source/SNAT CIDR, VIP ACL, ingress allowlist 확인 |
-| 인증서 SAN 누락 | apex, explicit `platform`, wildcard 세 SAN으로 재발급 |
+| 인증서 SAN 누락 | apex와 wildcard 두 SAN으로 재발급 |
+| Docker/Compose version 거부 | Engine 27.1.2 미만은 차단; Engine 27은 Compose 2.24.4+ 확인; 27.5.1 미만 경고와 upgrade 계획 검토 |
+| execution network option drift | Engine 28+ isolated / Engine 27 overlay 선택 확인; 수동 주석·삭제 금지, 모든 workspace를 정상 중지한 점검 창에서만 복구 판단 |
 | preflight가 local stack을 발견 | local/domain-test workspace와 stack을 정상 종료 |
 | image build/pull 실패 | 운영 host build-time DNS/HTTPS와 registry 접근 확인 |
 | Hub/reconciler unhealthy | 해당 service log, secret mode/GID, DB migration 확인 |
@@ -614,12 +669,14 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 ## 19. 최종 Go/No-Go 체크리스트
 
 - [ ] 검토된 release tag/commit이며 working tree가 깨끗함
-- [ ] Docker Engine 28+, Compose v2 확인
+- [ ] Docker Server Engine 27.1.2+, Engine 27이면 Compose 2.24.4+, Docker firewall 관리 활성 확인
+- [ ] Engine 27.5.1 미만 경고를 기록하고 최신 보안 patch로 올릴 일정 확인
 - [ ] 서버가 `10.155.1.24`를 보유하고 3030 충돌 없음
-- [ ] DNS apex/portal/random wildcard가 VIP를 반환
+- [ ] DNS apex와 root wildcard를 통한 portal/random hostname이 VIP를 반환
 - [ ] VIP 443→host 3030 L4 전달과 source IP/SNAT 계약 확인
-- [ ] 인증서 SAN 세 개, key mode/GID, 만료 경보 확인
+- [ ] 인증서 apex/wildcard SAN 두 개, key mode/GID, 만료 경보 확인
 - [ ] 회사/VPN CIDR allowlist와 상위 ACL 확인
+- [ ] live execution network option, host bridge IPv4/routable IPv6 주소 부재와 Docker restart 후 연결 차단 확인
 - [ ] CPU/RAM ceiling에 control-plane/OS 여유 포함
 - [ ] egress domain과 blocked-user 정책 검토
 - [ ] `make production-preflight` 성공
