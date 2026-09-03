@@ -103,7 +103,9 @@ services:
       args:
         JUPYTERHUB_BASE_IMAGE: quay.io/jupyterhub/jupyterhub@sha256:f91ed45a0d2333de2ed9f5d708ad6f18a2fb79547526fbaaa19e88fd44fcab71
         ALLOW_MUTABLE_BASE_IMAGE: "false"
-    image: team-workspace-jupyterhub:production
+    # Keep operator tooling on a separate tag so building a password-reset
+    # helper cannot partially upgrade the running JupyterHub image.
+    image: team-workspace-jupyterhub-admin:production
     entrypoint: ["python", "/etc/jupyterhub/native_user_admin.py"]
     command:
       - --database

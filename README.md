@@ -5,7 +5,7 @@
 Compose를 결합해 소규모 팀이 하나의 Linux 호스트에서 개발환경을 일관되게 제공하는 것을
 목표로 합니다.
 
-> **현재 상태: v0.1.4 Technical Preview**
+> **현재 상태: v0.1.5 Technical Preview**
 >
 > 로컬 통합환경과 `cyberailabs.team` 단일 호스트 운영 구성을 함께 제공합니다. 운영 구성도
 > 조직의 TLS 인증서, 접근 CIDR, VIP/NAT와 백업 책임을 대신하지 않으므로 실제 공개 전에는
@@ -463,6 +463,7 @@ make production-restore BACKUP=/absolute/path/to/verified-backup-bundle
 | `make production-logs` | Engine별 Compose 선택을 적용한 운영 로그 follow |
 | `make production-recreate-gateway` | TLS 교체 후 Gateway 강제 재생성·health 검증 |
 | `make production-bootstrap-admin` | fresh 운영 DB의 최초 관리자 계정 생성 |
+| `make production-reset-admin-password` | 기존 운영 관리자 비밀번호 안전 재설정 |
 | `make production-create-user USERNAME=alice` | signup을 열지 않고 승인 사용자 생성 |
 
 ## 저장소 구조
@@ -550,6 +551,10 @@ make test
 실시간 execution-network/bridge 검증을 추가합니다.
 `v0.1.4`는 HTTP listener가 없는 operation worker에 명시적인 process-liveness healthcheck를
 추가해 지원 범위의 Docker Compose에서 `production-up --wait`가 안정적으로 동작하게 합니다.
+`v0.1.5`는 기존 관리자 bootstrap에서 새 비밀번호가 무시될 수 있던 모호한 재실행을 거부하고,
+DB backup과 control-plane 검증을 포함한 별도 관리자 비밀번호 재설정 절차를 추가합니다. 또한
+SQLite backup의 transient-lock 재시도와 Alpine frontend의 Rollup optional package 설치를
+안정화합니다.
 `0.x` 기간에는 API, migration과 운영 절차가 호환성 없이 변경될 수 있습니다. runtime profile
 같은 실행 정책은 기존 row를 직접 수정하지 않고 새 version으로 추가하는 원칙을 유지합니다.
 

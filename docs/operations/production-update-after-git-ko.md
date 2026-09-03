@@ -212,7 +212,11 @@ host·사내망·metadata·direct IP/DNS egress가 실패하고 승인 proxy만 
 6. 일반/secret 환경변수 변경 후 restart 안내와 재시작 적용 확인
 7. workspace 중지 및 테스트용 workspace 삭제 수렴 확인
 
-## 6. 최초 설치에서만 수행할 작업
+## 6. 운영 계정 관리
+
+계정 명령을 실행하기 전에 모든 workspace를 중지하고 운영 stack의 Gateway/API/Frontend/
+Egress proxy/Hub/Worker/Reconciler가 모두 실행 중이고 healthy인지 확인한다. 작업 중에는 Gateway와
+DB writer가 잠시 중지되므로 짧은 유지보수 중단이 발생한다.
 
 새 DB를 만든 첫 배포에만 최초 관리자 계정을 만든다.
 
@@ -227,10 +231,34 @@ make production-bootstrap-admin
 make production-create-user USERNAME=alice
 ```
 
+이미 생성된 운영 관리자의 비밀번호를 모르면 bootstrap을 반복하지 않고 다음을 사용한다.
+
+```bash
+make production-reset-admin-password
+```
+
+이 명령은 `.env.production`의 관리자만 대상으로 하고, 비밀번호를 argv·환경변수·로그에 남기지
+않으며 Platform/Hub DB backup 뒤 NativeAuthenticator password hash 한 열만 갱신한다. 현재
+checkout에서 관리자 도구만 별도 image로 만들고 기존 장기 실행 container를 그대로 재시작하므로,
+전체 release 반영은 별도의 `production-preflight`와 `production-up` 절차로 진행한다.
+
+재설정 완료 후 새 private browser 창에서 새 비밀번호로 로그인해 확인한다. 이 절차는 비밀번호
+분실 복구용이며 기존 Hub cookie, OAuth/API token, 포털 session을 강제로 철회하지 않는다.
+credential 유출이 의심되면 이 명령만으로 사고 대응을 끝내지 말고 별도의 session/token 폐기
+절차를 수행한다.
+
+운영 변경기록에는 작업 시각, OS 운영자, 대상 username, Git commit, 출력된 backup 경로와
+결과를 남긴다. 비밀번호나 password hash는 기록하지 않는다.
+
 ## 7. 실패 시 처리
 
 DB mutation 전에 실패하면 배포 스크립트가 원래 실행 중이던 service를 재시작한다. 원인을
 로그에서 확인한 뒤 수정한다.
+
+비밀번호 도구 성공 뒤 runtime 복구만 실패하면 `administrator password hash was committed`가
+출력된다. 이 경우 같은 reset을 반복하지 말고 먼저 Gateway와 각 service의 현재 상태를 확인한다.
+health가 완전히 복구되지 않았다면 Gateway를 닫아 둔 채 원인을 확인한 후
+`production-preflight`와 `production-up`으로 정상 배포·health를 복구한다.
 
 `team-workspace-production-worker-1 has no healthcheck configured`가 나오면 worker 장애나
 workspace busy 상태가 아니라, worker healthcheck가 빠진 과거 Compose 파일과 `--wait`가 함께

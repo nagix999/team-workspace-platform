@@ -454,9 +454,10 @@ ip -6 -o address show scope global dev "${bridge_name}"
 
 ## 12. 최초 관리자와 사용자 계정 생성
 
-production에서는 웹 signup을 항상 닫는다. 새 DB에서 관리자를 만들기 위해 공개 Gateway와
-Hub/worker/reconciler를 잠시 중지하고, 비밀번호를 argv·환경변수·로그에 남기지 않는 one-shot
-도구를 사용한다.
+production에서는 웹 signup을 항상 닫는다. 계정 작업 전에 모든 workspace를 중지하고 운영
+stack의 Gateway/API/Frontend/Egress proxy/Hub/Worker/Reconciler가 모두 실행 중이고 healthy인지
+확인한다. 새 DB에서 관리자를 만들기 위해 공개 Gateway와 DB writer를 잠시 중지하고, 비밀번호를
+argv·환경변수·로그에 남기지 않는 one-shot 도구를 사용한다.
 
 ```bash
 make production-bootstrap-admin
@@ -465,8 +466,33 @@ make production-bootstrap-admin
 프롬프트에서 `.env.production`의 `PLATFORM_ADMIN_USERNAME`용 비밀번호를 두 번 입력한다.
 비밀번호는 12자 이상, common-password denylist 밖이어야 하며 UTF-8 72 byte를 넘지 않는다.
 초기 관리자 bootstrap은 NativeAuthenticator 사용자 표가 비어 있을 때만 성공하고 기존 행을
-덮어쓰지 않는다. 변경 전 Platform/Hub DB online backup을 만들며, 작업 후 control plane과
+덮어쓰지 않는다. 기존 계정에 다른 비밀번호를 넣어 재실행하면 비밀번호가 바뀌지 않았음을
+명시하고 실패한다. 변경 전 Platform/Hub DB online backup을 만들며, 작업 후 control plane과
 Gateway를 다시 healthy 상태로 시작한다.
+
+기존 관리자 비밀번호를 모르면 bootstrap을 반복하지 않고 다음 전용 명령을 실행한다.
+
+```bash
+make production-reset-admin-password
+```
+
+명령은 `.env.production`의 정확한 관리자 ID만 대상으로 하며 새 비밀번호를 터미널에서 두 번
+입력받는다. Gateway와 DB writer를 닫고 두 DB를 backup한 뒤, 승인 상태와 Hub의 admin bit가
+모두 맞는 단일 계정의 password hash만 transaction으로 교체한다. 기존 장기 실행 container를
+재생성하지 않고 같은 container ID로 복원하며, 완료 후 Hub가 재시작되므로 이전 로그인 실패
+횟수에 따른 일시 잠금도 초기화된다. 작업 중에는 짧은 유지보수 중단이 발생한다.
+
+재설정 완료 후 새 private browser 창에서 새 비밀번호로 로그인해 확인한다. 이 절차는 비밀번호
+분실 복구용이며 기존 Hub cookie, OAuth/API token, 포털 session을 강제로 철회하지 않는다.
+credential 유출이 의심되면 별도의 session/token 폐기 절차가 필요하다.
+
+운영 변경기록에는 작업 시각, OS 운영자, 대상 username, Git commit, 출력된 backup 경로와
+결과를 남기고 비밀번호나 password hash는 기록하지 않는다.
+
+비밀번호 hash commit 뒤 runtime 복구만 실패했다는 메시지가 나오면 reset을 반복하지 않는다.
+Gateway와 각 service의 현재 상태를 먼저 확인하고, health가 완전히 복구되지 않았다면 Gateway를
+닫아 둔 채 원인을 확인한 뒤 `make production-preflight`와 `make production-up`으로 정상
+배포·health를 복구한다.
 
 일반 사용자는 운영자가 exact username을 지정해 사전 승인 계정으로 만든다.
 

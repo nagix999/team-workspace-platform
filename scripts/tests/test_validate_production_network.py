@@ -135,9 +135,9 @@ class DeclarativeNetworkContractTests(unittest.TestCase):
         gateway = inspected_network()
         gateway["IPAM"]["Config"][0]["Gateway"] = "172.40.0.1"
         extra_option = inspected_network()
-        extra_option["Options"]["com.docker.network.bridge.enable_ip_masquerade"] = (
-            "true"
-        )
+        extra_option["Options"][
+            "com.docker.network.bridge.enable_ip_masquerade"
+        ] = "true"
         for inspected in (gateway, extra_option):
             with self.assertRaises(network_contract.ContractError):
                 network_contract.validate_network_configuration(
@@ -325,13 +325,32 @@ class ProductionOrchestrationContractTests(unittest.TestCase):
             recreate.index("start_gateway_checked --force-recreate"),
         )
         self.assertLess(
-            account_restart.index("compose up -d --wait jupyterhub"),
+            account_restart.index("start_existing_container_checked api"),
+            account_restart.index("start_existing_container_checked jupyterhub"),
+        )
+        self.assertLess(
+            account_restart.index("start_existing_container_checked jupyterhub"),
             account_restart.index("production_network_contract validate"),
         )
         self.assertLess(
             account_restart.index("production_network_contract validate"),
-            account_restart.index("start_gateway_checked"),
+            account_restart.index("start_existing_container_checked gateway"),
         )
+        self.assertLess(
+            account_restart.index("start_existing_container_checked gateway"),
+            account_restart.index("validate_gateway_health"),
+        )
+        self.assertIn("stop_existing_container_checked gateway", account_restart)
+        self.assertNotIn("compose up", account_restart)
+
+    def test_gateway_health_requires_both_public_hosts(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        health = script.split("validate_gateway_health() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertEqual(health.count("curl --fail --silent --show-error"), 2)
+        self.assertEqual(health.count("|| return 1"), 2)
+        self.assertIn("https://platform.cyberailabs.team/healthz", health)
+        self.assertIn("https://cyberailabs.team/healthz", health)
 
     def test_engine_27_overlay_replaces_driver_options(self) -> None:
         base = (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
@@ -346,9 +365,7 @@ class ProductionOrchestrationContractTests(unittest.TestCase):
 
     def test_worker_defines_compose_wait_compatible_liveness_check(self) -> None:
         compose = (ROOT / "compose.production.yaml").read_text(encoding="utf-8")
-        worker = compose.split("\n  worker:\n", 1)[1].split(
-            "\n  reconciler:\n", 1
-        )[0]
+        worker = compose.split("\n  worker:\n", 1)[1].split("\n  reconciler:\n", 1)[0]
 
         self.assertNotIn("disable: true", worker)
         self.assertIn(

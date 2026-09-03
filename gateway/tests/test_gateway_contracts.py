@@ -221,6 +221,44 @@ class DomainTestComposeContractTests(unittest.TestCase):
             {("/var/lib/platform", False)},
         )
 
+        native_admin = config["services"]["native-user-admin"]
+        self.assertEqual(native_admin["profiles"], ["operator"])
+        self.assertEqual(
+            native_admin["entrypoint"],
+            ["python", "/etc/jupyterhub/native_user_admin.py"],
+        )
+        self.assertEqual(
+            native_admin["image"], "team-workspace-jupyterhub-admin:production"
+        )
+        self.assertNotEqual(
+            native_admin["image"], config["services"]["jupyterhub"]["image"]
+        )
+        self.assertEqual(native_admin["network_mode"], "none")
+        self.assertNotIn("ports", native_admin)
+        self.assertNotIn("environment", native_admin)
+        self.assertTrue(native_admin["read_only"])
+        self.assertEqual(native_admin["cap_drop"], ["ALL"])
+        self.assertEqual(
+            {
+                (mount["target"], mount.get("read_only", False))
+                for mount in native_admin["volumes"]
+            },
+            {("/srv/jupyterhub", False)},
+        )
+        native_database_mount = next(
+            mount
+            for mount in native_admin["volumes"]
+            if mount["target"] == "/srv/jupyterhub"
+        )
+        hub_database_mount = next(
+            mount
+            for mount in config["services"]["jupyterhub"]["volumes"]
+            if mount["target"] == "/srv/jupyterhub"
+        )
+        self.assertEqual(native_database_mount["type"], "volume")
+        self.assertEqual(native_database_mount["source"], hub_database_mount["source"])
+        self.assertEqual(native_database_mount["source"], "jupyterhub_data")
+
 
 class ProductionTransitionContractTests(unittest.TestCase):
     def test_candidate_policy_backup_and_migration_order_is_fail_closed(self) -> None:
@@ -312,9 +350,7 @@ class ProductionTransitionContractTests(unittest.TestCase):
     def test_mutating_production_commands_share_an_operator_lock(self) -> None:
         script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
         self.assertIn("flock -n", script)
-        preflight_body = script.split("preflight() {", 1)[1].split(
-            "\nstart() {", 1
-        )[0]
+        preflight_body = script.split("preflight() {", 1)[1].split("\nstart() {", 1)[0]
         self.assertIn("acquire_operator_lock", preflight_body)
         self.assertIn("preflight_impl", preflight_body)
         for start_marker, end_marker in (
@@ -334,6 +370,73 @@ class ProductionTransitionContractTests(unittest.TestCase):
         )[0]
         self.assertIn('test -n "$(EXPECTED_COUNT)"', target)
         self.assertIn('PRODUCTION_EXPECTED_COUNT="$(EXPECTED_COUNT)"', target)
+
+    def test_admin_password_reset_reuses_fail_closed_account_maintenance(self) -> None:
+        script = (ROOT / "scripts" / "production.sh").read_text(encoding="utf-8")
+        restart_body = script.split("restart_account_control_plane_checked() {", 1)[
+            1
+        ].split("\nvalidate_host_contract() {", 1)[0]
+        body = script.split("create_user() {", 1)[1].split("\noffline_quiesce() {", 1)[
+            0
+        ]
+
+        self.assertIn("reset-admin-password) create_user reset-admin-password", script)
+        self.assertIn('PRODUCTION_TARGET_USERNAME="${PLATFORM_ADMIN_USERNAME}"', body)
+        self.assertIn("reset_password_flag+=(--reset-admin-password)", body)
+        self.assertNotIn("PRODUCTION_PASSWORD", script)
+        self.assertIn("running_healthy_service_id", body)
+        self.assertIn('original_ids["${service}"]', body)
+        first_trap = body.index('trap "${account_recovery_trap}" EXIT')
+        self.assertLess(
+            body.index("compose --profile operator build native-user-admin"),
+            first_trap,
+        )
+        gateway_stop = body.index(
+            'stop_existing_container_checked gateway "${original_ids[gateway]}"'
+        )
+        api_stop = body.index(
+            'stop_existing_container_checked api "${original_ids[api]}"'
+        )
+        post_stop_idle = body.index("require_idle", api_stop)
+        database_idle = body.index("production_database_is_idle", post_stop_idle)
+        snapshot = body.index("snapshot_existing_databases", database_idle)
+        admin_tool = body.index(
+            "compose --profile operator run --rm --no-deps native-user-admin",
+            snapshot,
+        )
+        backup_required = body.index(
+            '"${PRODUCTION_FRESH_DATABASES}" == false', snapshot
+        )
+        backup_verified = body.index(
+            "domain_test_database_snapshot.py verify", backup_required
+        )
+        committed = body.index("printf -v account_recovery_trap", admin_tool)
+        committed_trap = body.index('trap "${account_recovery_trap}" EXIT', committed)
+        final_restart = body.rindex("restart_account_control_plane_checked")
+        self.assertLess(first_trap, gateway_stop)
+        self.assertLess(gateway_stop, api_stop)
+        self.assertLess(api_stop, post_stop_idle)
+        self.assertLess(post_stop_idle, database_idle)
+        self.assertLess(database_idle, snapshot)
+        self.assertLess(snapshot, backup_required)
+        self.assertLess(backup_required, backup_verified)
+        self.assertLess(backup_verified, admin_tool)
+        self.assertLess(admin_tool, committed)
+        self.assertLess(committed, committed_trap)
+        self.assertLess(committed_trap, final_restart)
+        self.assertEqual(body.count('trap "${account_recovery_trap}" EXIT'), 2)
+        self.assertIn("recover_after_user_admin_failure", restart_body)
+        self.assertIn("trap - EXIT", restart_body)
+        self.assertIn("start_existing_container_checked api", restart_body)
+        self.assertIn("start_existing_container_checked jupyterhub", restart_body)
+        self.assertIn("start_existing_container_checked gateway", restart_body)
+        self.assertNotIn("compose up", restart_body)
+
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        target = makefile.split("production-reset-admin-password:", 1)[1].split(
+            "\nproduction-offline-quiesce-dry-run:", 1
+        )[0]
+        self.assertIn("bash scripts/production.sh reset-admin-password", target)
 
 
 class NginxContractTests(unittest.TestCase):
@@ -701,6 +804,42 @@ class DomainTestDatabaseSnapshotTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     snapshot.execute("PRAGMA quick_check").fetchone(), ("ok",)
+                )
+
+    def test_online_snapshot_succeeds_after_one_transient_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "live.sqlite"
+            output = root / "snapshot.sqlite"
+            self._database(source, "0004")
+            real_connect = self.module._connect_snapshot_source
+            attempts = 0
+
+            def connect_after_transient_lock(path: Path):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return real_connect(path)
+
+            with (
+                mock.patch.object(
+                    self.module,
+                    "_connect_snapshot_source",
+                    side_effect=connect_after_transient_lock,
+                ),
+                mock.patch.object(self.module.time, "sleep") as sleep,
+            ):
+                self.module.snapshot_database(source, output)
+
+            self.assertEqual(attempts, 2)
+            sleep.assert_called_once_with(1)
+            with sqlite3.connect(output) as snapshot:
+                self.assertEqual(
+                    snapshot.execute(
+                        "SELECT version_num FROM alembic_version"
+                    ).fetchone(),
+                    ("0004",),
                 )
 
     def test_group_access_and_symlink_bundle_are_rejected(self) -> None:

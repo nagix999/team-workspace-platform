@@ -371,6 +371,7 @@ def snapshot_database(
                     pass
                 if snapshot.execute("PRAGMA quick_check").fetchone() != ("ok",):
                     raise RuntimeError("snapshot SQLite integrity check failed")
+            last_error = None
             break
         except sqlite3.OperationalError as exc:
             last_error = exc
