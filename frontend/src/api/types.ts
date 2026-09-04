@@ -35,7 +35,7 @@ export interface WorkspaceProfile {
   kernelDisplayName: string;
   pythonVersion: string;
   acceleratorKind: "none" | "nvidia";
-  gpuCount: 0 | 1;
+  gpuCount: number;
   cudaVersion: string | null;
   gpuFramework: "pytorch" | null;
   gpuFrameworkVersion: string | null;
@@ -82,6 +82,15 @@ export type ObservedState =
   | "FAILED"
   | "UNKNOWN";
 
+export interface WorkspaceResourceUsage {
+  cpuMillicores: number;
+  memoryBytes: number;
+  memoryLimitBytes: number;
+  observedAt: string;
+  expiresAt: string;
+  stale: boolean;
+}
+
 export interface Workspace {
   id: string;
   name: string;
@@ -92,7 +101,7 @@ export interface Workspace {
   kernelDisplayName: string | null;
   pythonVersion: string | null;
   acceleratorKind: "none" | "nvidia" | null;
-  gpuCount: 0 | 1 | null;
+  gpuCount: number | null;
   cudaVersion: string | null;
   gpuFramework: "pytorch" | null;
   gpuFrameworkVersion: string | null;
@@ -104,6 +113,7 @@ export interface Workspace {
   observedState: ObservedState;
   progressPercent: number | null;
   stale: boolean;
+  resourceUsage: WorkspaceResourceUsage | null;
   lastErrorCode: string | null;
   lastErrorSummary: string | null;
   createdAt: string | null;
@@ -178,6 +188,17 @@ export interface AdminCapacity {
   memoryBudgetMb: number;
   gpuReservedCount: number;
   gpuBudgetCount: number;
+  usage: AdminResourceUsage | null;
+}
+
+export interface AdminResourceUsage {
+  runningTotal: number;
+  measured: number;
+  unavailable: number;
+  cpuMillicores: number;
+  memoryBytes: number;
+  expiresAt: string;
+  stale: boolean;
 }
 
 export interface ResourcePolicy {
@@ -234,7 +255,7 @@ export interface RuntimeProfileTemplate {
   kernelDisplayName: string;
   pythonVersion: string;
   acceleratorKind: "none" | "nvidia";
-  gpuCount: 0 | 1;
+  gpuCount: number;
   cudaVersion: string | null;
   gpuFramework: "pytorch" | null;
   gpuFrameworkVersion: string | null;

@@ -56,6 +56,7 @@ ACCELERATOR_KEYS = {
     "framework",
     "framework_version",
 }
+MAX_NVIDIA_GPU_COUNT = 64
 V3_PROFILE_KEYS = V2_PROFILE_KEYS | {"accelerator"}
 LEGACY_EXECUTION_FIELDS = tuple(
     sorted(LEGACY_PROFILE_KEYS - {"enabled", "config_digest"})
@@ -179,11 +180,32 @@ def derived_resource_profile_id(
 
 
 def derive_resource_profile(
-    base: dict[str, Any], *, cpu_millicores: int, memory_mb: int
+    base: dict[str, Any],
+    *,
+    cpu_millicores: int,
+    memory_mb: int,
+    gpu_count: int | None = None,
 ) -> dict[str, Any]:
     profile = dict(base)
+    accelerator = accelerator_contract(base)
+    if gpu_count is not None:
+        if type(gpu_count) is not int:
+            raise ProfilePolicyError("derived GPU count must be an integer")
+        if accelerator is None or accelerator["kind"] == "none":
+            expected_gpu_count = 0
+        elif accelerator["kind"] == "nvidia":
+            expected_gpu_count = accelerator["count"]
+        else:  # pragma: no cover - loaded policies reject this first
+            raise ProfilePolicyError("derived accelerator contract is unsupported")
+        # GPU count is part of the immutable runtime identity. The production
+        # generator emits one reviewed base per count; authorization may select
+        # a base, but must never synthesize a different accelerator contract.
+        if gpu_count != expected_gpu_count:
+            raise ProfilePolicyError(
+                "derived GPU count does not match the immutable runtime base"
+            )
     profile["id"] = derived_resource_profile_id(
-        base, cpu_millicores=cpu_millicores, memory_mb=memory_mb
+        profile, cpu_millicores=cpu_millicores, memory_mb=memory_mb
     )
     profile["version"] = 1
     profile["enabled"] = True
@@ -367,9 +389,9 @@ def _validate_v3_accelerator(profile: dict[str, Any], where: str) -> None:
 
     if kind != "nvidia":
         raise ProfilePolicyError(f"{where}.accelerator.kind is unsupported")
-    if count != 1 or sharing != "exclusive":
+    if not 1 <= count <= MAX_NVIDIA_GPU_COUNT or sharing != "exclusive":
         raise ProfilePolicyError(
-            f"{where}.accelerator NVIDIA contract must request one exclusive GPU"
+            f"{where}.accelerator NVIDIA contract must request 1-64 exclusive GPUs"
         )
     if not isinstance(cuda_version, str) or not CUDA_VERSION_RE.fullmatch(cuda_version):
         raise ProfilePolicyError(f"{where}.accelerator.cuda_version must be exact X.Y")

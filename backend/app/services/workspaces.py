@@ -10,7 +10,7 @@ from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..config import Settings
-from ..accelerators import stored_profile_accelerator
+from ..accelerators import parse_gpu_device_ids_json, stored_profile_accelerator
 from ..db import begin_immediate
 from ..domain import (
     DesiredState,
@@ -30,6 +30,7 @@ from ..models import (
     UserSession,
     Workspace,
     WorkspaceDeletionJob,
+    WorkspaceGpuLease,
     WorkspaceProfile,
     WorkspaceVolumeSlot,
 )
@@ -38,6 +39,12 @@ from ..security import TokenCipher, json_dumps_safe, keyed_hash
 from .profile_offers import resolve_offer
 from .provisioning import active_inventory_is_valid
 from .resource_policy import get_resource_policy, profile_is_allowed
+from .gpu_allocations import (
+    assign_workspace_gpu_devices,
+    release_workspace_gpu_devices,
+    workspace_gpu_device_ids,
+)
+from .resource_usage import clear_workspace_resource_usage
 
 
 @dataclass(frozen=True)
@@ -53,6 +60,17 @@ class ActiveReservations:
     cpu_millicores: int
     memory_mb: int
     gpu_count: int
+
+
+@dataclass
+class _ActiveReservationSnapshot:
+    assigned_gpu_device_id: str | None
+    assigned_gpu_device_ids_json: str | None
+    cpu_limit: str | None
+    profile_memory_mb: int | None
+    profile_gpu_count: int | None
+    is_active_runtime: bool
+    leased_gpu_device_ids: list[str]
 
 
 def _audit(
@@ -278,42 +296,65 @@ class WorkspaceService:
                 "PROFILE_RESOURCE_INVALID",
                 "Pinned workspace profile accelerator values are invalid",
             ) from exc
+        try:
+            assigned_device_ids = workspace_gpu_device_ids(db, workspace)
+        except ValueError as exc:
+            raise AppError(
+                500,
+                "GPU_ALLOCATION_INVARIANT_FAILED",
+                "Workspace GPU assignment does not match its durable leases",
+            ) from exc
         if gpu_count == 0:
-            if workspace.assigned_gpu_device_id is not None:
+            if assigned_device_ids:
                 raise AppError(
                     500,
                     "GPU_ALLOCATION_INVARIANT_FAILED",
                     "A CPU workspace unexpectedly retains a GPU allocation",
                 )
             return
-        if len(self.settings.nvidia_gpu_device_ids) != 1:
+        configured_device_ids = self.settings.nvidia_gpu_device_ids
+        if not configured_device_ids or gpu_count > len(configured_device_ids):
             raise AppError(
                 503,
                 "GPU_HOST_UNAVAILABLE",
-                "No verified NVIDIA GPU is configured for this deployment",
+                "The verified NVIDIA GPU inventory cannot satisfy this profile",
             )
-        device_id = self.settings.nvidia_gpu_device_ids[0]
-        if workspace.assigned_gpu_device_id == device_id:
+        if assigned_device_ids:
+            if (
+                len(assigned_device_ids) != gpu_count
+                or any(
+                    device_id not in configured_device_ids
+                    for device_id in assigned_device_ids
+                )
+            ):
+                raise AppError(
+                    500,
+                    "GPU_ALLOCATION_INVARIANT_FAILED",
+                    "Workspace GPU allocation does not match the host inventory",
+                )
             return
-        if workspace.assigned_gpu_device_id is not None:
-            raise AppError(
-                500,
-                "GPU_ALLOCATION_INVARIANT_FAILED",
-                "Workspace GPU allocation does not match the host inventory",
-            )
-        owner = db.scalar(
-            select(Workspace.id).where(
-                Workspace.assigned_gpu_device_id == device_id,
-                Workspace.id != workspace.id,
-            )
+        leased_device_ids = set(db.scalars(select(WorkspaceGpuLease.gpu_device_id)))
+        free_device_ids = tuple(
+            device_id
+            for device_id in configured_device_ids
+            if device_id not in leased_device_ids
         )
-        if owner is not None:
+        if len(free_device_ids) < gpu_count:
             raise AppError(
                 429,
                 "GPU_CAPACITY_LIMIT",
-                "The configured NVIDIA GPU is already allocated",
+                "Not enough verified NVIDIA GPUs are currently available",
             )
-        workspace.assigned_gpu_device_id = device_id
+        try:
+            assign_workspace_gpu_devices(
+                db, workspace, free_device_ids[:gpu_count]
+            )
+        except ValueError as exc:  # pragma: no cover - guarded above
+            raise AppError(
+                500,
+                "GPU_ALLOCATION_INVARIANT_FAILED",
+                "Workspace GPU allocation could not be persisted",
+            ) from exc
 
     def create(
         self,
@@ -505,12 +546,45 @@ class WorkspaceService:
             raise AppError(409, "WORKSPACE_DELETING", "Workspace deletion has started")
         now = datetime.utcnow()
         observation_fresh = self._observation_is_fresh(workspace, now)
+        # BEGIN IMMEDIATE serializes this check with worker claims. A claimed
+        # START/RESTART may already be creating a server while the portal still
+        # has a fresh STOPPED observation; symmetrically, a claimed STOP/RESTART
+        # may already have removed it while the portal still says RUNNING. The
+        # opposite request must therefore enqueue a real convergence operation,
+        # not cancel the worker and return a no-op. An unclaimed PENDING request
+        # remains safe to cancel because it cannot be claimed while this write
+        # transaction is open.
+        claimed_lifecycle_types = set(
+            db.scalars(
+                select(Operation.operation_type).where(
+                    Operation.workspace_id == workspace.id,
+                    Operation.operation_type.in_(
+                        [
+                            OperationType.START.value,
+                            OperationType.STOP.value,
+                            OperationType.RESTART.value,
+                        ]
+                    ),
+                    Operation.status == OperationStatus.RUNNING.value,
+                )
+            ).all()
+        )
+        claimed_start_or_restart = bool(
+            claimed_lifecycle_types
+            & {OperationType.START.value, OperationType.RESTART.value}
+        )
+        claimed_stop_or_restart = bool(
+            claimed_lifecycle_types
+            & {OperationType.STOP.value, OperationType.RESTART.value}
+        )
         no_op = (
             target == DesiredState.RUNNING
+            and not claimed_stop_or_restart
             and workspace.observed_state == ObservedState.RUNNING.value
             and observation_fresh
         ) or (
             target == DesiredState.STOPPED
+            and not claimed_start_or_restart
             and workspace.observed_state
             in {ObservedState.STOPPED.value, ObservedState.NOT_FOUND.value}
             and observation_fresh
@@ -518,7 +592,9 @@ class WorkspaceService:
         if target == DesiredState.STOPPED and no_op:
             # A fresh non-running Hub observation is the only safe point at
             # which the exclusive physical device can be returned.
-            workspace.assigned_gpu_device_id = None
+            release_workspace_gpu_devices(db, workspace)
+        if target == DesiredState.STOPPED:
+            clear_workspace_resource_usage(workspace)
         if target == DesiredState.RUNNING and not no_op:
             profile = db.get(
                 WorkspaceProfile, (workspace.profile_id, workspace.profile_version)
@@ -623,6 +699,7 @@ class WorkspaceService:
             raise AppError(409, "WORKSPACE_NOT_RUNNING", "Workspace is not running")
         _cancel_active_lifecycle_operations(db, workspace_id=workspace.id, now=now)
         workspace.desired_state = DesiredState.RUNNING.value
+        clear_workspace_resource_usage(workspace)
         workspace.spec_version += 1
         workspace.row_version += 1
         workspace.updated_at = now
@@ -774,6 +851,7 @@ class WorkspaceService:
             workspace.desired_state = DesiredState.DELETED.value
             workspace.spec_version += 1
             workspace.row_version += 1
+        clear_workspace_resource_usage(workspace)
         workspace.last_error_code = None
         workspace.last_error_summary = None
         workspace.updated_at = now
@@ -859,7 +937,8 @@ def _active_reservation_conditions(
                     # A stop/delete request can supersede an in-flight start
                     # before that start's RUNNING observation is persisted. Keep
                     # the pinned resources reserved until Hub confirms teardown;
-                    # deletion releases at WAITING_EXTERNAL/NOT_FOUND.
+                    # deletion retains GPU leases until the external wipe and
+                    # archive callback complete.
                     OperationType.STOP.value,
                     OperationType.DELETE.value,
                 ]
@@ -872,6 +951,13 @@ def _active_reservation_conditions(
     conditions: list[object] = [
         Workspace.archived_at.is_(None),
         or_(
+            # A RUNNING intent remains a resource reservation even after a
+            # terminal/ambiguous start failure. The Hub may have created the
+            # container before its response was lost, and releasing CPU/RAM on
+            # an old NOT_FOUND observation would permit host overcommit. An
+            # explicit STOP/DELETE (whose operation remains reserved while it
+            # tears down Hub state) is the release boundary.
+            Workspace.desired_state == DesiredState.RUNNING.value,
             Workspace.observed_state.in_(
                 [
                     ObservedState.STARTING.value,
@@ -893,17 +979,20 @@ def active_reservations(
     active_conditions = _active_reservation_conditions(
         exclude_workspace_id=exclude_workspace_id
     )
-    # GPU admission has a stronger lifetime than CPU/memory admission.  A
-    # terminal start failure can leave Hub's state ambiguous while the desired
-    # state is still RUNNING, so the exact physical-device assignment remains
-    # the durable lease until a confirmed stop/not-found transition releases
-    # it.  Count that lease directly instead of inferring GPU usage from the
-    # lifecycle operation/state predicate below.
+    # RUNNING intent keeps CPU/memory reserved through ambiguous start failure.
+    # GPU admission has an additional durable lifetime: the physical assignment
+    # remains leased until a confirmed stop/not-found transition releases it,
+    # including while deletion cleanup continues. Count that lease directly
+    # instead of inferring GPU usage only from the runtime predicate below.
     active_runtime = and_(*active_conditions)
     row_conditions: list[object] = [
         or_(
             Workspace.archived_at.is_(None),
+            WorkspaceGpuLease.gpu_device_id.is_not(None),
+            # Include corrupt mirror-only rows so admission fails closed instead
+            # of silently ignoring a device that may still be in use.
             Workspace.assigned_gpu_device_id.is_not(None),
+            Workspace.assigned_gpu_device_ids_json.is_not(None),
         )
     ]
     if exclude_workspace_id is not None:
@@ -913,11 +1002,13 @@ def active_reservations(
     rows = db.execute(
         select(
             Workspace.id,
+            Workspace.assigned_gpu_device_id,
+            Workspace.assigned_gpu_device_ids_json,
             WorkspaceProfile.cpu_limit,
             WorkspaceProfile.memory_limit_mb,
             WorkspaceProfile.gpu_count,
-            Workspace.assigned_gpu_device_id,
             active_runtime.label("active_runtime"),
+            WorkspaceGpuLease.gpu_device_id,
         )
         .select_from(Workspace)
         .outerjoin(
@@ -927,42 +1018,102 @@ def active_reservations(
                 Workspace.profile_version == WorkspaceProfile.version,
             ),
         )
+        .outerjoin(
+            WorkspaceGpuLease,
+            WorkspaceGpuLease.workspace_id == Workspace.id,
+        )
         .where(*row_conditions)
+        .order_by(Workspace.id, WorkspaceGpuLease.gpu_device_id)
     ).all()
+
+    # Materialize each workspace and its complete lease set from this one SQL
+    # statement.  In particular, do not issue a lease query per workspace:
+    # separate SELECTs can observe different SQLite snapshots when another
+    # process releases or assigns a lease between reads.
+    workspace_snapshots: dict[str, _ActiveReservationSnapshot] = {}
+    for (
+        workspace_id,
+        assigned_gpu_device_id,
+        assigned_gpu_device_ids_json,
+        cpu_limit,
+        profile_memory_mb,
+        profile_gpu_count,
+        is_active_runtime,
+        leased_gpu_device_id,
+    ) in rows:
+        snapshot = workspace_snapshots.get(workspace_id)
+        if snapshot is None:
+            snapshot = _ActiveReservationSnapshot(
+                assigned_gpu_device_id=assigned_gpu_device_id,
+                assigned_gpu_device_ids_json=assigned_gpu_device_ids_json,
+                cpu_limit=cpu_limit,
+                profile_memory_mb=profile_memory_mb,
+                profile_gpu_count=profile_gpu_count,
+                is_active_runtime=bool(is_active_runtime),
+                leased_gpu_device_ids=[],
+            )
+            workspace_snapshots[workspace_id] = snapshot
+        if leased_gpu_device_id is not None:
+            snapshot.leased_gpu_device_ids.append(leased_gpu_device_id)
+
     active_count = 0
     cpu_millicores = 0
     memory_mb = 0
     gpu_count = 0
-    for (
-        _workspace_id,
-        cpu_limit,
-        profile_memory_mb,
-        profile_gpu_count,
-        assigned_gpu_device_id,
-        is_active_runtime,
-    ) in rows:
-        if assigned_gpu_device_id is not None:
-            if profile_gpu_count != 1:
-                raise AppError(
-                    500,
-                    "GPU_ALLOCATION_INVARIANT_FAILED",
-                    "A physical GPU is assigned to a non-GPU workspace",
-                )
-            gpu_count += 1
-        elif is_active_runtime and profile_gpu_count == 1:
+    for snapshot in workspace_snapshots.values():
+        try:
+            assigned_gpu_device_ids = parse_gpu_device_ids_json(
+                snapshot.assigned_gpu_device_ids_json
+            )
+        except ValueError as exc:
             raise AppError(
                 500,
                 "GPU_ALLOCATION_INVARIANT_FAILED",
-                "An active GPU workspace has no physical GPU assignment",
+                "A workspace GPU assignment does not match its durable leases",
+            ) from exc
+        expected_scalar = (
+            assigned_gpu_device_ids[0] if assigned_gpu_device_ids else None
+        )
+        if (
+            snapshot.assigned_gpu_device_id != expected_scalar
+            or tuple(snapshot.leased_gpu_device_ids) != assigned_gpu_device_ids
+        ):
+            raise AppError(
+                500,
+                "GPU_ALLOCATION_INVARIANT_FAILED",
+                "A workspace GPU assignment does not match its durable leases",
+            )
+        if assigned_gpu_device_ids:
+            if (
+                type(snapshot.profile_gpu_count) is not int
+                or snapshot.profile_gpu_count <= 0
+                or snapshot.profile_gpu_count != len(assigned_gpu_device_ids)
+            ):
+                raise AppError(
+                    500,
+                    "GPU_ALLOCATION_INVARIANT_FAILED",
+                    "Physical GPU leases do not match the workspace profile",
+                )
+            gpu_count += len(assigned_gpu_device_ids)
+        elif (
+            snapshot.is_active_runtime
+            and snapshot.profile_gpu_count
+            and snapshot.profile_gpu_count > 0
+        ):
+            raise AppError(
+                500,
+                "GPU_ALLOCATION_INVARIANT_FAILED",
+                "An active GPU workspace has no physical GPU leases",
             )
 
-        if not is_active_runtime:
+        if not snapshot.is_active_runtime:
             continue
         if (
-            cpu_limit is None
-            or profile_memory_mb is None
-            or profile_memory_mb <= 0
-            or profile_gpu_count not in {0, 1}
+            snapshot.cpu_limit is None
+            or snapshot.profile_memory_mb is None
+            or snapshot.profile_memory_mb <= 0
+            or type(snapshot.profile_gpu_count) is not int
+            or snapshot.profile_gpu_count < 0
         ):
             raise AppError(
                 500,
@@ -971,14 +1122,14 @@ def active_reservations(
             )
         active_count += 1
         try:
-            cpu_millicores += cpu_limit_to_millicores(cpu_limit)
+            cpu_millicores += cpu_limit_to_millicores(snapshot.cpu_limit)
         except ValueError as exc:
             raise AppError(
                 500,
                 "PROFILE_RESOURCE_INVALID",
                 "An active reservation has invalid pinned profile resources",
             ) from exc
-        memory_mb += profile_memory_mb
+        memory_mb += snapshot.profile_memory_mb
     return ActiveReservations(
         count=active_count,
         cpu_millicores=cpu_millicores,

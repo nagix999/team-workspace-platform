@@ -45,6 +45,7 @@ describe("profile facets", () => {
   it("converts only exact positive milllicore values", () => {
     expect(cpuLimitToMillicores("2")).toBe(2000);
     expect(cpuLimitToMillicores("0.125")).toBe(125);
+    expect(cpuLimitToMillicores("1.001")).toBe(1001);
     expect(cpuLimitToMillicores("0.0001")).toBeNull();
     expect(cpuLimitToMillicores("01")).toBeNull();
     expect(cpuLimitToMillicores("0")).toBeNull();

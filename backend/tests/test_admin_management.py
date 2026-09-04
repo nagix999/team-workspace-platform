@@ -502,6 +502,72 @@ def test_unclaimed_start_releases_resources_when_stop_observes_not_found(
     assert not asyncio.run(_worker(app, hub, "reservation-race-worker").process_next())
 
 
+@pytest.mark.parametrize("transition", ["stop", "restart", "delete"])
+def test_lifecycle_transition_response_clears_cached_resource_usage(
+    management_env, transition
+):
+    app, hub, client = management_env
+    me, *_ = login(client, hub, "alice")
+    provision(app, "alice")
+    created = _create(client, me, key=f"usage-{transition}-create")
+    workspace_id = created["workspace"]["id"]
+    assert asyncio.run(_worker(app, hub, f"usage-{transition}-worker").process_next())
+    with app.state.session_factory() as db:
+        workspace = db.get(Workspace, workspace_id)
+        assert workspace and workspace.observed_state == "RUNNING"
+        workspace.cpu_usage_millicores = 250
+        workspace.memory_usage_bytes = 256 * 1024 * 1024
+        workspace.memory_limit_bytes = 1024 * 1024 * 1024
+        workspace.resource_usage_observed_at = datetime.utcnow()
+        version_before = workspace.row_version
+        db.commit()
+
+    path = f"/api/v1/workspaces/{workspace_id}"
+    if transition == "stop":
+        response = client.post(
+            f"{path}/actions/stop",
+            headers=mutation_headers(me, "usage-stop-transition"),
+        )
+    elif transition == "restart":
+        response = client.post(
+            f"{path}/actions/restart",
+            headers=mutation_headers(me, "usage-restart-transition"),
+        )
+    else:
+        response = client.delete(
+            path, headers=mutation_headers(me, "usage-delete-transition")
+        )
+    assert response.status_code == 202, response.text
+    assert response.json()["workspace"]["resource_usage"] is None
+    with app.state.session_factory() as db:
+        workspace = db.get(Workspace, workspace_id)
+        assert workspace
+        assert workspace.cpu_usage_millicores is None
+        assert workspace.memory_usage_bytes is None
+        assert workspace.memory_limit_bytes is None
+        assert workspace.resource_usage_observed_at is None
+        assert workspace.row_version == version_before + 1
+        if transition == "stop":
+            # Even if an out-of-band writer repopulates an old sample while the
+            # operation is active, applying a non-running Hub state clears it.
+            workspace.cpu_usage_millicores = 10
+            workspace.memory_usage_bytes = 1024
+            workspace.memory_limit_bytes = 1024 * 1024 * 1024
+            workspace.resource_usage_observed_at = datetime.utcnow()
+            db.commit()
+    if transition == "stop":
+        assert asyncio.run(
+            _worker(app, hub, "usage-stop-apply-worker").process_next()
+        )
+        with app.state.session_factory() as db:
+            workspace = db.get(Workspace, workspace_id)
+            assert workspace and workspace.observed_state in {"STOPPED", "NOT_FOUND"}
+            assert workspace.cpu_usage_millicores is None
+            assert workspace.memory_usage_bytes is None
+            assert workspace.memory_limit_bytes is None
+            assert workspace.resource_usage_observed_at is None
+
+
 def test_expired_running_observation_is_stale_and_start_rechecks_hub(
     management_env,
 ):

@@ -16,7 +16,11 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import Settings
-from .accelerators import gpu_inventory_digest, stored_profile_accelerator
+from .accelerators import (
+    gpu_device_ids_json,
+    gpu_inventory_digest,
+    stored_profile_accelerator,
+)
 from .db import begin_immediate, create_database_engine, create_session_factory
 from .domain import (
     DesiredState,
@@ -53,6 +57,11 @@ from .models import (
 )
 from .security import TokenCipher, json_dumps_safe, random_token, sha256_hex
 from .services.environment import effective_environment, spawn_snapshot_purpose
+from .services.gpu_allocations import (
+    release_workspace_gpu_devices,
+    workspace_gpu_device_ids,
+)
+from .services.resource_usage import clear_workspace_resource_usage
 from .services.internal_egress import sync_internal_egress_runtime
 from .services.resource_policy import get_resource_policy
 
@@ -714,7 +723,7 @@ class OperationWorker:
                 db.rollback()
                 return
             removed = HubServer(state=HubServerState.NOT_FOUND, progress_percent=100)
-            self._apply_server(workspace, removed)
+            self._apply_server(db, workspace, removed)
             workspace.deletion_checkpoint = "DELETION_PENDING"
             slot.provision_status = ProvisionStatus.WIPING.value
             job = db.get(WorkspaceDeletionJob, workspace.id)
@@ -900,8 +909,17 @@ class OperationWorker:
                     "Pinned workspace profile accelerator values are invalid",
                 ) from exc
             configured_gpu_ids = self.settings.nvidia_gpu_device_ids
+            try:
+                assigned_gpu_ids = workspace_gpu_device_ids(db, workspace)
+            except ValueError as exc:
+                db.rollback()
+                raise AppError(
+                    500,
+                    "GPU_ALLOCATION_INVARIANT_FAILED",
+                    "Workspace GPU assignment does not match its durable leases",
+                ) from exc
             if accelerator.count == 0:
-                if workspace.assigned_gpu_device_id is not None:
+                if assigned_gpu_ids:
                     db.rollback()
                     raise AppError(
                         500,
@@ -909,11 +927,15 @@ class OperationWorker:
                         "A CPU workspace unexpectedly retains a GPU allocation",
                     )
                 gpu_device_id = None
+                gpu_device_ids_value = None
                 inventory_digest = None
             else:
                 if (
-                    len(configured_gpu_ids) != 1
-                    or workspace.assigned_gpu_device_id != configured_gpu_ids[0]
+                    len(assigned_gpu_ids) != accelerator.count
+                    or any(
+                        device_id not in configured_gpu_ids
+                        for device_id in assigned_gpu_ids
+                    )
                 ):
                     db.rollback()
                     raise AppError(
@@ -921,7 +943,8 @@ class OperationWorker:
                         "GPU_ALLOCATION_INVARIANT_FAILED",
                         "Workspace GPU allocation does not match the verified host inventory",
                     )
-                gpu_device_id = configured_gpu_ids[0]
+                gpu_device_id = assigned_gpu_ids[0]
+                gpu_device_ids_value = gpu_device_ids_json(assigned_gpu_ids)
                 inventory_digest = gpu_inventory_digest(configured_gpu_ids)
             db.execute(
                 update(SpawnAuthorization)
@@ -967,6 +990,7 @@ class OperationWorker:
                     ),
                     gpu_count=accelerator.count,
                     gpu_device_id=gpu_device_id,
+                    gpu_device_ids_json=gpu_device_ids_value,
                     gpu_inventory_digest=inventory_digest,
                     environment_digest=environment.digest,
                     environment_snapshot_cipher=environment_snapshot_cipher,
@@ -1002,7 +1026,7 @@ class OperationWorker:
                 return True
             if operation.attempts < self.settings.worker_max_attempts:
                 return False
-            self._apply_server(workspace, server)
+            self._apply_server(db, workspace, server)
             self._finish(
                 db,
                 operation,
@@ -1013,8 +1037,12 @@ class OperationWorker:
             )
             return True
 
-    def _apply_server(self, workspace: Workspace, server: HubServer) -> None:
+    def _apply_server(
+        self, db: Session, workspace: Workspace, server: HubServer
+    ) -> None:
         workspace.observed_state = self._observed_from_hub(server.state)
+        if server.state != HubServerState.RUNNING:
+            clear_workspace_resource_usage(workspace)
         if (
             server.progress_percent is not None
             or server.state != HubServerState.STARTING
@@ -1027,9 +1055,9 @@ class OperationWorker:
         workspace.stale = False
         if (
             server.state in {HubServerState.NOT_FOUND, HubServerState.STOPPED}
-            and workspace.desired_state != DesiredState.RUNNING.value
+            and workspace.desired_state == DesiredState.STOPPED.value
         ):
-            workspace.assigned_gpu_device_id = None
+            release_workspace_gpu_devices(db, workspace)
         workspace.last_error_code = None
         workspace.last_error_summary = None
         workspace.row_version += 1
@@ -1047,7 +1075,7 @@ class OperationWorker:
                 or operation.lease_owner != self.worker_id
             ):
                 return
-            self._apply_server(workspace, server)
+            self._apply_server(db, workspace, server)
             if server.state == HubServerState.RUNNING and server.ready:
                 authorization = db.scalar(
                     select(SpawnAuthorization)
@@ -1090,7 +1118,7 @@ class OperationWorker:
                 or operation.lease_owner != self.worker_id
             ):
                 return
-            self._apply_server(workspace, server)
+            self._apply_server(db, workspace, server)
             operation.error_code = error_code
             operation.error_summary = error_summary
             if error_code:

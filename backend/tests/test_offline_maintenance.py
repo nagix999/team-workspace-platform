@@ -33,7 +33,7 @@ UNCONSUMED_AUTH_ID = "66666666-6666-6666-6666-666666666666"
 PROFILE_DIGEST = "sha256:" + "a" * 64
 
 
-def _database(tmp_path: Path, *, revision: str = "0007") -> Path:
+def _database(tmp_path: Path, *, revision: str = "0009") -> Path:
     path = tmp_path / "platform.db"
     engine = create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(engine)
@@ -208,7 +208,7 @@ def test_dry_run_lists_targets_without_mutating_database(tmp_path):
     assert result == {
         "action": "quiesce-stopped-intent",
         "applied": False,
-        "schema_revision": "0007",
+        "schema_revision": "0009",
         "target_count": 1,
         "workspace_ids": [WORKSPACE_ID],
     }

@@ -125,12 +125,22 @@ describe("AdminProfileManager", () => {
         gpuFrameworkVersion: "2.7.1",
       },
     };
+    const gpuPair: AdminWorkspaceProfile = {
+      ...gpu,
+      id: "gpu-pair",
+      runtimeProfile: {
+        ...gpu.runtimeProfile,
+        id: "gpu-runtime-pair",
+        gpuCount: 2,
+      },
+    };
 
-    const groups = groupAdminProfilesByKernel([gpu, cpu]);
-    expect(groups).toHaveLength(2);
+    const groups = groupAdminProfilesByKernel([gpuPair, gpu, cpu]);
+    expect(groups).toHaveLength(3);
     expect(groups.map((group) => group.acceleratorLabel)).toEqual([
       "CPU 전용",
       "NVIDIA GPU 1개 · CUDA 12.6 · PyTorch 2.7.1",
+      "NVIDIA GPU 2개 · CUDA 12.6 · PyTorch 2.7.1",
     ]);
   });
 });

@@ -405,12 +405,17 @@ class Settings:
             raise RuntimeError(
                 "PLATFORM_WORKSPACE_MEMORY_BUDGET_MB must be greater than 0"
             )
-        if len(self.nvidia_gpu_device_ids) > 1 or any(
-            configured_gpu_device_ids(device_id) != (device_id,)
-            for device_id in self.nvidia_gpu_device_ids
-        ):
+        try:
+            configured_gpu_ids = configured_gpu_device_ids(
+                ",".join(self.nvidia_gpu_device_ids)
+            )
+        except RuntimeError as exc:
             raise RuntimeError(
-                "only one canonical physical NVIDIA GPU UUID is supported"
+                "NVIDIA GPU UUID inventory must be canonical, unique and sorted"
+            ) from exc
+        if configured_gpu_ids != self.nvidia_gpu_device_ids:
+            raise RuntimeError(
+                "NVIDIA GPU UUID inventory must be canonical, unique and sorted"
             )
         if self.session_idle_seconds > self.session_absolute_seconds:
             raise RuntimeError("session idle expiry cannot exceed absolute expiry")

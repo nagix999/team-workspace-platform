@@ -84,7 +84,7 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
 
     consume_path = "/internal/v1/spawn-authorizations/consume"
     consume_payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "username": "alice",
         "server_name": workspace.hub_server_name,
         "profile_id": "python-standard",
@@ -136,13 +136,13 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
         "workspace_environment_generation",
         "kernel_idle_timeout_seconds",
         "gpu_count",
-        "gpu_device_id",
+        "gpu_device_ids",
         "gpu_inventory_digest",
         "valid_until_unix",
     }
     assert authorization["kernel_idle_timeout_seconds"] == 7_200
     assert authorization["gpu_count"] == 0
-    assert authorization["gpu_device_id"] is None
+    assert authorization["gpu_device_ids"] == []
     assert authorization["gpu_inventory_digest"] is None
     assert authorization["environment"] == {
         "API_KEY": "never-log-this",
@@ -171,7 +171,7 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
         db.commit()
     tampered_body = json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             **check_authorization,
             "kernel_idle_timeout_seconds": 3_600,
         },
@@ -191,7 +191,7 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
     assert tampered.status_code == 403
     assert tampered.json()["error"]["code"] == "SPAWN_BINDING_MISMATCH"
     check_body = json.dumps(
-        {"schema_version": 1, **check_authorization},
+        {"schema_version": 2, **check_authorization},
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
@@ -207,7 +207,7 @@ def test_guard_hmac_consume_and_check_exact_contract(app_env):
     )
     assert checked.status_code == 200, checked.text
     assert checked.json() == {
-        "schema_version": 1,
+        "schema_version": 2,
         "authorized": True,
         "spawn_authorization_id": authorization["spawn_authorization_id"],
     }

@@ -146,8 +146,9 @@ PLATFORM_GPU_RUNTIME_CONFIG_FILE=disabled
 
 GPU를 함께 활성화하려면 [전체 배포 가이드의 NVIDIA GPU 절차](production-deployment-ko.md#81-선택-nvidia-gpu-runtime-활성화)를
 먼저 완료한다. 즉 host driver 설치와 reboot, NVIDIA Container Toolkit/Docker runtime 구성,
-정확한 물리 GPU UUID 하나를 담은 외부 policy 파일 생성까지 끝낸 다음 그 파일의 절대경로를
-설정한다. `nvidia-smi: command not found`인 상태에서 환경변수만 켜서는 안 된다.
+운영에 공개할 물리 GPU UUID를 중복 없이 담은 외부 policy 파일 생성까지 끝낸 다음 그 파일의
+절대경로를 설정한다. 입력 순서는 내부에서 사전순으로 canonicalize된다. `nvidia-smi: command
+not found`인 상태에서 환경변수만 켜서는 안 된다.
 
 ```bash
 nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader,nounits
@@ -158,11 +159,12 @@ docker info --format '{{json .Runtimes}}'
 기존 schema-v2 CPU profile은 원래 digest/image ID를 유지한 재시작 전용 history로 보존되고 새
 schema-v3 CPU profile이 선택 항목이 된다. GPU를 활성화하면 별도 Python 3.12/PyTorch CUDA
 image와 GPU profile도 추가된다. 기존 DB의 자원 정책은 안전하게 GPU budget 0으로 migration될
-수 있으므로 배포 후 관리자 **자원·커널 정책**에서 GPU 1개 선택을 명시적으로 활성화한다. 새
-DB는 검증된 host GPU가 있으면 초기 catalog에 CPU 0/GPU 1 선택을 함께 만든다.
+수 있으므로 배포 후 관리자 **자원·커널 정책**에서 GPU를 활성화하고, 검증된 풀 크기 이하의
+전체 예산과 사용자에게 공개할 GPU 개수(예: 1, 2, 4)를 지정한다. 새 DB는 검증된 host GPU가
+있으면 CPU 0과 GPU 1..N runtime catalog를 만든다.
 
 이미 이전 release에서 GPU를 사용했다면 `/etc/team-workspace/gpu-runtime.json` 같은 외부 policy와
-그 exact UUID를 계속 보존한다. Enabled GPU history가 있는데 새 release에서 설정을
+그 exact UUID 목록을 계속 보존한다. Enabled GPU history가 있는데 새 release에서 설정을
 `disabled`로 바꾸면 preflight가 중단되는 것이 정상이다. 기존 GPU workspace를 재시작할 수 없는
 상태로 조용히 전환하지 않기 위한 보호다. GPU 폐기는 profile history와 workspace를 함께 다루는
 별도 검토 절차 없이 수행하지 않는다.
@@ -174,8 +176,9 @@ make production-preflight
 ```
 
 이 단계는 host/TLS/CIDR, Docker volume 쌍, single-user image 계약, Compose/Nginx 설정을 검사한다.
-GPU가 활성화돼 있으면 별도 CUDA image를 빌드하고 정확한 UUID 하나를 주입해 driver/toolkit,
-PyTorch CUDA build와 실제 tensor 실행을 DB 변경 전에 검사한다. 첫 CUDA image build는 크고
+GPU가 활성화돼 있으면 별도 CUDA image를 빌드하고 각 UUID 및 전체 UUID 풀을 주입해
+driver/toolkit, PyTorch CUDA build와 각 장치의 실제 tensor 실행을 DB 변경 전에 검사한다.
+첫 CUDA image build는 크고
 `download.pytorch.org` 접근이 필요해 CPU-only preflight보다 오래 걸릴 수 있다.
 기존 DB가 있으면 SQLite online snapshot을 이용해 다음 상태가 전부 비어 있는지도 확인한다.
 
@@ -249,6 +252,13 @@ host·사내망·metadata·direct IP/DNS egress가 실패하고 승인 proxy만 
 proxy를 통해 성공하는지, 같은 IP의 다른 port와 다른 사설 IP 및 direct 요청은 실패하는지
 확인한다. 운영 IP는 repository의 domain allowlist나 `.env`로 옮기지 않는다.
 
+`v0.1.7` 최초 적용에는 다중 GPU lease와 CPU·메모리 관측 cache를 위한 `0008`, `0009`
+migration이 포함된다. `production-up`으로 API·worker·reconciler·JupyterHub·frontend를 함께
+재생성해야 Hub 전용 사용량 endpoint와 schema가 같은 버전으로 맞춰진다. 적용 후 관리자
+현황에서 실행 환경 수와 사용량 측정 성공·누락 합계가 일치하는지 확인한다. GPU를 사용하는
+호스트는 기존 단일 UUID 설정을 `gpu_uuids` 배열로 유지하거나 여러 물리 UUID를 추가한 뒤
+사전검사를 다시 통과해야 한다.
+
 그다음 실제 허용된 사내 PC에서 다음 smoke test를 수행한다.
 
 1. 포털 로그인과 명시적 로그아웃 후 재인증
@@ -264,8 +274,8 @@ proxy를 통해 성공하는지, 같은 IP의 다른 port와 다른 사설 IP �
 9. 일반/secret 환경변수 변경 후 restart 안내와 재시작 적용 확인
 10. workspace 중지 및 테스트용 workspace 삭제 수렴 확인
 11. GPU 사용 시 `python312-cuda` 환경에서 PyTorch `2.7.1+cu126`, CUDA 12.6,
-   `torch.cuda.is_available()`, device 수 1과 CUDA tensor 연산 확인; 동시 두 번째 GPU 환경은
-   첫 환경이 멈출 때까지 admission 거부 확인
+   `torch.cuda.is_available()`, 선택 개수와 같은 device 수 및 각 GPU의 CUDA tensor 연산 확인;
+   여러 환경의 UUID가 중복되지 않고 미예약 GPU보다 큰 요청은 admission 거부되는지 확인
 
 ## 6. 운영 계정 관리
 

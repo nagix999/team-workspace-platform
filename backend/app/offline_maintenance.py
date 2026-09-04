@@ -23,7 +23,7 @@ from urllib.parse import quote
 from .db import _sqlite_version_is_safe
 
 
-EXPECTED_DATABASE_REVISION = "0007"
+EXPECTED_DATABASE_REVISION = "0009"
 PRODUCTION_DATABASE_URL = "sqlite:////var/lib/platform/platform.db"
 PRODUCTION_DATABASE_PATH = Path("/var/lib/platform/platform.db")
 ACTIVE_STATUSES = ("PENDING", "RUNNING", "WAITING_EXTERNAL")
@@ -126,6 +126,11 @@ def _require_exact_schema(connection: sqlite3.Connection) -> None:
             "deletion_checkpoint",
             "archived_at",
             "assigned_gpu_device_id",
+            "assigned_gpu_device_ids_json",
+            "cpu_usage_millicores",
+            "memory_usage_bytes",
+            "memory_limit_bytes",
+            "resource_usage_observed_at",
         },
         "operations": {"id", "status"},
         "user_provisioning_jobs": {"user_id", "status"},
@@ -136,6 +141,7 @@ def _require_exact_schema(connection: sqlite3.Connection) -> None:
             "kernel_idle_timeout_seconds",
             "gpu_count",
             "gpu_device_id",
+            "gpu_device_ids_json",
             "gpu_inventory_digest",
             "consumed_at",
             "revoked_at",
@@ -146,6 +152,11 @@ def _require_exact_schema(connection: sqlite3.Connection) -> None:
             "kernel_idle_timeout_seconds",
             "gpu_budget_count",
             "selectable_gpu_counts_json",
+        },
+        "workspace_gpu_leases": {
+            "gpu_device_id",
+            "workspace_id",
+            "created_at",
         },
         "internal_egress_policies": {
             "id",
@@ -338,9 +349,14 @@ def quiesce_stopped_intent(
                 (now, workspace_id),
             ).rowcount
             revoked_total += revoked
+            connection.execute(
+                "DELETE FROM workspace_gpu_leases WHERE workspace_id = ?",
+                (workspace_id,),
+            )
             updated = connection.execute(
                 "UPDATE workspaces SET desired_state = 'STOPPED', "
                 "assigned_gpu_device_id = NULL, "
+                "assigned_gpu_device_ids_json = NULL, "
                 "spec_version = spec_version + 1, row_version = row_version + 1, "
                 "updated_at = ? WHERE id = ? AND archived_at IS NULL "
                 "AND deletion_started_at IS NULL AND deletion_checkpoint IS NULL "

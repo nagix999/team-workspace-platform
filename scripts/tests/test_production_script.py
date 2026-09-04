@@ -941,7 +941,7 @@ class ProductionGpuOrchestrationContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.script = PRODUCTION_SCRIPT.read_text(encoding="utf-8")
 
-    def test_gpu_is_explicit_opt_in_and_one_validated_uuid_is_exported(self) -> None:
+    def test_gpu_is_explicit_opt_in_and_validated_uuid_pool_is_exported(self) -> None:
         load_environment = self.script.split("load_environment() {", 1)[1].split(
             "\n}\n\ncompose()", 1
         )[0]
@@ -949,9 +949,10 @@ class ProductionGpuOrchestrationContractTests(unittest.TestCase):
         self.assertIn(
             '"${PLATFORM_GPU_RUNTIME_CONFIG_FILE:-disabled}"', load_environment
         )
-        self.assertIn("--print-device-id", load_environment)
+        self.assertIn("--print-device-ids", load_environment)
         self.assertIn("require_regular_file", load_environment)
-        self.assertIn("export PLATFORM_NVIDIA_GPU_DEVICE_ID", load_environment)
+        self.assertIn("export PLATFORM_NVIDIA_GPU_DEVICE_IDS", load_environment)
+        self.assertIn("PLATFORM_NVIDIA_GPU_COUNT", load_environment)
         self.assertNotIn("NVIDIA_VISIBLE_DEVICES", load_environment)
 
     def test_cuda_runtime_probe_precedes_policy_generation_and_db_mutation(
@@ -978,6 +979,11 @@ class ProductionGpuOrchestrationContractTests(unittest.TestCase):
         self.assertIn('[[ "${gpu_image_id}" =~ ^sha256:', prepare)
         self.assertIn("io.team-workspace.cpu-base.image-id", prepare)
         self.assertIn('--gpu-image-id "${gpu_image_id}"', prepare)
+        self.assertIn('--gpu-count "${PLATFORM_NVIDIA_GPU_COUNT}"', prepare)
+        self.assertIn(
+            '--nvidia-gpu-device-ids "${PLATFORM_NVIDIA_GPU_DEVICE_IDS}"',
+            prepare,
+        )
 
         preflight_offset = self.script.index("preflight_impl() {")
         self.assertLess(

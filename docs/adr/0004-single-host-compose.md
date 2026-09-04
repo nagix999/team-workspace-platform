@@ -108,7 +108,7 @@ shared volume은 모든 팀원이 읽고 수정·삭제할 수 있는 공동 신
 
 ### KubeSpawner/Kubernetes
 
-network policy, resource quota, 여러 node, 다중 GPU·MIG·공유 GPU scheduling과 HA에 더 적합하다. 조직에 기존 Kubernetes가 있어 전환 비용도 일반적인 신규 cluster보다 낮다. 그럼에도 사용자가 Compose 우선으로 확정했으므로 MVP에는 채택하지 않는다. 현재 Compose 구현은 운영자가 허용한 물리 NVIDIA GPU 한 개의 workspace별 독점 할당만 지원한다. Docker에서 user-to-user/egress 격리를 신뢰성 있게 강제하지 못하거나 15개가 단일 host 용량을 넘으면 우선 전환 대안이다.
+network policy, resource quota, 여러 node, MIG·공유 GPU와 topology-aware scheduling 및 HA에 더 적합하다. 조직에 기존 Kubernetes가 있어 전환 비용도 일반적인 신규 cluster보다 낮다. 그럼에도 사용자가 Compose 우선으로 확정했으므로 MVP에는 채택하지 않는다. 현재 Compose 구현은 단일 host에서 allowlist한 여러 물리 NVIDIA GPU를 workspace별로 선택한 수만큼 독점 할당한다. Docker에서 user-to-user/egress 격리를 신뢰성 있게 강제하지 못하거나 15개가 단일 host 용량을 넘으면 우선 전환 대안이다.
 
 ### LocalProcessSpawner
 
@@ -164,7 +164,7 @@ socket mount 없이 host daemon을 사용할 수 있지만 Hub dependency와 Pyt
 
 - 최대 동시 실행량이 단일 host 용량을 초과함
 - 비신뢰 사용자 간 강한 격리 또는 민감 내부망 접근이 필요함
-- 단일 물리 GPU 독점 범위를 넘는 다중 GPU·MIG·time-slicing, 여러 node, HA,
+- 단일 host 물리 GPU 독점 풀을 넘는 MIG·time-slicing·topology-aware 배치, 여러 node, HA,
   세밀한 network policy/resource quota가 필요함
 - Docker에서 user-to-user 차단 또는 package-only egress를 안정적으로 강제할 수 없음
 - Docker socket의 host root급 위험을 수용할 수 없음

@@ -145,8 +145,9 @@ class DomainTestComposeContractTests(unittest.TestCase):
                 "PLATFORM_TLS_GID": "1000",
                 "DOCKER_GID": "999",
                 "PLATFORM_SECRET_GID": "1000",
-                "PLATFORM_NVIDIA_GPU_DEVICE_ID": (
-                    "GPU-01234567-89ab-cdef-0123-456789abcdef"
+                "PLATFORM_NVIDIA_GPU_DEVICE_IDS": (
+                    "GPU-01234567-89ab-cdef-0123-456789abcdef,"
+                    "GPU-12345678-1234-5678-9abc-123456789abc"
                 ),
             }
         )
@@ -199,7 +200,8 @@ class DomainTestComposeContractTests(unittest.TestCase):
                 config["services"][service]["environment"][
                     "PLATFORM_NVIDIA_GPU_DEVICE_IDS"
                 ],
-                "GPU-01234567-89ab-cdef-0123-456789abcdef",
+                "GPU-01234567-89ab-cdef-0123-456789abcdef,"
+                "GPU-12345678-1234-5678-9abc-123456789abc",
             )
         hub = config["services"]["jupyterhub"]["environment"]
         self.assertEqual(hub["PLATFORM_ENV"], "production")
@@ -209,8 +211,9 @@ class DomainTestComposeContractTests(unittest.TestCase):
             "true",
         )
         self.assertEqual(
-            hub["JUPYTERHUB_NVIDIA_GPU_DEVICE_ID"],
-            "GPU-01234567-89ab-cdef-0123-456789abcdef",
+            hub["JUPYTERHUB_NVIDIA_GPU_DEVICE_IDS"],
+            "GPU-01234567-89ab-cdef-0123-456789abcdef,"
+            "GPU-12345678-1234-5678-9abc-123456789abc",
         )
         published_services = {
             name for name, service in config["services"].items() if service.get("ports")

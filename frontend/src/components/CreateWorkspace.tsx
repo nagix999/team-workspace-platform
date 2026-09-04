@@ -81,7 +81,7 @@ export function filterWorkspaceProfiles(
 
 function acceleratorLabel(profile: WorkspaceProfile): string {
   return profile.acceleratorKind === "nvidia"
-    ? `NVIDIA GPU 1개 · CUDA ${profile.cudaVersion} · PyTorch ${profile.gpuFrameworkVersion}`
+    ? `NVIDIA GPU ${profile.gpuCount}개 · CUDA ${profile.cudaVersion} · PyTorch ${profile.gpuFrameworkVersion}`
     : "CPU 전용";
 }
 
@@ -114,16 +114,22 @@ export function CreateWorkspace({
   const [workspaceName, setWorkspaceName] = useState("");
 
   const acceleratorOptions = useMemo(() => {
-    const values = new Map<string, { key: string; label: string }>();
+    const values = new Map<
+      string,
+      { key: string; label: string; cpuOnly: boolean; gpuCount: number }
+    >();
     for (const profile of profiles) {
       const key = workspaceAcceleratorKey(profile);
-      values.set(key, { key, label: acceleratorLabel(profile) });
+      values.set(key, {
+        key,
+        label: acceleratorLabel(profile),
+        cpuOnly: profile.acceleratorKind === "none",
+        gpuCount: profile.gpuCount,
+      });
     }
     return [...values.values()].sort((left, right) => {
-      const leftCpu = left.key.startsWith("none:");
-      const rightCpu = right.key.startsWith("none:");
-      if (leftCpu !== rightCpu) return leftCpu ? -1 : 1;
-      return left.key.localeCompare(right.key);
+      if (left.cpuOnly !== right.cpuOnly) return left.cpuOnly ? -1 : 1;
+      return left.gpuCount - right.gpuCount || left.key.localeCompare(right.key);
     });
   }, [profiles]);
 
@@ -356,7 +362,7 @@ export function CreateWorkspace({
               <li>기본 노트북/터미널 Python {selected.pythonVersion}</li>
               {selected.acceleratorKind === "nvidia" ? (
                 <li>
-                  NVIDIA GPU 1개 · CUDA {selected.cudaVersion} · PyTorch {selected.gpuFrameworkVersion}
+                  NVIDIA GPU {selected.gpuCount}개 · CUDA {selected.cudaVersion} · PyTorch {selected.gpuFrameworkVersion}
                 </li>
               ) : (
                 <li>가속기 CPU 전용</li>

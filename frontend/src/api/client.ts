@@ -24,8 +24,11 @@ import type {
   Workspace,
   WorkspaceMutationResult,
   WorkspaceProfile,
+  WorkspaceResourceUsage,
 } from "./types";
 import { cpuLimitToMillicores } from "../lib/profiles";
+
+const MAX_NVIDIA_GPU_COUNT = 64;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -140,8 +143,54 @@ function nonNegativeInteger(value: unknown): number | null {
     : null;
 }
 
-function exclusiveGpuCount(value: unknown): 0 | 1 {
-  return nonNegativeInteger(value) === 1 ? 1 : 0;
+function utcInstant(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?Z$/.exec(
+    value,
+  );
+  const parsed = new Date(value);
+  if (!match || !Number.isFinite(parsed.getTime()) ||
+    parsed.getUTCFullYear() !== Number(match[1]) ||
+    parsed.getUTCMonth() + 1 !== Number(match[2]) ||
+    parsed.getUTCDate() !== Number(match[3]) ||
+    parsed.getUTCHours() !== Number(match[4]) ||
+    parsed.getUTCMinutes() !== Number(match[5]) ||
+    parsed.getUTCSeconds() !== Number(match[6])) {
+    return null;
+  }
+  return value;
+}
+
+function normalizeWorkspaceResourceUsage(
+  value: unknown,
+): WorkspaceResourceUsage | null {
+  if (value === null || value === undefined) return null;
+  const usage = optionalRecord(value);
+  if (usage === null) return null;
+  const cpuMillicores = nonNegativeInteger(usage.cpu_millicores);
+  const memoryBytes = nonNegativeInteger(usage.memory_bytes);
+  const memoryLimitBytes = positiveInteger(usage.memory_limit_bytes);
+  const observedAt = utcInstant(usage.observed_at);
+  const expiresAt = utcInstant(usage.expires_at);
+  if (cpuMillicores === null || memoryBytes === null || memoryLimitBytes === null ||
+    memoryBytes > memoryLimitBytes || observedAt === null || expiresAt === null ||
+    Date.parse(expiresAt) <= Date.parse(observedAt) ||
+    typeof usage.stale !== "boolean") {
+    return null;
+  }
+  return {
+    cpuMillicores,
+    memoryBytes,
+    memoryLimitBytes,
+    observedAt,
+    expiresAt,
+    stale: usage.stale,
+  };
+}
+
+function gpuPoolCount(value: unknown): number {
+  const count = nonNegativeInteger(value);
+  return count !== null && count <= MAX_NVIDIA_GPU_COUNT ? count : 0;
 }
 
 function kernelIdleTimeout(value: unknown): number | null {
@@ -183,7 +232,7 @@ function normalizeAccelerator(value: JsonRecord): Pick<
     value.gpu_framework_version,
   ].every((item) => item === undefined);
   const kind = entirelyMissing ? "none" : value.accelerator_kind;
-  const count = entirelyMissing ? 0 : value.gpu_count;
+  const count = entirelyMissing ? 0 : nonNegativeInteger(value.gpu_count);
   if (
     kind === "none" && count === 0 &&
     (value.cuda_version === undefined || value.cuda_version === null) &&
@@ -201,14 +250,16 @@ function normalizeAccelerator(value: JsonRecord): Pick<
   const cudaVersion = trimmedString(value.cuda_version, 16);
   const frameworkVersion = trimmedString(value.gpu_framework_version, 32);
   if (
-    kind !== "nvidia" || count !== 1 || value.gpu_framework !== "pytorch" ||
+    kind !== "nvidia" || count === null || count < 1 ||
+    count > MAX_NVIDIA_GPU_COUNT ||
+    value.gpu_framework !== "pytorch" ||
     !cudaVersion || !/^(?:[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(cudaVersion) ||
     !frameworkVersion ||
     !/^(?:[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(frameworkVersion)
   ) return null;
   return {
     acceleratorKind: "nvidia",
-    gpuCount: 1,
+    gpuCount: count,
     cudaVersion,
     gpuFramework: "pytorch",
     gpuFrameworkVersion: frameworkVersion,
@@ -546,6 +597,7 @@ export function normalizeWorkspace(payload: unknown): Workspace {
     observedState: stringValue(value.observed_state, "UNKNOWN") as Workspace["observedState"],
     progressPercent: nullableNumber(value.progress_percent),
     stale: booleanValue(value.stale, false),
+    resourceUsage: normalizeWorkspaceResourceUsage(value.resource_usage),
     lastErrorCode: nullableString(value.last_error_code),
     lastErrorSummary: nullableString(value.last_error_summary),
     createdAt: nullableString(value.created_at),
@@ -759,13 +811,39 @@ export function normalizeAdminCapacity(payload: unknown): AdminCapacity {
   const cpu = optionalRecord(resources.cpu_millicores) ?? {};
   const memory = optionalRecord(resources.memory_mb) ?? {};
   const gpu = optionalRecord(resources.gpu_count) ?? {};
+  const workspaceRunning = Math.max(0, numberValue(workspaces.running, 0));
+  const rawUsage = optionalRecord(root.usage);
+  let usage: AdminCapacity["usage"] = null;
+  if (rawUsage !== null) {
+    const runningTotal = nonNegativeInteger(rawUsage.running_total);
+    const measured = nonNegativeInteger(rawUsage.measured);
+    const unavailable = nonNegativeInteger(rawUsage.unavailable);
+    const cpuMillicores = nonNegativeInteger(rawUsage.cpu_millicores);
+    const memoryBytes = nonNegativeInteger(rawUsage.memory_bytes);
+    const expiresAt = utcInstant(rawUsage.expires_at);
+    if (runningTotal !== null && measured !== null && unavailable !== null &&
+      cpuMillicores !== null && memoryBytes !== null && expiresAt !== null &&
+      typeof rawUsage.stale === "boolean" &&
+      runningTotal === workspaceRunning && measured + unavailable === runningTotal &&
+      (measured > 0 || (cpuMillicores === 0 && memoryBytes === 0))) {
+      usage = {
+        runningTotal,
+        measured,
+        unavailable,
+        cpuMillicores,
+        memoryBytes,
+        expiresAt,
+        stale: rawUsage.stale,
+      };
+    }
+  }
   return {
     users: Math.max(0, numberValue(root.users, 0)),
     workspaceCreated: Math.max(0, numberValue(
       workspaces.created ?? root.workspaces,
       0,
     )),
-    workspaceRunning: Math.max(0, numberValue(workspaces.running, 0)),
+    workspaceRunning,
     workspaceReserved: Math.max(0, numberValue(
       workspaces.reserved ?? optionalRecord(root.global)?.active,
       0,
@@ -780,6 +858,7 @@ export function normalizeAdminCapacity(payload: unknown): AdminCapacity {
     memoryBudgetMb: Math.max(0, numberValue(memory.limit, 0)),
     gpuReservedCount: Math.max(0, numberValue(gpu.reserved, 0)),
     gpuBudgetCount: Math.max(0, numberValue(gpu.limit, 0)),
+    usage,
   };
 }
 
@@ -791,9 +870,9 @@ export function normalizeResourcePolicy(payload: unknown): ResourcePolicy {
   const availableCpu = integerArray(value.available_cpu_millicores);
   const availableMemory = integerArray(value.available_memory_mb);
   const selectedGpu = integerArray(value.selectable_gpu_counts, false)
-    .filter((item) => item <= 1);
+    .filter((item) => item <= MAX_NVIDIA_GPU_COUNT);
   const availableGpu = integerArray(value.available_gpu_counts, false)
-    .filter((item) => item <= 1);
+    .filter((item) => item <= MAX_NVIDIA_GPU_COUNT);
   const hasAvailableCpu = Array.isArray(value.available_cpu_millicores);
   const hasAvailableMemory = Array.isArray(value.available_memory_mb);
   const hasSelectedGpu = Array.isArray(value.selectable_gpu_counts);
@@ -832,10 +911,9 @@ export function normalizeResourcePolicy(payload: unknown): ResourcePolicy {
     memoryBudgetMb: numberValue(value.memory_budget_mb, 0),
     selectableCpuMillicores: selectedCpu,
     selectableMemoryMb: selectedMemory,
-    // This release supports one exclusively assigned physical GPU only.  An
-    // out-of-contract server value must never make the UI advertise a larger
-    // pool than the runtime can enforce.
-    gpuBudgetCount: exclusiveGpuCount(value.gpu_budget_count),
+    // The platform budget may cover multiple verified physical GPUs. Runtime
+    // offers determine how many of them one workspace may reserve exclusively.
+    gpuBudgetCount: gpuPoolCount(value.gpu_budget_count),
     selectableGpuCounts: hasSelectedGpu ? selectedGpu : [0],
     // Older API responses omitted the available catalog.  Preserve that
     // compatibility, but do not turn an explicitly empty current catalog into
@@ -847,7 +925,7 @@ export function normalizeResourcePolicy(payload: unknown): ResourcePolicy {
       : (hasSelectedGpu ? selectedGpu : [0]),
     maxCpuBudgetMillicores: positiveInteger(hardCeiling.cpu_millicores),
     maxMemoryBudgetMb: positiveInteger(hardCeiling.memory_mb),
-    maxGpuBudgetCount: exclusiveGpuCount(hardCeiling.gpu_count),
+    maxGpuBudgetCount: gpuPoolCount(hardCeiling.gpu_count),
     kernelIdleTimeoutSeconds,
     kernelIdleTimeoutBounds,
     updatedAt: nullableString(value.updated_at),

@@ -15,6 +15,7 @@ from ..profile_values import cpu_limit_to_millicores
 
 
 DYNAMIC_BASE_KEY = "platform_resource_base"
+MAX_RESOURCE_PROFILE_MATRIX_SIZE = 1024
 _SAFE_COMPONENT_RE = re.compile(r"[^a-z0-9-]+")
 _DIGEST_FIELDS = tuple(
     sorted(
@@ -140,12 +141,14 @@ def ensure_resource_profile_matrix(
     *,
     cpu_millicores: list[int],
     memory_mb: list[int],
+    gpu_counts: list[int],
 ) -> None:
     """Materialize every verified Python runtime × approved resource pair.
 
     Images, commands, kernels, mounts, identity, and containment limits are
-    copied from a policy-imported immutable runtime. Only CPU and memory vary.
-    JupyterHub independently reconstructs and checks this derivation at spawn.
+    copied from a policy-imported immutable runtime. Only CPU and memory vary;
+    every selectable GPU count must already have its own verified immutable
+    runtime base. JupyterHub independently reconstructs this derivation.
     """
 
     rows = db.scalars(
@@ -175,6 +178,17 @@ def ensure_resource_profile_matrix(
         raise AppError(
             503, "RESOURCE_CATALOG_EMPTY", "No verified Python runtime is available"
         )
+    projected_size = (
+        sum(1 for family in by_kernel if int(family[3]) in gpu_counts)
+        * len(cpu_millicores)
+        * len(memory_mb)
+    )
+    if projected_size > MAX_RESOURCE_PROFILE_MATRIX_SIZE:
+        raise AppError(
+            422,
+            "RESOURCE_PROFILE_MATRIX_TOO_LARGE",
+            "The selected runtime, CPU and memory combinations exceed the safe limit",
+        )
     existing = {
         (
             row.kernel_name,
@@ -194,6 +208,8 @@ def ensure_resource_profile_matrix(
         python_version = str(family[1])
         accelerator_kind = str(family[2])
         gpu_count = int(family[3])
+        if gpu_count not in gpu_counts:
+            continue
         missing = [
             (cpu, memory)
             for cpu in cpu_millicores
@@ -213,17 +229,17 @@ def ensure_resource_profile_matrix(
         ]
         if not missing:
             continue
-        families: dict[str, tuple[WorkspaceProfile, dict[str, Any]]] = {}
+        compatible_bases: dict[str, tuple[WorkspaceProfile, dict[str, Any]]] = {}
         for candidate in bases:
             raw = _provider_options(candidate)
-            families.setdefault(_runtime_signature(raw), (candidate, raw))
-        if len(families) != 1:
+            compatible_bases.setdefault(_runtime_signature(raw), (candidate, raw))
+        if len(compatible_bases) != 1:
             raise AppError(
                 500,
                 "PROFILE_RESOURCE_AMBIGUOUS",
                 "A Python kernel maps to multiple incompatible runtime contracts",
             )
-        signature, (base, base_raw) = next(iter(families.items()))
+        signature, (base, base_raw) = next(iter(compatible_bases.items()))
         for cpu, memory in missing:
             key = (
                 kernel_name,
@@ -259,12 +275,13 @@ def ensure_resource_profile_matrix(
                 "version": base.version,
                 "config_digest": base.config_digest,
             }
+            gpu_suffix = f" · GPU {gpu_count}" if gpu_count else ""
             profile = WorkspaceProfile(
                 id=profile_id,
                 version=1,
                 name=(
                     f"{base.kernel_display_name} · CPU {cpu / 1000:g} · "
-                    f"Memory {memory} MB"
+                    f"Memory {memory} MB{gpu_suffix}"
                 )[:80],
                 kernel_name=base.kernel_name,
                 kernel_display_name=base.kernel_display_name,

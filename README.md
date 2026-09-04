@@ -5,7 +5,7 @@
 Compose를 결합해 소규모 팀이 하나의 Linux 호스트에서 개발환경을 일관되게 제공하는 것을
 목표로 합니다.
 
-> **현재 상태: v0.1.6 Technical Preview**
+> **현재 상태: v0.1.7 Technical Preview**
 >
 > 로컬 통합환경과 `cyberailabs.team` 단일 호스트 운영 구성을 함께 제공합니다. 운영 구성도
 > 조직의 TLS 인증서, 접근 CIDR, VIP/NAT와 백업 책임을 대신하지 않으므로 실제 공개 전에는
@@ -24,10 +24,12 @@ Team Workspace Platform은 다음과 같은 팀을 대상으로 합니다.
 - 한 호스트에서 시작하되 향후 Kubernetes 전환 가능성을 남기려는 팀
 - 사용자별 코드와 데이터는 분리하고 명시적인 공유 디렉터리만 함께 쓰려는 팀
 - 인터넷 전체가 아니라 승인된 패키지·Git 목적지만 개발환경에서 허용하려는 팀
-- CPU·메모리와 선택형 단일 GPU 예산 및 실행 중인 환경을 관리자가 한 화면에서 관리하려는 팀
+- CPU·메모리와 단일 호스트의 물리 GPU 풀 예산 및 실행 중인 환경을 관리자가 한 화면에서
+  관리하려는 팀
 
-반대로 불특정 다수의 공개 사용자, 강한 사용자 간 네트워크 격리, 다중 호스트 HA, 여러 GPU,
-MIG·time-slicing 같은 유연한 GPU 스케줄링이 필요한 환경에는 현재 버전이 적합하지 않습니다.
+반대로 불특정 다수의 공개 사용자, 강한 사용자 간 네트워크 격리, 다중 호스트 HA,
+MIG·time-slicing·GPU 공유나 topology-aware 배치 같은 유연한 GPU 스케줄링이 필요한 환경에는
+현재 버전이 적합하지 않습니다.
 이 경우 KubeSpawner와 Kubernetes NetworkPolicy·ResourceQuota 및 전용 GPU scheduler를
 사용하는 구성이 더 적합합니다.
 
@@ -40,7 +42,7 @@ MIG·time-slicing 같은 유연한 GPU 스케줄링이 필요한 환경에는 �
 - 웹에서 개인 개발환경 생성·시작·중지·재시작·삭제 및 JupyterLab 열기
 - 환경 이름 직접 지정 또는 `환경 N` 기본 이름 자동 할당
 - Python 3.12/3.13과 관리자가 승인한 CPU·메모리 값 독립 선택
-- 운영자가 활성화한 경우 Python 3.12 PyTorch CUDA kernel과 물리 NVIDIA GPU 1개 독점 선택
+- 운영자가 활성화한 경우 Python 3.12 PyTorch CUDA kernel과 물리 NVIDIA GPU 1개 이상 독점 선택
 - 사용자별 최대 5개 workspace와 전체 active workspace 상한
 - workspace별 private volume과 모든 팀원이 함께 쓰는 `/home/jovyan/shared`
 - 사용자 공통 및 workspace별 환경변수 생성·수정·삭제
@@ -48,12 +50,14 @@ MIG·time-slicing 같은 유연한 GPU 스케줄링이 필요한 환경에는 �
 - 실행 중 환경변수 변경 시 재실행 필요 안내 및 즉시 재실행 선택
 - 설정 시간 동안 유휴인 Jupyter 커널 자동 정리와 메모리 상태 소실 사전 안내
 - 생성·시작·중지·재시작·삭제 진행률과 실패 원인 표시
+- 실행 중인 본인 환경의 CPU·메모리 실사용량과 할당 한도 표시
 
 ### 관리자 기능
 
 - 관리자 전용 메뉴와 별도 운영·프로필·감사 탭
 - 전체 사용자 workspace 조회, 상태 확인, 시작·중지·재시작·삭제 및 접속
 - 생성된 workspace 수, 실제 실행 수와 예약된 자원 확인
+- 전체 실행 환경의 CPU·메모리 실사용량, 환경별 값과 측정 누락 범위 확인
 - 전체 CPU·메모리·GPU 예산과 사용자에게 노출할 CPU·메모리·GPU 값 관리
 - 유휴 커널 자동 정리 활성화 여부와 시간(5분~7일) 설정
 - 검증된 runtime 조합을 참조하는 논리 profile 생성·수정·비공개 처리
@@ -76,9 +80,10 @@ operation을 처리하고 reconciler는 Hub의 실제 상태를 주기적으로 
 Python 이미지·커널·명령·mount는 배포된 immutable runtime profile로 고정됩니다. 관리자는
 호스트 hard ceiling 안에서 CPU와 메모리 숫자를 추가할 수 있고, API는 각 Python runtime과의
 파생 조합을 digest로 고정합니다. 선택형 NVIDIA runtime은 CPU image와 분리된 검증된
-PyTorch CUDA image, 정확한 물리 GPU UUID 하나와 독점 할당으로 제한됩니다. JupyterHub는 짧은
-일회성 spawn ticket, 원본 runtime digest, 파생 CPU·메모리, GPU 예약과 실행 상한을 독립적으로
-재검증한 뒤에만 container를 생성합니다.
+PyTorch CUDA image와 물리 GPU UUID allowlist를 사용합니다. 선택한 수의 UUID는 workspace에
+독점 lease로 묶입니다. JupyterHub는 짧은 일회성 spawn ticket, 원본 runtime digest, 파생
+CPU·메모리, 정확한 GPU UUID 집합, GPU 예약과 실행 상한을 독립적으로 재검증한 뒤에만
+container를 생성합니다.
 
 ### 3. 최소 권한과 자격증명 분리
 
@@ -86,6 +91,7 @@ PyTorch CUDA image, 정확한 물리 GPU UUID 하나와 독점 할당으로 제�
 - 일반 lifecycle은 로그인 사용자의 `servers!user` 위임 OAuth token을 사용합니다.
 - 관리자 cross-user lifecycle token은 API나 브라우저가 아니라 worker에만 전달합니다.
 - read-only reconciler와 volume 작업 agent는 서로 다른 권한과 credential을 사용합니다.
+- Docker 실사용량은 socket을 이미 보유한 Hub의 reconciler 전용 endpoint에서만 수집합니다.
 - 사용자 container에는 Docker socket, host path와 control-plane network를 제공하지 않습니다.
 
 ### 4. 비동기 작업과 실패 복구를 데이터로 관리
@@ -184,7 +190,7 @@ NativeAuthenticator의 본인 변경 화면으로만 연결되며 기존·새 �
 3. 사용자가 시작하면 API가 aggregate CPU/RAM/GPU 예산을 하나의 SQLite transaction에서
    검사합니다.
 4. worker가 일회성 spawn authorization을 만들고 사용자 권한으로 Hub에 시작을 요청합니다.
-5. Hub가 ticket, 원본·파생 profile digest, CPU/RAM/GPU 상한과 exact GPU binding, owner,
+5. Hub가 ticket, 원본·파생 profile digest, CPU/RAM/GPU 상한과 exact GPU UUID 집합 binding, owner,
    slot, network와 volume 계약을 다시 검사합니다.
 6. 실제 server가 ready가 되면 포털이 진행률과 token 없는 Jupyter URL을 표시합니다.
 
@@ -351,10 +357,11 @@ Python/image 자체는 여전히 코드 검토, profile policy 변경과 실제 
 운영자가 GPU runtime을 명시적으로 활성화하면 CPU runtime과 별도로 Python 3.12.13,
 PyTorch `2.7.1+cu126`, CUDA 12.6 조합이 표시됩니다. 이는 일반 Python kernel에 CUDA를
 덧붙이는 방식이 아니라 CUDA wheel과 `python312-cuda` kernelspec을 포함한 별도 image입니다.
-현재는 allowlist에 등록한 물리 NVIDIA GPU 한 개를 workspace 하나에 독점 배정하며, GPU memory
-quota, MIG, time-slicing, 여러 GPU 동시 할당과 `nvcc` 개발환경은 제공하지 않습니다. 실제
-GPU host의 driver·NVIDIA Container Toolkit 설치와 tensor smoke test는 운영 배포 가이드를
-따릅니다.
+allowlist에는 물리 NVIDIA GPU를 여러 개 등록할 수 있고, 관리자가 전체 GPU 예산과 사용자에게
+노출할 GPU 개수(예: 1, 2, 4)를 지정합니다. 한 환경이 선택한 UUID 집합은 중지될 때까지
+독점됩니다. GPU memory quota, MIG, time-slicing, 동일 GPU 공유, 다중 host scheduling과
+`nvcc` 개발환경은 제공하지 않습니다. 실제 GPU host의 driver·NVIDIA Container Toolkit
+설치와 개별/전체 풀 tensor smoke test는 운영 배포 가이드를 따릅니다.
 
 같은 관리자 화면에서 유휴 커널 자동 정리를 끄거나 `5분~7일` 범위의 분 단위 값으로 설정할
 수 있습니다. 기본값은 1시간입니다. 이 정책은 시작 시점의 일회성 spawn authorization에
@@ -461,9 +468,10 @@ make production-ps
 
 GPU는 기본적으로 꺼져 있습니다. 운영 host에 NVIDIA driver와 NVIDIA Container Toolkit을
 설치하고, Git 밖의 root/operator 관리 파일에 정확한 driver·toolkit version과 허용할 물리
-GPU UUID 하나를 기록한 뒤 `PLATFORM_GPU_RUNTIME_CONFIG_FILE`로 지정해야 CUDA profile이
-생성됩니다. 사전검사는 별도 CUDA/PyTorch image를 만든 후 그 UUID만 container에 주입해
-`torch.cuda.is_available()`, device 수와 실제 CUDA tensor 실행까지 확인합니다. 자세한 순서는
+GPU UUID를 중복 없이 기록한 뒤 `PLATFORM_GPU_RUNTIME_CONFIG_FILE`로 지정해야 CUDA profile이
+생성됩니다. 사전검사는 별도 CUDA/PyTorch image를 만든 후 각 UUID와 전체 UUID 풀을
+container에 주입해 `torch.cuda.is_available()`, 정확한 device 수와 각 GPU의 실제 CUDA tensor
+실행까지 확인합니다. 자세한 순서는
 [운영 서버 전체 배포 가이드](docs/operations/production-deployment-ko.md#81-선택-nvidia-gpu-runtime-활성화)를
 따릅니다.
 
@@ -547,6 +555,7 @@ make test
 - OAuth/session/CSRF/소유권/idempotency와 관리자 권한
 - workspace quota와 aggregate CPU/RAM/GPU admission race
 - worker/reconciler lease, 재시도와 외부 상태 drift
+- 실행 컨테이너 CPU·메모리 통계의 identity, freshness, limit과 권한 경계
 - 환경변수 암호화·크기 제한·restart snapshot
 - profile digest와 Jupyter kernel/interpreter 계약
 - 서명된 유휴 커널 정책과 busy/connected culling 계약
@@ -566,16 +575,16 @@ make test
 - ADR-0009의 DNS apex/root-wildcard와 portal 해석, wildcard TLS, HTTPS-only `__Host-` cookie
 - digest-pinned image와 dependency·취약점 검토 및 SBOM
 - 실제 host 사양에 맞춘 CPU/RAM/동시 실행 부하 시험
-- GPU를 사용할 경우 driver·NVIDIA Container Toolkit, 정확한 UUID 격리와 CUDA tensor 실행 시험
+- GPU를 사용할 경우 driver·NVIDIA Container Toolkit, UUID 풀 독점 격리와 개별/전체 CUDA tensor 실행 시험
 - host disk·inode 모니터링, control-plane 예약 공간과 용량 고갈 대응
 - Platform DB, Hub DB, private/shared volume과 secret의 backup·복구 훈련
 - 승인된 package/Git allowlist와 사내망·metadata·direct egress 차단 시험
 - Docker restart 뒤 live network inspect·bridge 주소·연결 차단, volume 계약 및 전체 브라우저 E2E
 - 사용자 보존 기간, 퇴사자 처리, 감사 보존과 삭제 승인 정책
 
-단일 호스트 장애는 전체 서비스 장애가 됩니다. 다중 호스트, HA, 다중 GPU/MIG/공유 GPU
-스케줄링, 비신뢰 사용자 간 강한 격리 또는 세밀한 network policy가 필요해지면 Kubernetes
-전환을 권장합니다.
+단일 호스트 장애는 전체 서비스 장애가 됩니다. 다중 호스트, HA, MIG/time-slicing/공유 GPU,
+topology-aware 스케줄링, 비신뢰 사용자 간 강한 격리 또는 세밀한 network policy가 필요해지면
+Kubernetes 전환을 권장합니다.
 
 ## 문서
 
@@ -590,8 +599,10 @@ make test
 - [ADR-0008: 파생 자원 프로필·중지 상태 생성](docs/adr/0008-derived-resource-profiles-and-stopped-creation.md)
 - [ADR-0009: cyberailabs.team 운영 도메인](docs/adr/0009-cyberailabs-production-domain.md)
 - [ADR-0010: 유휴 Jupyter 커널 자동 정리](docs/adr/0010-idle-kernel-culling.md)
-- [ADR-0011: 단일 NVIDIA GPU와 CUDA Python kernel](docs/adr/0011-single-nvidia-gpu-cuda-kernel.md)
+- [ADR-0011: 단일 NVIDIA GPU와 CUDA Python kernel(대체됨)](docs/adr/0011-single-nvidia-gpu-cuda-kernel.md)
 - [ADR-0012: 관리자 제어형 내부 서비스 egress 예외](docs/adr/0012-dynamic-private-service-egress.md)
+- [ADR-0013: 다중 NVIDIA GPU 풀과 환경별 독점 할당](docs/adr/0013-multi-nvidia-gpu-exclusive-pool.md)
+- [ADR-0014: 실행 중 workspace CPU·메모리 관측](docs/adr/0014-live-workspace-resource-usage.md)
 
 ## 버전 정책
 
@@ -612,6 +623,10 @@ SQLite backup의 transient-lock 재시도와 Alpine frontend의 Rollup optional 
 digest-bound inventory를 다시 읽지 못하던 문제를 고치고, 로그인 fallback의 포털 복귀와
 NativeAuthenticator 본인 비밀번호 변경 진입점을 제공합니다. 또한 관리자가 사설 서비스의
 정확한 `/32 + TCP port` 예외를 감사 가능한 desired/applied 상태로 무중단 관리할 수 있습니다.
+`v0.1.7`은 단일 GPU 제한을 확장해 하나의 호스트에서 검증된 여러 물리 GPU를 관리하고,
+관리자가 전체 예산과 사용자 선택 개수를 정하며 환경별로 선택한 UUID 집합을 독점 할당합니다.
+또한 실행 환경의 CPU·메모리 실사용량을 권한이 제한된 Hub snapshot으로 수집해 사용자별 값과
+관리자 전체 합계·측정 범위를 표시합니다.
 `0.x` 기간에는 API, migration과 운영 절차가 호환성 없이 변경될 수 있습니다. runtime profile
 같은 실행 정책은 기존 row를 직접 수정하지 않고 새 version으로 추가하는 원칙을 유지합니다.
 

@@ -6,7 +6,7 @@ import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .accelerators import NVIDIA_GPU_DEVICE_ID_RE
+from .accelerators import MAX_NVIDIA_GPU_COUNT, NVIDIA_GPU_DEVICE_ID_RE
 from .policy_values import validate_kernel_idle_timeout
 from .services.internal_egress import (
     normalize_destination_cidr,
@@ -60,9 +60,11 @@ class ResourcePolicyUpdate(BaseModel):
     selectable_memory_mb: list[int] = Field(min_length=1, max_length=32)
     # Optional additions preserve the current values for older v1 clients;
     # responses always contain the resolved policy values.
-    gpu_budget_count: int | None = Field(default=None, ge=0, le=1)
+    gpu_budget_count: int | None = Field(
+        default=None, ge=0, le=MAX_NVIDIA_GPU_COUNT
+    )
     selectable_gpu_counts: list[int] | None = Field(
-        default=None, min_length=1, max_length=2
+        default=None, min_length=1, max_length=MAX_NVIDIA_GPU_COUNT + 1
     )
     kernel_idle_timeout_seconds: int | None = Field(default=None, ge=0)
 
@@ -383,7 +385,7 @@ class WorkspaceDeletionFailRequest(BaseModel):
 class SpawnConsumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = Field(ge=1, le=1)
+    schema_version: Literal[2]
     spawn_ticket: str = Field(min_length=32, max_length=256)
     username: str = Field(min_length=1, max_length=64)
     server_name: str = Field(min_length=1, max_length=64)
@@ -419,8 +421,8 @@ class SpawnAuthorizationBinding(BaseModel):
     user_environment_generation: int = Field(gt=0)
     workspace_environment_generation: int = Field(gt=0)
     kernel_idle_timeout_seconds: int = Field(strict=True, ge=0)
-    gpu_count: int = Field(strict=True, ge=0, le=1)
-    gpu_device_id: str | None = Field(pattern=NVIDIA_GPU_DEVICE_ID_RE.pattern)
+    gpu_count: int = Field(strict=True, ge=0, le=MAX_NVIDIA_GPU_COUNT)
+    gpu_device_ids: list[str] = Field(max_length=MAX_NVIDIA_GPU_COUNT)
     gpu_inventory_digest: str | None = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     valid_until_unix: int = Field(gt=0)
 
@@ -432,10 +434,20 @@ class SpawnAuthorizationBinding(BaseModel):
     @model_validator(mode="after")
     def gpu_assignment_is_exact(self) -> "SpawnAuthorizationBinding":
         if self.gpu_count == 0:
-            if self.gpu_device_id is not None or self.gpu_inventory_digest is not None:
+            if self.gpu_device_ids or self.gpu_inventory_digest is not None:
                 raise ValueError("CPU authorization cannot carry a GPU assignment")
-        elif self.gpu_device_id is None or self.gpu_inventory_digest is None:
-            raise ValueError("GPU authorization requires an exact inventory binding")
+        elif (
+            len(self.gpu_device_ids) != self.gpu_count
+            or self.gpu_device_ids != sorted(set(self.gpu_device_ids))
+            or any(
+                NVIDIA_GPU_DEVICE_ID_RE.fullmatch(device_id) is None
+                for device_id in self.gpu_device_ids
+            )
+            or self.gpu_inventory_digest is None
+        ):
+            raise ValueError(
+                "GPU authorization requires an exact canonical inventory binding"
+            )
         return self
 
 
@@ -444,7 +456,7 @@ class SpawnAuthorizationPayload(SpawnAuthorizationBinding):
 
 
 class SpawnCheckRequest(SpawnAuthorizationBinding):
-    schema_version: int = Field(ge=1, le=1)
+    schema_version: Literal[2]
 
 
 class ErrorEnvelope(BaseModel):

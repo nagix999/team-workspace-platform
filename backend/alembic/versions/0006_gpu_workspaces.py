@@ -16,6 +16,28 @@ branch_labels = None
 depends_on = None
 
 
+def _disable_sqlite_foreign_keys() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name != "sqlite":
+        return
+    # SQLite rejects a batch recreation of workspace_profiles while populated
+    # child tables still reference it.  This must be the first statement in the
+    # downgrade, before SQLite has opened a write transaction.  Alembic uses a
+    # disposable NullPool connection; application connections independently
+    # enable foreign_keys again.
+    bind.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    if bind.exec_driver_sql("PRAGMA foreign_keys").scalar_one() != 0:
+        raise RuntimeError("could not suspend SQLite foreign-key checks")
+
+
+def _assert_foreign_keys() -> None:
+    bind = op.get_bind()
+    if bind.dialect.name == "sqlite":
+        violations = bind.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+        if violations:
+            raise RuntimeError("0006 downgrade produced foreign-key violations")
+
+
 def upgrade() -> None:
     # Additive ALTERs deliberately avoid batch-recreating workspace_profiles and
     # workspaces: both are referenced by durable history tables on SQLite.
@@ -117,19 +139,31 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_column("resource_policies", "selectable_gpu_counts_json")
-    op.drop_column("resource_policies", "gpu_budget_count")
+    _disable_sqlite_foreign_keys()
+    # Later migrations may have batch-recreated these tables, which turns the
+    # originally column-attached SQLite CHECKs into table-level constraints.
+    # Recreate the tables while removing the CHECK and its columns together so
+    # SQLite never observes a constraint that references an already-dropped
+    # column.
+    with op.batch_alter_table("resource_policies", recreate="always") as batch:
+        batch.drop_constraint("ck_resource_policy_gpu_budget", type_="check")
+        batch.drop_column("selectable_gpu_counts_json")
+        batch.drop_column("gpu_budget_count")
 
-    op.drop_column("spawn_authorizations", "gpu_inventory_digest")
-    op.drop_column("spawn_authorizations", "gpu_device_id")
-    op.drop_column("spawn_authorizations", "gpu_count")
+    with op.batch_alter_table("spawn_authorizations", recreate="always") as batch:
+        batch.drop_constraint("ck_spawn_auth_gpu_contract", type_="check")
+        batch.drop_column("gpu_inventory_digest")
+        batch.drop_column("gpu_device_id")
+        batch.drop_column("gpu_count")
 
     op.drop_index("uq_workspace_assigned_gpu_device", table_name="workspaces")
     op.drop_column("workspaces", "assigned_gpu_device_id")
 
-    # Drop the column that owns the cross-column CHECK before its dependencies.
-    op.drop_column("workspace_profiles", "accelerator_kind")
-    op.drop_column("workspace_profiles", "gpu_framework_version")
-    op.drop_column("workspace_profiles", "gpu_framework")
-    op.drop_column("workspace_profiles", "cuda_version")
-    op.drop_column("workspace_profiles", "gpu_count")
+    with op.batch_alter_table("workspace_profiles", recreate="always") as batch:
+        batch.drop_constraint("ck_profiles_accelerator_contract", type_="check")
+        batch.drop_column("accelerator_kind")
+        batch.drop_column("gpu_framework_version")
+        batch.drop_column("gpu_framework")
+        batch.drop_column("cuda_version")
+        batch.drop_column("gpu_count")
+    _assert_foreign_keys()

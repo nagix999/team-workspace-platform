@@ -264,6 +264,73 @@ def test_admin_resource_values_materialize_verified_runtime_cross_product(
     engine.dispose()
 
 
+def test_admin_resource_matrix_is_bounded_before_materialization(
+    settings, tmp_path, monkeypatch
+):
+    database_url = f"sqlite:///{tmp_path / 'bounded-resource-matrix.db'}"
+    _set_migration_environment(monkeypatch, database_url)
+    command.upgrade(_alembic_config(), "head")
+    local_settings = replace(
+        settings,
+        database_url=database_url,
+        workspace_cpu_budget_millicores=32_000,
+        workspace_memory_budget_mb=32_768,
+    )
+    python312 = _extended_profile(profile_id="python312-base")
+    python313 = _extended_profile(profile_id="python313-base")
+    python313.update(
+        {
+            "python_version": "3.13.14",
+            "kernels": [
+                {
+                    "name": "python313",
+                    "display_name": "Python 3.13",
+                    "language": "python",
+                    "python_version": "3.13.14",
+                    "executable": "/opt/conda/bin/python",
+                }
+            ],
+            "default_kernel": "python313",
+        }
+    )
+    python313["config_digest"] = _profile_digest(python313)
+    policy_path = tmp_path / "profiles-bounded.json"
+    _write_policy(
+        policy_path,
+        schema_version=2,
+        profiles=[python312, python313],
+    )
+    import_profiles(local_settings, str(policy_path))
+
+    engine = create_database_engine(local_settings)
+    factory = create_session_factory(engine)
+    with factory() as db:
+        policy = get_resource_policy(db, local_settings)
+        initial_profiles = db.query(WorkspaceProfile).count()
+        with pytest.raises(AppError) as caught:
+            update_resource_policy(
+                db,
+                settings=local_settings,
+                actor_user_id=None,  # type: ignore[arg-type] - service-level test
+                expected_version=policy.version,
+                cpu_budget_millicores=32_000,
+                memory_budget_mb=32_768,
+                selectable_cpu_millicores=[1_000 * value for value in range(1, 33)],
+                selectable_memory_mb=[1_024 * value for value in range(1, 33)],
+                gpu_budget_count=0,
+                selectable_gpu_counts=[0],
+                kernel_idle_timeout_seconds=3_600,
+                reserved_cpu_millicores=0,
+                reserved_memory_mb=0,
+                reserved_gpu_count=0,
+            )
+        assert caught.value.status_code == 422
+        assert caught.value.code == "RESOURCE_PROFILE_MATRIX_TOO_LARGE"
+        assert db.query(WorkspaceProfile).count() == initial_profiles
+        db.rollback()
+    engine.dispose()
+
+
 def test_resource_matrix_keeps_distinct_cuda_runtime_families(
     settings, tmp_path, monkeypatch
 ):
@@ -289,12 +356,33 @@ def test_resource_matrix_keeps_distinct_cuda_runtime_families(
         cuda_version="12.7",
         framework_version="2.8.0",
     )
-    _write_policy(policy_path, schema_version=3, profiles=[first, second])
+    cpu = _schema_v3_profile(profile_id="python312-cpu")
+    _write_policy(policy_path, schema_version=3, profiles=[cpu, first, second])
     import_profiles(local_settings, str(policy_path))
 
     engine = create_database_engine(local_settings)
     factory = create_session_factory(engine)
     with factory() as db:
+        policy = get_resource_policy(db, local_settings)
+        with pytest.raises(AppError) as cpu_hidden:
+            update_resource_policy(
+                db,
+                settings=local_settings,
+                actor_user_id=None,  # type: ignore[arg-type]
+                expected_version=policy.version,
+                cpu_budget_millicores=8_000,
+                memory_budget_mb=8_192,
+                selectable_cpu_millicores=[2_000],
+                selectable_memory_mb=[2_048],
+                gpu_budget_count=1,
+                selectable_gpu_counts=[1],
+                kernel_idle_timeout_seconds=3_600,
+                reserved_cpu_millicores=0,
+                reserved_memory_mb=0,
+                reserved_gpu_count=0,
+            )
+        assert cpu_hidden.value.code == "RESOURCE_SELECTION_INVALID"
+        db.rollback()
         policy = get_resource_policy(db, local_settings)
         update_resource_policy(
             db,
@@ -306,7 +394,7 @@ def test_resource_matrix_keeps_distinct_cuda_runtime_families(
             selectable_cpu_millicores=[2_000, 3_500],
             selectable_memory_mb=[2_048, 3_072],
             gpu_budget_count=1,
-            selectable_gpu_counts=[1],
+            selectable_gpu_counts=[0, 1],
             kernel_idle_timeout_seconds=3_600,
             reserved_cpu_millicores=0,
             reserved_memory_mb=0,
@@ -316,6 +404,7 @@ def test_resource_matrix_keeps_distinct_cuda_runtime_families(
         derived = db.scalars(
             select(WorkspaceProfile).where(
                 WorkspaceProfile.selectable.is_(True),
+                WorkspaceProfile.accelerator_kind == "nvidia",
                 WorkspaceProfile.cpu_limit == "3.5",
                 WorkspaceProfile.memory_limit_mb == 3_072,
             )

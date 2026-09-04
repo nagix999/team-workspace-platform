@@ -21,6 +21,7 @@ production_network_isolation_mode=isolated
 die() { echo >&2 "production: $*"; exit 1; }
 
 load_environment() {
+  local -a platform_gpu_device_id_list=()
   [[ -f "${env_file}" && ! -L "${env_file}" ]] || die "run make production-init first"
   awk '
     $0 == "" || $0 ~ /^#/ { next }
@@ -37,17 +38,21 @@ load_environment() {
   : "${PLATFORM_TLS_KEY_FILE:?}"
   : "${PLATFORM_INGRESS_CIDRS_FILE:?}"
   : "${PLATFORM_TLS_GID:?}"
-  PLATFORM_NVIDIA_GPU_DEVICE_ID=""
+  PLATFORM_NVIDIA_GPU_DEVICE_IDS=""
+  PLATFORM_NVIDIA_GPU_COUNT=0
   if [[ "${PLATFORM_GPU_RUNTIME_CONFIG_FILE:-disabled}" != disabled ]]; then
     require_regular_file \
       "${PLATFORM_GPU_RUNTIME_CONFIG_FILE}" "GPU runtime policy"
-    PLATFORM_NVIDIA_GPU_DEVICE_ID="$(
+    PLATFORM_NVIDIA_GPU_DEVICE_IDS="$(
       python3 infra/host/check_gpu_runtime.py \
         --config "${PLATFORM_GPU_RUNTIME_CONFIG_FILE}" \
-        --print-device-id
+        --print-device-ids
     )" || die "GPU runtime policy is invalid"
+    IFS=',' read -r -a platform_gpu_device_id_list \
+      <<<"${PLATFORM_NVIDIA_GPU_DEVICE_IDS}"
+    PLATFORM_NVIDIA_GPU_COUNT="${#platform_gpu_device_id_list[@]}"
   fi
-  export PLATFORM_NVIDIA_GPU_DEVICE_ID
+  export PLATFORM_NVIDIA_GPU_DEVICE_IDS
 }
 
 compose() {
@@ -338,7 +343,7 @@ recover_after_user_admin_failure() {
 validate_host_contract() {
   local certificate_sans cert_key file_key key_mode san
   validate_docker_engine_contract
-  if [[ -n "${PLATFORM_NVIDIA_GPU_DEVICE_ID}" ]]; then
+  if [[ -n "${PLATFORM_NVIDIA_GPU_DEVICE_IDS}" ]]; then
     command -v nvidia-smi >/dev/null \
       || die "nvidia-smi is required when GPU support is enabled"
     command -v nvidia-ctk >/dev/null \
@@ -431,7 +436,7 @@ prepare_images_and_policy() {
   compose build singleuser-image
   image_id="$(docker image inspect team-workspace-singleuser:production-current --format '{{.Id}}')"
   [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "single-user build did not produce an exact image ID"
-  if [[ -n "${PLATFORM_NVIDIA_GPU_DEVICE_ID}" ]]; then
+  if [[ -n "${PLATFORM_NVIDIA_GPU_DEVICE_IDS}" ]]; then
     cpu_image_hex="${image_id#sha256:}"
     cpu_cuda_base="team-workspace-singleuser:cuda-base-${cpu_image_hex}"
     docker tag "${image_id}" "${cpu_cuda_base}"
@@ -459,7 +464,7 @@ prepare_images_and_policy() {
       --config "${PLATFORM_GPU_RUNTIME_CONFIG_FILE}" \
       --image "${gpu_image_id}"
     profile_check_args+=(
-      --nvidia-gpu-device-id "${PLATFORM_NVIDIA_GPU_DEVICE_ID}"
+      --nvidia-gpu-device-ids "${PLATFORM_NVIDIA_GPU_DEVICE_IDS}"
     )
   fi
   args=(
@@ -468,7 +473,12 @@ prepare_images_and_policy() {
     --shared-volume jupyter-shared
     --output "${candidate_policy_file}"
   )
-  [[ -z "${gpu_image_id}" ]] || args+=(--gpu-image-id "${gpu_image_id}")
+  if [[ -n "${gpu_image_id}" ]]; then
+    args+=(
+      --gpu-image-id "${gpu_image_id}"
+      --gpu-count "${PLATFORM_NVIDIA_GPU_COUNT}"
+    )
+  fi
   [[ ! -s "${policy_file}" ]] || args+=(--previous "${policy_file}")
   python3 infra/jupyterhub/generate_production_profile_policy.py "${args[@]}"
   while read -r retained_id; do

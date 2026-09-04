@@ -946,6 +946,90 @@ p {
   margin: 0.85rem 0 0 3.65rem;
 }
 
+.workspace-resource-usage {
+  margin: 0.85rem 0 0 3.65rem;
+  padding: 0.75rem 0.85rem;
+  color: var(--ink-soft);
+  background: #f2f7f4;
+  border: 1px solid #dce7e0;
+  border-radius: 0.55rem;
+}
+
+.workspace-resource-usage__heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.workspace-resource-usage__heading strong {
+  color: var(--ink);
+  font-size: 0.7rem;
+}
+
+.workspace-resource-usage__heading span {
+  padding: 0.17rem 0.4rem;
+  color: #1d6857;
+  background: #dff4e9;
+  border-radius: 99rem;
+  font-size: 0.58rem;
+  font-weight: 750;
+}
+
+.workspace-resource-usage--stale .workspace-resource-usage__heading span,
+.workspace-resource-usage--measuring .workspace-resource-usage__heading span {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.workspace-resource-usage--unavailable .workspace-resource-usage__heading span,
+.workspace-resource-usage--stopped .workspace-resource-usage__heading span {
+  color: #5f716d;
+  background: #e6ebe7;
+}
+
+.workspace-resource-usage dl {
+  margin: 0.6rem 0 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem;
+}
+
+.workspace-resource-usage dl > div {
+  min-width: 0;
+  padding: 0.5rem 0.58rem;
+  background: rgba(255, 255, 255, 0.75);
+  border-radius: 0.4rem;
+}
+
+.workspace-resource-usage dt {
+  font-size: 0.57rem;
+  font-weight: 700;
+}
+
+.workspace-resource-usage dd {
+  margin: 0.2rem 0 0;
+  color: var(--forest);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.workspace-resource-usage dd small {
+  color: var(--ink-soft);
+  font-size: 0.59rem;
+  font-weight: 650;
+}
+
+.workspace-resource-usage > p {
+  margin: 0.5rem 0 0;
+  font-size: 0.61rem;
+  line-height: 1.45;
+}
+
+.workspace-resource-usage--stale > p {
+  color: var(--amber);
+}
+
 .status-badge {
   display: inline-flex;
   align-items: center;
@@ -1766,6 +1850,25 @@ p {
   grid-column: span 2;
 }
 
+.admin-stats .admin-stat--usage-coverage {
+  grid-column: span 2;
+}
+
+.admin-stats .admin-stat--actual i {
+  background: var(--blue);
+}
+
+.admin-stat--usage-coverage p {
+  margin: 0.35rem 0 0;
+  color: var(--ink-soft);
+  font-size: 0.62rem;
+  line-height: 1.4;
+}
+
+.admin-stat--usage-coverage.is-warning p {
+  color: var(--amber);
+}
+
 .admin-stat--resource i {
   height: 0.3rem;
   margin-top: 0.7rem;
@@ -2264,6 +2367,21 @@ p {
   font-size: 0.61rem;
 }
 
+.admin-workspace-table .workspace-resource-usage--compact {
+  min-width: 11.5rem;
+  margin: 0.55rem 0 0;
+  padding: 0.5rem;
+}
+
+.workspace-resource-usage--compact dl {
+  grid-template-columns: 1fr;
+  gap: 0.3rem;
+}
+
+.workspace-resource-usage--compact dl > div {
+  padding: 0.35rem 0.4rem;
+}
+
 .admin-operation {
   margin-top: 0.45rem;
   padding: 0.42rem 0.48rem;
@@ -2471,7 +2589,8 @@ p {
     grid-template-columns: 1fr;
   }
 
-  .admin-stats .admin-stat--resource {
+  .admin-stats .admin-stat--resource,
+  .admin-stats .admin-stat--usage-coverage {
     grid-column: auto;
   }
 
@@ -2496,7 +2615,8 @@ p {
   .workspace-error,
   .inline-result,
   .deletion-pending,
-  .workspace-profile-details {
+  .workspace-profile-details,
+  .workspace-resource-usage {
     margin-left: 0;
   }
 

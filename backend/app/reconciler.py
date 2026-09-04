@@ -10,8 +10,8 @@ import re
 import stat
 import time
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Protocol
 from urllib.parse import urlsplit
@@ -22,9 +22,11 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .db import begin_immediate, create_database_engine, create_session_factory
 from .domain import DesiredState, HubServerState, OperationStatus
-from .hub import HubServer
-from .models import AuditEvent, Operation, User, Workspace
+from .hub import HubResourceUsage, HubServer
+from .models import AuditEvent, Operation, User, Workspace, WorkspaceProfile
 from .security import json_dumps_safe
+from .services.gpu_allocations import release_workspace_gpu_devices
+from .services.resource_usage import clear_workspace_resource_usage
 
 
 PAGINATION_MEDIA_TYPE = "application/jupyterhub-pagination+json"
@@ -42,6 +44,8 @@ ACTIVE_OPERATION_STATUSES = {
 MAX_PAGE_BYTES = 1024 * 1024
 MAX_USERS = 1000
 MAX_SERVERS = 1000
+MAX_CPU_USAGE_MILLICORES = 2_147_483_647
+MAX_MEMORY_BYTES = 9_223_372_036_854_775_807
 PAGE_LIMIT = 100
 SAFE_TEXT_RE = re.compile(r"^[^\x00-\x1f\x7f]*$")
 HEARTBEAT_PATH = Path("/tmp/platform-reconciler-health.json")
@@ -247,6 +251,35 @@ def _hub_datetime(value: Any, where: str) -> datetime | None:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def _resource_usage_item(value: Any, *, observed_at: datetime) -> tuple[tuple[str, str], HubResourceUsage]:
+    if not isinstance(value, dict) or set(value) != {
+        "username",
+        "server_name",
+        "cpu_usage_millicores",
+        "memory_usage_bytes",
+        "memory_limit_bytes",
+    }:
+        raise ReconciliationError("Hub resource usage schema is invalid")
+    username = _safe_text(value["username"], "usage username", minimum=1, maximum=128)
+    server_name = _safe_text(value["server_name"], "usage server name", maximum=128)
+    cpu = value["cpu_usage_millicores"]
+    memory = value["memory_usage_bytes"]
+    memory_limit = value["memory_limit_bytes"]
+    if (
+        type(cpu) is not int
+        or not 0 <= cpu <= MAX_CPU_USAGE_MILLICORES
+        or type(memory) is not int
+        or not 0 <= memory <= MAX_MEMORY_BYTES
+        or type(memory_limit) is not int
+        or not 1 <= memory_limit <= MAX_MEMORY_BYTES
+        or memory > memory_limit
+    ):
+        raise ReconciliationError("Hub resource usage values are invalid")
+    return (username, server_name), HubResourceUsage(
+        cpu, memory, memory_limit, observed_at
+    )
+
+
 def _server_model(username: str, server_name: str, value: Any) -> HubServer:
     expected_keys = {
         "name",
@@ -319,6 +352,42 @@ def _server_model(username: str, server_name: str, value: Any) -> HubServer:
         started_at=_hub_datetime(value["started"], "started"),
         last_activity_at=_hub_datetime(value["last_activity"], "last_activity"),
     )
+
+
+def _merge_resource_usage_snapshot(
+    value: Any,
+    servers: Mapping[tuple[str, str], HubServer],
+    *,
+    received_at: datetime,
+) -> dict[tuple[str, str], HubServer]:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "captured_at",
+        "items",
+    }:
+        raise ReconciliationError("Hub resource usage snapshot schema is invalid")
+    usage_captured_at = _hub_datetime(value["captured_at"], "resource usage captured_at")
+    items = value["items"]
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or usage_captured_at is None
+        or usage_captured_at > received_at
+        or received_at - usage_captured_at > timedelta(seconds=300)
+        or not isinstance(items, list)
+        or len(items) > MAX_SERVERS
+    ):
+        raise ReconciliationError("Hub resource usage snapshot is invalid")
+    merged = dict(servers)
+    usage_seen: set[tuple[str, str]] = set()
+    for item in items:
+        key, usage = _resource_usage_item(item, observed_at=usage_captured_at)
+        server = merged.get(key)
+        if key in usage_seen or server is None or server.state != HubServerState.RUNNING:
+            raise ReconciliationError("Hub resource usage binding is invalid")
+        usage_seen.add(key)
+        merged[key] = replace(server, resource_usage=usage)
+    return merged
 
 
 class HubSnapshotClient:
@@ -488,6 +557,18 @@ class HubSnapshotClient:
                 raise ReconciliationError("Hub users next page is invalid")
             _safe_text(next_page["url"], "next URL", maximum=2048)
             offset = next_page["offset"]
+        try:
+            usage_value = await self._get_json("/hub/api/platform/resource-usage")
+            servers = _merge_resource_usage_snapshot(
+                usage_value, servers, received_at=_utcnow()
+            )
+        except ReconciliationError:
+            # Lifecycle state remains authoritative even when the optional
+            # metrics collector is unavailable. Unmerged servers carry no
+            # usage, causing apply_snapshot to clear old cached measurements.
+            logging.getLogger(__name__).warning(
+                "Hub resource usage snapshot is unavailable or invalid"
+            )
         return HubSnapshot(servers=servers, captured_at=captured_at)
 
     async def aclose(self) -> None:
@@ -554,15 +635,20 @@ class WorkspaceReconciler:
         with self.session_factory() as db:
             begin_immediate(db)
             rows = db.execute(
-                select(Workspace, User)
+                select(Workspace, User, WorkspaceProfile.memory_limit_mb)
                 .join(User, User.id == Workspace.owner_user_id)
+                .join(
+                    WorkspaceProfile,
+                    (WorkspaceProfile.id == Workspace.profile_id)
+                    & (WorkspaceProfile.version == Workspace.profile_version),
+                )
                 .where(
                     Workspace.archived_at.is_(None),
                     ~active_operation,
                     ~operation_newer_than_snapshot,
                 )
             ).all()
-            for workspace, owner in rows:
+            for workspace, owner, profile_memory_limit_mb in rows:
                 if (
                     workspace.last_reconciled_at is not None
                     and workspace.last_reconciled_at > snapshot.captured_at
@@ -575,11 +661,35 @@ class WorkspaceReconciler:
                 observed = self._observed(server)
                 previous = workspace.observed_state
                 state_changed = previous != observed
+                usage = server.resource_usage
+                usage_age = now - usage.observed_at if usage is not None else None
+                expected_memory_limit = profile_memory_limit_mb * 1024 * 1024
+                usage_fresh = bool(
+                    server.state == HubServerState.RUNNING
+                    and usage_age is not None
+                    and timedelta(0)
+                    <= usage_age
+                    <= timedelta(seconds=self.maximum_snapshot_age_seconds)
+                    and usage.memory_limit_bytes == expected_memory_limit
+                )
+                next_usage = (
+                    (
+                        usage.cpu_usage_millicores,
+                        usage.memory_usage_bytes,
+                        usage.memory_limit_bytes,
+                        usage.observed_at,
+                    )
+                    if usage_fresh and usage is not None
+                    else (None, None, None, None)
+                )
                 release_gpu = bool(
-                    workspace.assigned_gpu_device_id is not None
+                    (
+                        workspace.assigned_gpu_device_id is not None
+                        or workspace.assigned_gpu_device_ids_json is not None
+                    )
                     and server.state
                     in {HubServerState.NOT_FOUND, HubServerState.STOPPED}
-                    and workspace.desired_state != DesiredState.RUNNING.value
+                    and workspace.desired_state == DesiredState.STOPPED.value
                 )
                 material_changed = state_changed or any(
                     (
@@ -597,8 +707,17 @@ class WorkspaceReconciler:
                 workspace.hub_started_at = server.started_at
                 workspace.hub_last_activity_at = server.last_activity_at
                 workspace.hub_server_url = None
+                if next_usage == (None, None, None, None):
+                    clear_workspace_resource_usage(workspace)
+                else:
+                    (
+                        workspace.cpu_usage_millicores,
+                        workspace.memory_usage_bytes,
+                        workspace.memory_limit_bytes,
+                        workspace.resource_usage_observed_at,
+                    ) = next_usage
                 if release_gpu:
-                    workspace.assigned_gpu_device_id = None
+                    release_workspace_gpu_devices(db, workspace)
                 # Freshness is the age of the observation, not the time this
                 # database transaction happened to finish.
                 workspace.last_reconciled_at = snapshot.captured_at

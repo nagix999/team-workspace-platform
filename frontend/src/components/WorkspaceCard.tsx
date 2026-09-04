@@ -7,6 +7,7 @@ import {
 } from "../lib/display";
 import { StatusBadge } from "./StatusBadge";
 import { EnvironmentVariablesPanel } from "./EnvironmentVariablesPanel";
+import { WorkspaceResourceUsage } from "./WorkspaceResourceUsage";
 
 interface WorkspaceCardProps {
   workspace: Workspace;
@@ -123,8 +124,8 @@ export function WorkspaceCard({
         <ul className="resource-list workspace-profile-details" aria-label="개발환경 설정">
           {kernelName && <li>기본 커널 {kernelName}</li>}
           {pythonVersion && <li>기본 노트북/터미널 Python {pythonVersion}</li>}
-          {acceleratorKind === "nvidia" && gpuCount === 1 && (
-            <li>NVIDIA GPU 1개 · CUDA {cudaVersion} · PyTorch {gpuFrameworkVersion}</li>
+          {acceleratorKind === "nvidia" && gpuCount !== null && gpuCount > 0 && (
+            <li>NVIDIA GPU {gpuCount}개 · CUDA {cudaVersion} · PyTorch {gpuFrameworkVersion}</li>
           )}
           {cpuLimit && <li>CPU {cpuLimit}</li>}
           {memoryLimitMb !== null && <li>메모리 {formatMegabytes(memoryLimitMb)}</li>}
@@ -148,6 +149,13 @@ export function WorkspaceCard({
           ) : null}
         </ul>
       )}
+
+      <WorkspaceResourceUsage
+        observedState={workspace.observedState}
+        resourceUsage={workspace.resourceUsage}
+        cpuLimit={cpuLimit}
+        label={title}
+      />
 
       {showProgress && (
         <div className="workspace-progress" aria-live="polite">

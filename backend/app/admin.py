@@ -420,13 +420,14 @@ def import_profiles(settings: Settings, policy_path: str) -> None:
         # endpoints never create or reactivate offers.
         ensure_default_offers(db)
         resource_policy = get_resource_policy(db, settings, create=True)
-        selected_cpu, selected_memory, _selected_gpu = selected_resource_values(
+        selected_cpu, selected_memory, selected_gpu = selected_resource_values(
             resource_policy
         )
         ensure_resource_profile_matrix(
             db,
             cpu_millicores=sorted(selected_cpu),
             memory_mb=sorted(selected_memory),
+            gpu_counts=sorted(selected_gpu),
         )
         ensure_default_offers(db)
         db.commit()

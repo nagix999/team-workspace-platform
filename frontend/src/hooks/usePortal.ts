@@ -12,6 +12,7 @@ import type {
 import { isAdminUser } from "../lib/access";
 import { presentError } from "../lib/display";
 import { selectLatestOperationsByWorkspace } from "../lib/operations";
+import { markWorkspaceUsageStale } from "../lib/resourceUsage";
 
 type SessionState = "CHECKING" | "AUTHENTICATED" | "ANONYMOUS";
 
@@ -224,7 +225,11 @@ export function usePortal() {
           setProfilesError(presentError(profileResult.reason));
         }
       }
-      if (workspaceResult.status === "fulfilled") setWorkspaces(workspaceResult.value);
+      if (workspaceResult.status === "fulfilled") {
+        setWorkspaces(workspaceResult.value);
+      } else {
+        setWorkspaces((current) => markWorkspaceUsageStale(current));
+      }
       if (capacityResult.status === "fulfilled") {
         setCapacity(capacityResult.value);
         setCapacityError(null);

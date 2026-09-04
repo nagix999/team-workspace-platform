@@ -51,8 +51,11 @@ JupyterHub 공식 문서는 외부 애플리케이션이 REST API로 서버를 �
 - 사용자 A의 private volume은 B에게 보이지 않고, 명시적인 shared directory만 공동 읽기·쓰기 가능하다.
 - 리버스 프록시를 통한 JupyterLab HTTP와 WebSocket이 모두 동작한다.
 - CPU, 메모리, 프로세스 수와 사용자당 환경 수에 상한이 있다.
-- 운영자가 명시적으로 활성화한 경우 물리 NVIDIA GPU 한 개가 한 workspace에만 독점 배정되고,
-  별도 Python 3.12/PyTorch CUDA kernel의 실제 tensor 실행이 검증된다.
+- 운영자가 명시적으로 활성화한 경우 단일 host의 물리 NVIDIA GPU 풀에서 선택한 수가 한
+  workspace에 독점 배정되고, 별도 Python 3.12/PyTorch CUDA kernel의 각 장치 tensor 실행이
+  검증된다.
+- 실행 중인 workspace의 CPU·메모리 실사용량은 짧은 TTL의 관측값으로 표시되고, 관리자는
+  환경별 값과 전체 fresh 합계 및 측정 누락 수를 확인할 수 있다.
 
 ### 2.3 이번 범위에서 제외
 
@@ -60,7 +63,8 @@ JupyterHub 공식 문서는 외부 애플리케이션이 REST API로 서버를 �
   loader/platform 환경변수를 덮어쓰는 기능
 - 공유 실행환경·공동 owner·세분화된 shared directory ACL
 - 일반 VM·클라우드 인스턴스 관리
-- 다중 GPU, MIG/time-slicing, GPU memory quota, 다중 노드 스케줄링, 자동 확장, 고가용성
+- MIG/time-slicing, GPU memory quota, topology-aware·다중 노드 GPU 스케줄링, 자동 확장,
+  고가용성
 - 파일별 백업 복구
 - 브라우저 안 `iframe`으로 Jupyter를 임베드하는 기능
 
@@ -103,6 +107,7 @@ flowchart LR
     A -->|OAuth code/token + Hub REST API| H[JupyterHub]
     W -->|delegated user or worker-only admin lifecycle token| H
     Q -->|read-only service token| H
+    H -->|reconciler-only usage snapshot| Q
     H --> N[NativeAuthenticator]
     N --> HD[(Hub SQLite + bcrypt hashes)]
     H -->|Docker socket| S[DockerSpawner]
@@ -121,9 +126,9 @@ flowchart LR
 | React | 환경 목록·상태·진행 표시, 생성/시작/중지 요청, launch 이동 | Hub 토큰, 컨테이너 생성, 권한 판단 |
 | FastAPI | 플랫폼 인증/인가, quota, 프로필 검증, workspace/operation/audit API, launch 권한 검사 | Jupyter 프로세스와 프록시 상태의 직접 관리 |
 | Operation worker | Hub lifecycle 명령 실행과 durable retry | 사용자 요청 인증, 주기적 전체 Hub 열거 |
-| Read-only reconciler | Hub 전체 snapshot, 실제 상태·freshness·외부 변경 감사 갱신 | server start/stop, notebook 접근, portal session·환경 secret 복호화 |
-| Platform SQLite | 사용자 매핑, 승인 프로필, 희망/최근 관찰 상태, 작업·감사 기록 | JupyterHub 내부 사용자·프록시·Spawner 상태 |
-| JupyterHub | ID/password 인증, 포털 OAuth provider, 사용자 서버 수명주기, Hub RBAC, Jupyter 인증, 프록시 경로 | 포털 제품 정책과 일반 인스턴스 도메인 |
+| Read-only reconciler | Hub 전체 snapshot, 실제 상태·freshness·외부 변경 감사 및 CPU·메모리 관측 cache 갱신 | server start/stop, notebook 접근, portal session·환경 secret 복호화 |
+| Platform SQLite | 사용자 매핑, 승인 프로필, 희망/최근 관찰 상태, 짧은 TTL 사용량 cache, 작업·감사 기록 | JupyterHub 내부 사용자·프록시·Spawner 상태와 장기 metrics 시계열 |
+| JupyterHub | ID/password 인증, 포털 OAuth provider, 사용자 서버 수명주기, Hub RBAC, Jupyter 인증, 프록시 경로, 관리 container의 Docker stats 수집 | 포털 제품 정책과 일반 인스턴스 도메인 |
 | NativeAuthenticator | bcrypt password hash, signup/승인, password 변경·reset, 로그인 실패 제한 | 포털 세션과 workspace 정책 |
 | Spawner | 사용자별 실행 단위, 자원 한도, 영속 볼륨 연결 | 포털 사용자 권한 |
 | Compose execution network / egress proxy | direct route·사용자 DNS 제거, 승인 외부 package 목적지 중계, 사내망·metadata 차단 | 사용자별 workspace 권한과 user-to-user port 격리 |
@@ -613,7 +618,8 @@ host의 mount/backup/crash-recovery 시험은 별도 출시 gate다.
 ### 7.8 Compose 결론을 재검토할 조건
 
 - 사용자 또는 동시 실행 환경이 단일 host 용량을 초과
-- 사용자 간 강한 격리, 민감 내부망, 다중 GPU·MIG·공유 GPU scheduling, 다중 노드, HA 필요
+- 사용자 간 강한 격리, 민감 내부망, MIG·공유 GPU 또는 topology-aware scheduling, 다중 노드,
+  HA 필요
 - 팀별 network policy/resource quota가 필요
 - 현재 수용한 동적 Docker container 간 east-west 접근 위험을 더는 허용할 수 없음
 - Hub의 Docker socket 보유 위험을 수용할 수 없음

@@ -52,6 +52,8 @@ const errorMessages: Record<string, string> = {
   RESOURCE_BUDGET_EXCEEDS_HARD_CEILING: "호스트 기준 최대 자원 예산을 초과했습니다.",
   RESOURCE_SELECTION_INVALID: "검증된 실행 프로필에 없는 CPU 또는 메모리 값입니다.",
   RESOURCE_SELECTION_EMPTY: "선택한 CPU·메모리 조합으로 제공할 수 있는 프로필이 없습니다.",
+  RESOURCE_PROFILE_MATRIX_TOO_LARGE:
+    "선택한 Python·CPU·메모리 조합이 너무 많습니다. 선택값 수를 줄여 주세요.",
   ENVIRONMENT_NAME_INVALID: "환경변수 이름은 영문자 또는 밑줄로 시작하는 ASCII 식별자여야 합니다.",
   ENVIRONMENT_NAME_RESERVED: "플랫폼이 관리하는 예약 환경변수 이름은 사용할 수 없습니다.",
   ENVIRONMENT_VERSION_CONFLICT: "환경변수가 다른 요청에서 변경되었습니다. 새로고침 후 다시 시도해 주세요.",
@@ -72,6 +74,27 @@ export function formatMegabytes(value: number | null): string | null {
   if (value === null) return null;
   if (value >= 1024 && value % 1024 === 0) return `${value / 1024} GB`;
   return `${value.toLocaleString("ko-KR")} MB`;
+}
+
+export function formatMillicores(value: number): string {
+  if (value < 1000) return `${value.toLocaleString("ko-KR")} mCPU`;
+  const cores = value / 1000;
+  return `${new Intl.NumberFormat("ko-KR", {
+    maximumFractionDigits: 2,
+  }).format(cores)} core`;
+}
+
+export function formatBytes(value: number): string {
+  if (value === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const unitIndex = Math.min(
+    units.length - 1,
+    Math.floor(Math.log(value) / Math.log(1024)),
+  );
+  const amount = value / 1024 ** unitIndex;
+  return `${new Intl.NumberFormat("ko-KR", {
+    maximumFractionDigits: amount < 10 ? 2 : 1,
+  }).format(amount)} ${units[unitIndex]}`;
 }
 
 export function formatDate(value: string | null): string | null {
