@@ -22,6 +22,8 @@ from profile_policy import ProfilePolicyError, load_profile_policy, profile_dige
 
 
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
+MAX_NVIDIA_GPU_COUNT = 64
 
 
 def _load_object(path: Path) -> dict[str, Any]:
@@ -39,6 +41,7 @@ def generate_policy(
     template: dict[str, Any],
     image_id: str,
     gpu_image_id: str | None = None,
+    gpu_count: int | None = None,
     shared_volume_name: str,
     previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -54,6 +57,14 @@ def generate_policy(
     if gpu_image_id is not None and not IMAGE_ID_RE.fullmatch(gpu_image_id):
         raise RuntimeError(
             "production GPU single-user image must be an exact local image ID"
+        )
+    if gpu_count is None:
+        gpu_count = 1 if gpu_image_id is not None else 0
+    if type(gpu_count) is not int or not 0 <= gpu_count <= MAX_NVIDIA_GPU_COUNT:
+        raise RuntimeError("production GPU count must be between 0 and 64")
+    if (gpu_image_id is None) != (gpu_count == 0):
+        raise RuntimeError(
+            "production GPU image and positive GPU count are required together"
         )
 
     template_profiles = []
@@ -86,18 +97,55 @@ def generate_policy(
             row["selectable"] = False
             retained.append(row)
             previous_by_id.setdefault(row["id"], []).append(row)
-        if gpu_image_id is None and any(
-            isinstance(row.get("accelerator"), dict)
+        historical_gpu_counts = [
+            row["accelerator"].get("count")
+            for row in retained
+            if isinstance(row.get("accelerator"), dict)
             and row["accelerator"].get("kind") == "nvidia"
             and row.get("enabled") is True
-            for row in retained
+        ]
+        if historical_gpu_counts and gpu_image_id is None:
+            raise RuntimeError("enabled production GPU history requires --gpu-image-id")
+        if historical_gpu_counts and any(
+            type(count) is not int or count < 1 or count > gpu_count
+            for count in historical_gpu_counts
         ):
             raise RuntimeError(
-                "enabled production GPU history requires --gpu-image-id"
+                "enabled production GPU history exceeds the configured GPU count"
             )
 
-    generated: list[dict[str, Any]] = []
+    expanded_templates: list[dict[str, Any]] = []
     for source in template_profiles:
+        accelerator = source.get("accelerator") if template_schema == 3 else None
+        if isinstance(accelerator, dict) and accelerator.get("kind") == "nvidia":
+            if gpu_image_id is None:
+                continue
+            if accelerator.get("count") != 1:
+                raise RuntimeError(
+                    "production NVIDIA template must retain the GPU1 base contract"
+                )
+            for requested_count in range(1, gpu_count + 1):
+                variant = dict(source)
+                variant["accelerator"] = {
+                    **accelerator,
+                    "count": requested_count,
+                }
+                if requested_count > 1:
+                    variant["id"] = f"{source['id']}-gpu{requested_count}"
+                    if not PROFILE_ID_RE.fullmatch(variant["id"]):
+                        raise RuntimeError("generated multi-GPU profile ID is invalid")
+                expanded_templates.append(variant)
+        else:
+            expanded_templates.append(source)
+
+    expanded_ids = [row.get("id") for row in expanded_templates]
+    if any(not isinstance(profile_id, str) for profile_id in expanded_ids) or len(
+        set(expanded_ids)
+    ) != len(expanded_ids):
+        raise RuntimeError("expanded production profile IDs must be unique")
+
+    generated: list[dict[str, Any]] = []
+    for source in expanded_templates:
         profile_id = source["id"]
         prior = previous_by_id.get(profile_id, [])
         latest = max(prior, key=lambda row: row["version"]) if prior else None
@@ -108,12 +156,6 @@ def generate_policy(
                 raise RuntimeError("schema-v3 runtime is missing accelerator metadata")
             accelerator_kind = accelerator.get("kind")
             if accelerator_kind == "nvidia":
-                if gpu_image_id is None:
-                    # GPU support is an explicit operator opt-in.  A fresh
-                    # CPU-only deployment may use the same reviewed template;
-                    # once GPU history exists, the guard above prevents silent
-                    # removal of restartable immutable rows.
-                    continue
                 candidate["image"] = gpu_image_id
             elif accelerator_kind == "none":
                 candidate["image"] = image_id
@@ -202,6 +244,7 @@ def main() -> int:
     parser.add_argument("--template", type=Path)
     parser.add_argument("--image-id")
     parser.add_argument("--gpu-image-id")
+    parser.add_argument("--gpu-count", type=int)
     parser.add_argument("--shared-volume", default="jupyter-shared")
     parser.add_argument("--previous", type=Path)
     parser.add_argument(
@@ -217,6 +260,7 @@ def main() -> int:
             args.template is not None
             or args.image_id is not None
             or args.gpu_image_id is not None
+            or args.gpu_count is not None
             or args.previous
         ):
             parser.error("--promote cannot be combined with generation arguments")
@@ -250,6 +294,7 @@ def main() -> int:
         template=template,
         image_id=args.image_id,
         gpu_image_id=args.gpu_image_id,
+        gpu_count=args.gpu_count,
         shared_volume_name=args.shared_volume,
         previous=previous,
     )

@@ -23,12 +23,92 @@ from profile_policy import (
 # and rejecting a leading option-like value makes the CLI boundary unambiguous.
 IMAGE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:-]{0,254}$")
 NVIDIA_GPU_UUID_RE = re.compile(r"^GPU-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+MAX_NVIDIA_GPU_COUNT = 64
+MAX_EXHAUSTIVE_GPU_POOL_SIZE = 8
+
+
+def _assigned_gpu_ids(
+    value: str | Sequence[str] | None, *, required_count: int
+) -> tuple[str, ...]:
+    if isinstance(value, str):
+        values = (value,)
+    elif value is None:
+        values = ()
+    else:
+        values = tuple(value)
+    if (
+        type(required_count) is not int
+        or not 1 <= required_count <= MAX_NVIDIA_GPU_COUNT
+        or len(values) != required_count
+        or any(not isinstance(item, str) for item in values)
+        or any(not NVIDIA_GPU_UUID_RE.fullmatch(item) for item in values)
+        or values != tuple(sorted(set(values)))
+    ):
+        raise ValueError(
+            "NVIDIA profile image verification requires the exact canonical GPU UUID set"
+        )
+    return values
+
+
+def _gpu_pool(value: Sequence[str] | None) -> tuple[str, ...]:
+    values = tuple(value or ())
+    if (
+        len(values) > MAX_NVIDIA_GPU_COUNT
+        or any(not isinstance(item, str) for item in values)
+        or any(not NVIDIA_GPU_UUID_RE.fullmatch(item) for item in values)
+        or values != tuple(sorted(set(values)))
+    ):
+        raise ValueError("NVIDIA GPU pool must contain sorted unique canonical UUIDs")
+    return values
+
+
+def _gpu_verification_assignments(
+    pool: tuple[str, ...], *, required_count: int
+) -> tuple[tuple[str, ...], ...]:
+    """Return exact-size assignments that exercise every physical GPU.
+
+    Testing every possible subset grows combinatorially and does not add useful
+    image-compatibility coverage. Keep ``required_count - 1`` anchor devices and
+    rotate every remaining pool member through the last slot instead. This
+    yields ``len(pool) - required_count + 1`` probes, keeps every assignment
+    canonical, and makes every physical UUID execute the image's tensor probe.
+    """
+
+    if len(pool) < required_count:
+        raise ValueError(
+            "enabled NVIDIA profile history exceeds the verified GPU pool"
+        )
+    anchors = pool[: required_count - 1]
+    return tuple(
+        _assigned_gpu_ids((*anchors, device_id), required_count=required_count)
+        for device_id in pool[required_count - 1 :]
+    )
+
+
+def _bounded_gpu_verification_assignments(
+    pool: tuple[str, ...], *, required_count: int
+) -> tuple[tuple[str, ...], ...]:
+    """Bound image probes while retaining exhaustive coverage on ordinary hosts.
+
+    The host GPU preflight already tensor-tests every UUID separately and the
+    complete pool with the deployment image. For pools up to eight devices we
+    retain per-profile physical-device coverage. Larger pools use one exact-size
+    assignment per GPU-count profile, including the highest sorted UUID, so a
+    64-device policy performs 64 rather than 2,080 profile tensor launches.
+    """
+
+    assignments = _gpu_verification_assignments(pool, required_count=required_count)
+    return (
+        assignments
+        if len(pool) <= MAX_EXHAUSTIVE_GPU_POOL_SIZE
+        else (assignments[-1],)
+    )
 
 
 def docker_verification_command(
     profile: dict[str, Any],
     *,
-    nvidia_gpu_device_id: str | None = None,
+    nvidia_gpu_device_id: str | Sequence[str] | None = None,
     docker_binary: str = "docker",
 ) -> list[str]:
     """Build the live CUDA probe, or the ordinary wrapper probe for CPU."""
@@ -70,7 +150,7 @@ def docker_verification_command(
 def _docker_command_prefix(
     profile: dict[str, Any],
     *,
-    nvidia_gpu_device_id: str | None,
+    nvidia_gpu_device_id: str | Sequence[str] | None,
     attach_gpu: bool,
     docker_binary: str,
 ) -> tuple[str, list[str]]:
@@ -81,15 +161,20 @@ def _docker_command_prefix(
     accelerator = accelerator_contract(profile)
     gpu_arguments: list[str] = []
     if accelerator is not None and accelerator["kind"] == "nvidia":
-        if not isinstance(
-            nvidia_gpu_device_id, str
-        ) or not NVIDIA_GPU_UUID_RE.fullmatch(nvidia_gpu_device_id):
-            raise ValueError(
-                "NVIDIA profile image verification requires one exact GPU UUID"
-            )
-        environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"] = nvidia_gpu_device_id
+        device_ids = _assigned_gpu_ids(
+            nvidia_gpu_device_id, required_count=accelerator["count"]
+        )
+        serialized_device_ids = ",".join(device_ids)
+        environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"] = serialized_device_ids
         if attach_gpu:
-            gpu_arguments = ["--gpus", f"device={nvidia_gpu_device_id}"]
+            # Docker's --gpus value is CSV. Preserve a multi-device request as
+            # one `device=` field by retaining literal quotes in direct argv.
+            gpu_request = (
+                f'"device={serialized_device_ids}"'
+                if len(device_ids) > 1
+                else f"device={serialized_device_ids}"
+            )
+            gpu_arguments = ["--gpus", gpu_request]
     command = [
         docker_binary,
         "run",
@@ -117,7 +202,7 @@ def _docker_command_prefix(
 def docker_kernel_verification_command(
     profile: dict[str, Any],
     *,
-    nvidia_gpu_device_id: str | None = None,
+    nvidia_gpu_device_id: str | Sequence[str] | None = None,
     docker_binary: str = "docker",
 ) -> list[str]:
     """Build the real-entrypoint kernel and image-metadata probe."""
@@ -143,9 +228,17 @@ def check_profile_images(
     allow_unsafe_policy: bool,
     execute: bool,
     nvidia_gpu_device_id: str | None = None,
+    nvidia_gpu_device_ids: Sequence[str] | None = None,
     docker_binary: str = "docker",
     runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run,
 ) -> tuple[int, int]:
+    if nvidia_gpu_device_id is not None and nvidia_gpu_device_ids is not None:
+        raise ValueError("legacy singular and plural NVIDIA GPU inputs conflict")
+    pool = _gpu_pool(
+        (nvidia_gpu_device_id,)
+        if nvidia_gpu_device_id is not None
+        else nvidia_gpu_device_ids
+    )
     policy = load_profile_policy(policy_path, allow_unsafe_images=allow_unsafe_policy)
     managed = []
     skipped_legacy = 0
@@ -165,9 +258,14 @@ def check_profile_images(
         for (profile_id, version), profile in managed:
             accelerator = accelerator_contract(profile)
             if accelerator is not None and accelerator["kind"] == "nvidia":
+                count = accelerator["count"]
+                assignments = _bounded_gpu_verification_assignments(
+                    pool, required_count=count
+                )
+                assigned = assignments[0]
                 kernel_command = docker_kernel_verification_command(
                     profile,
-                    nvidia_gpu_device_id=nvidia_gpu_device_id,
+                    nvidia_gpu_device_id=assigned,
                     docker_binary=docker_binary,
                 )
                 kernel_command_key = tuple(kernel_command)
@@ -178,16 +276,23 @@ def check_profile_images(
                         f"{profile_id}@{version}"
                     )
                     runner(kernel_command, check=True, timeout=120)
-                command = docker_verification_command(
-                    profile,
-                    nvidia_gpu_device_id=nvidia_gpu_device_id,
-                    docker_binary=docker_binary,
-                )
-                command_key = tuple(command)
-                if command_key in seen_gpu_commands:
-                    continue
-                seen_gpu_commands.add(command_key)
-                print(f"verifying GPU tensor contract: {profile_id}@{version}")
+                for assigned in assignments:
+                    command = docker_verification_command(
+                        profile,
+                        nvidia_gpu_device_id=assigned,
+                        docker_binary=docker_binary,
+                    )
+                    command_key = tuple(command)
+                    if command_key in seen_gpu_commands:
+                        continue
+                    seen_gpu_commands.add(command_key)
+                    print(
+                        "verifying GPU tensor contract: "
+                        f"{profile_id}@{version} devices={','.join(assigned)}"
+                    )
+                    # A broken container runtime or CUDA initialization must not hold
+                    # the operator lock indefinitely during production preflight.
+                    runner(command, check=True, timeout=120)
             else:
                 command = docker_verification_command(
                     profile,
@@ -195,9 +300,9 @@ def check_profile_images(
                     docker_binary=docker_binary,
                 )
                 print(f"verifying profile image contract: {profile_id}@{version}")
-            # A broken container runtime or CUDA initialization must not hold
-            # the operator lock indefinitely during production preflight.
-            runner(command, check=True, timeout=120)
+                # A broken container runtime or image initialization must not hold
+                # the operator lock indefinitely during production preflight.
+                runner(command, check=True, timeout=120)
     return len(managed), skipped_legacy
 
 
@@ -217,7 +322,9 @@ def _parser() -> argparse.ArgumentParser:
         help="validate policy/digests without invoking Docker",
     )
     parser.add_argument("--docker-binary", default="docker")
-    parser.add_argument("--nvidia-gpu-device-id")
+    gpu = parser.add_mutually_exclusive_group()
+    gpu.add_argument("--nvidia-gpu-device-id")
+    gpu.add_argument("--nvidia-gpu-device-ids")
     return parser
 
 
@@ -228,6 +335,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_unsafe_policy=args.allow_unsafe_policy,
         execute=not args.validate_only,
         nvidia_gpu_device_id=args.nvidia_gpu_device_id,
+        nvidia_gpu_device_ids=(
+            args.nvidia_gpu_device_ids.split(",")
+            if args.nvidia_gpu_device_ids is not None
+            else None
+        ),
         docker_binary=args.docker_binary,
     )
     action = "validated" if args.validate_only else "verified"

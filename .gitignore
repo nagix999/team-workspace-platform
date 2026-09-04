@@ -12,6 +12,7 @@ htmlcov/
 node_modules/
 dist/
 coverage/
+*.tsbuildinfo
 
 secrets/*
 !secrets/.gitkeep

@@ -7,7 +7,8 @@ No image, mount path, command, or Docker option from user_options or the validat
 response is passed through to Docker. CPU and memory may be derived from an
 allowlisted runtime only after the signed response, digest, and local hard ceiling
 all match. NVIDIA profiles additionally bind one signed workspace reservation to
-the operator-configured physical GPU UUID before emitting an exact DeviceRequest.
+an exact subset of the operator-configured physical GPU UUID pool before emitting
+a Docker DeviceRequest.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ MAX_ENVIRONMENT_VARIABLES = 128
 MAX_ENVIRONMENT_VALUE_BYTES = 16 * 1024
 MAX_ENVIRONMENT_CANONICAL_BYTES = 64 * 1024
 MAX_VALIDATOR_RESPONSE_BYTES = 96 * 1024
+MAX_NVIDIA_GPU_COUNT = 64
 ENVIRONMENT_HMAC_DOMAIN = b"platform-spawn-environment-v1\0"
 NVIDIA_GPU_INVENTORY_DOMAIN = b"platform-nvidia-gpu-inventory-v1\0"
 KERNEL_IDLE_TIMEOUT_MIN_SECONDS = 5 * 60
@@ -160,7 +162,7 @@ AUTHORIZATION_KEYS = {
     "memory_limit_bytes",
     "kernel_idle_timeout_seconds",
     "gpu_count",
-    "gpu_device_id",
+    "gpu_device_ids",
     "gpu_inventory_digest",
     "private_volume_slot_id",
     "private_volume_slot_number",
@@ -262,7 +264,7 @@ class GuardConfig:
     storage_policy_mode: str = LEGACY_XFS_QUOTA_STORAGE_POLICY
     max_cpu_millicores: int = 8_000
     max_memory_mb: int = 4_096
-    nvidia_gpu_device_id: str | None = None
+    nvidia_gpu_device_ids: tuple[str, ...] = ()
 
 
 _config: GuardConfig | None = None
@@ -291,12 +293,31 @@ def validate_nvidia_gpu_device_id(value: Any) -> str:
     return value
 
 
-def nvidia_gpu_inventory_digest(device_id: str) -> str:
+def validate_nvidia_gpu_device_ids(value: Any) -> tuple[str, ...]:
+    """Validate a bounded, canonical physical GPU UUID pool or assignment."""
+
+    if isinstance(value, str):
+        values = tuple(value.split(",")) if value else ()
+    elif isinstance(value, (list, tuple)):
+        values = tuple(value)
+    else:
+        values = ()
+    if (
+        not 1 <= len(values) <= MAX_NVIDIA_GPU_COUNT
+        or any(not isinstance(item, str) for item in values)
+        or any(not NVIDIA_GPU_UUID_RE.fullmatch(item) for item in values)
+        or values != tuple(sorted(set(values)))
+    ):
+        raise SpawnGuardError("NVIDIA GPU device pool is invalid")
+    return values
+
+
+def nvidia_gpu_inventory_digest(device_ids: str | list[str] | tuple[str, ...]) -> str:
     """Bind a spawn authorization to the canonical local GPU inventory."""
 
-    device_id = validate_nvidia_gpu_device_id(device_id)
+    canonical_ids = validate_nvidia_gpu_device_ids(device_ids)
     canonical = json.dumps(
-        {"schema_version": 1, "device_ids": [device_id]},
+        {"schema_version": 1, "device_ids": list(canonical_ids)},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -306,20 +327,50 @@ def nvidia_gpu_inventory_digest(device_id: str) -> str:
     )
 
 
-def _profile_nvidia_gpu_device_id(profile: dict[str, Any]) -> str | None:
+def _profile_nvidia_gpu_count(profile: dict[str, Any]) -> int:
     try:
         accelerator = accelerator_contract(profile)
     except ProfilePolicyError:
         raise SpawnGuardError("profile accelerator contract is invalid") from None
     if accelerator is None or accelerator["kind"] == "none":
-        return None
+        return 0
     if (
         accelerator["kind"] != "nvidia"
-        or accelerator["count"] != 1
+        or type(accelerator["count"]) is not int
+        or not 1 <= accelerator["count"] <= MAX_NVIDIA_GPU_COUNT
         or accelerator["sharing"] != "exclusive"
     ):
         raise SpawnGuardError("profile accelerator contract is unsupported")
-    return validate_nvidia_gpu_device_id(_get_config().nvidia_gpu_device_id)
+    return accelerator["count"]
+
+
+def _authorized_nvidia_gpu_device_ids(
+    profile: dict[str, Any], authorization: dict[str, Any]
+) -> tuple[str, ...]:
+    count = _profile_nvidia_gpu_count(profile)
+    raw = authorization.get("gpu_device_ids")
+    if count == 0:
+        if raw != []:
+            raise SpawnGuardError("CPU profile has an unexpected GPU binding")
+        return ()
+    if not isinstance(raw, list):
+        raise SpawnGuardError("GPU authorization does not match local inventory")
+    try:
+        assigned = validate_nvidia_gpu_device_ids(raw)
+    except SpawnGuardError:
+        raise SpawnGuardError(
+            "GPU authorization does not match local inventory"
+        ) from None
+    pool = validate_nvidia_gpu_device_ids(_get_config().nvidia_gpu_device_ids)
+    if (
+        len(assigned) != count
+        or any(device_id not in pool for device_id in assigned)
+        or authorization.get("gpu_count") != count
+        or authorization.get("gpu_inventory_digest")
+        != nvidia_gpu_inventory_digest(pool)
+    ):
+        raise SpawnGuardError("GPU authorization does not match local inventory")
+    return assigned
 
 
 def validate_storage_policy_configuration(
@@ -808,7 +859,10 @@ def _authorized_runtime_profile(
 
     try:
         derived = derive_resource_profile(
-            base, cpu_millicores=cpu_millicores, memory_mb=memory_mb
+            base,
+            cpu_millicores=cpu_millicores,
+            memory_mb=memory_mb,
+            gpu_count=authorization["gpu_count"],
         )
     except ProfilePolicyError:
         raise SpawnGuardError("derived resource profile is invalid") from None
@@ -856,9 +910,10 @@ def _validate_authorization(
     ):
         _positive_int(authorization[field], field)
     _kernel_idle_timeout_seconds(authorization["kernel_idle_timeout_seconds"])
-    if type(authorization["gpu_count"]) is not int or authorization[
-        "gpu_count"
-    ] not in {0, 1}:
+    if (
+        type(authorization["gpu_count"]) is not int
+        or not 0 <= authorization["gpu_count"] <= MAX_NVIDIA_GPU_COUNT
+    ):
         raise SpawnGuardError("gpu_count is invalid")
 
     user_environment = validate_user_environment(
@@ -881,21 +936,16 @@ def _validate_authorization(
     profile = _authorized_runtime_profile(
         authorization, profile_id=profile_id, profile_version=profile_version
     )
-    nvidia_gpu_device_id = _profile_nvidia_gpu_device_id(profile)
-    if nvidia_gpu_device_id is None:
+    profile_gpu_count = _profile_nvidia_gpu_count(profile)
+    if profile_gpu_count == 0:
         if (
             authorization["gpu_count"] != 0
-            or authorization["gpu_device_id"] is not None
+            or authorization["gpu_device_ids"] != []
             or authorization["gpu_inventory_digest"] is not None
         ):
             raise SpawnGuardError("CPU profile has an unexpected GPU binding")
-    elif (
-        authorization["gpu_count"] != 1
-        or authorization["gpu_device_id"] != nvidia_gpu_device_id
-        or authorization["gpu_inventory_digest"]
-        != nvidia_gpu_inventory_digest(nvidia_gpu_device_id)
-    ):
-        raise SpawnGuardError("GPU authorization does not match local inventory")
+    else:
+        _authorized_nvidia_gpu_device_ids(profile, authorization)
     for field in ("uid", "gid", "private_disk_hard_limit_bytes"):
         if authorization[field] != profile[field]:
             raise SpawnGuardError(f"authorized {field} does not match local profile")
@@ -986,9 +1036,11 @@ def _apply_local_policy(
     }
     if managed_runtime:
         platform_environment.update(kernel_runtime_environment(profile))
-    nvidia_gpu_device_id = _profile_nvidia_gpu_device_id(profile)
-    if nvidia_gpu_device_id is not None:
-        platform_environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"] = nvidia_gpu_device_id
+    nvidia_gpu_device_ids = _authorized_nvidia_gpu_device_ids(profile, authorization)
+    if nvidia_gpu_device_ids:
+        platform_environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"] = ",".join(
+            nvidia_gpu_device_ids
+        )
     if user_environment is None:
         user_environment = getattr(spawner, "_platform_user_environment", {})
     if not isinstance(user_environment, dict):
@@ -1015,7 +1067,7 @@ async def apply_user_options(spawner: Any, user_options: Any) -> None:
         result = await _signed_post(
             _get_config().consume_url,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "username": spawner.user.name,
                 "server_name": spawner.name,
                 "profile_id": profile_id,
@@ -1024,7 +1076,7 @@ async def apply_user_options(spawner: Any, user_options: Any) -> None:
             },
         )
         _exact_keys(result, CONSUME_RESPONSE_KEYS, "consume response")
-        if result["schema_version"] != 1 or result["authorized"] is not True:
+        if result["schema_version"] != 2 or result["authorized"] is not True:
             raise SpawnGuardError("spawn ticket was not authorized")
         authorization, profile, user_environment = _validate_authorization(
             result["authorization"],
@@ -1184,11 +1236,11 @@ async def pre_spawn_hook(spawner: Any) -> None:
         await _verify_docker_volumes(spawner, authorization, profile)
         result = await _signed_post(
             _get_config().check_url,
-            {"schema_version": 1, **authorization},
+            {"schema_version": 2, **authorization},
         )
         _exact_keys(result, CHECK_RESPONSE_KEYS, "check response")
         if (
-            result["schema_version"] != 1
+            result["schema_version"] != 2
             or result["authorized"] is not True
             or result["spawn_authorization_id"]
             != authorization["spawn_authorization_id"]
@@ -1322,12 +1374,19 @@ def extra_host_config(spawner: Any) -> dict[str, Any]:
         and profile.get("private_disk_quota_enforced", False) is True
     ):
         result["storage_opt"] = {"size": str(profile["writable_layer_size_bytes"])}
-    nvidia_gpu_device_id = _profile_nvidia_gpu_device_id(profile)
-    if nvidia_gpu_device_id is not None:
+    authorization = getattr(spawner, "_platform_spawn_authorization", None)
+    if not isinstance(authorization, dict):
+        raise SpawnGuardError(
+            "Docker host config requested without authorization marker"
+        )
+    nvidia_gpu_device_ids = _authorized_nvidia_gpu_device_ids(
+        profile, authorization
+    )
+    if nvidia_gpu_device_ids:
         result["device_requests"] = [
             DeviceRequest(
                 driver="nvidia",
-                device_ids=[nvidia_gpu_device_id],
+                device_ids=list(nvidia_gpu_device_ids),
                 capabilities=[["gpu"]],
             )
         ]

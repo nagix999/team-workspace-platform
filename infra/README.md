@@ -47,8 +47,8 @@ secret과 명시적인 network/storage policy mode를 확정해야 Hub가 시작
 
 `infra/singleuser/Dockerfile.cuda`는 CPU single-user image와 분리된 초기 GPU runtime이다.
 현재 검증 범위는 x86_64, Python 3.12.13, 단일 `python312-cuda` kernelspec, PyTorch
-2.7.1의 CUDA 12.6 wheel build(`2.7.1+cu126`)와 workspace당 물리 GPU 1개 독점 할당이다.
-MIG, 여러 GPU, time-slicing 및 사용자 CUDA extension compile용 `nvcc`는 지원하지
+2.7.1의 CUDA 12.6 wheel build(`2.7.1+cu126`)와 workspace당 물리 GPU 1개 이상 독점
+할당이다. MIG, time-slicing 및 사용자 CUDA extension compile용 `nvcc`는 지원하지
 않는다. CPU image에서 상속한 non-CUDA kernelspec은 제거하므로 GPU를 선택한
 사용자가 검증되지 않은 interpreter로 우회할 수 없다.
 
@@ -56,10 +56,14 @@ PyTorch wheel은 [공식 이전 버전 목록](https://pytorch.org/get-started/p
 x86_64 CPython 3.12 artifact URL과 SHA-256으로 고정한다. CUDA image의
 base도 image ID 또는 repository digest만 허용하며, 빌드 결과는 운영 profile에 넣기 전에
 다시 immutable ID/digest로 고정해야 한다. Docker build 단계의 metadata 검사는 GPU가 필요
-없지만, 운영 preflight는 새 image와 재시작 가능한 모든 enabled GPU history image를 실제
-GPU로 검사한다. 실제 workspace도 `PLATFORM_ACCELERATOR_CONTRACT`, 단일 물리 UUID인
-`PLATFORM_NVIDIA_GPU_DEVICE_IDS`, `NVIDIA_DRIVER_CAPABILITIES=compute,utility`를 검증하고
-`nvidia-smi`, CUDA 초기화, tensor matmul과 synchronize가 모두 성공해야 시작된다.
+없지만, 운영 preflight는 새 image와 재시작 가능한 모든 enabled GPU history image의 모든
+GPU 개수 계약을 exact-count 할당으로 검사한다. 8개 이하 풀은 각 물리 UUID를 순환하고,
+그보다 큰 풀은 host의 장치별/전체-pool 검사를 전제로 개수별 대표 할당 하나로 제한한다.
+실제 workspace도
+`PLATFORM_ACCELERATOR_CONTRACT`, 요청 수와 정확히
+일치하는 정렬된 물리 UUID 집합인 `PLATFORM_NVIDIA_GPU_DEVICE_IDS`,
+`NVIDIA_DRIVER_CAPABILITIES=compute,utility`를 검증하고 `nvidia-smi`, CUDA 초기화 및
+할당된 각 device의 tensor matmul과 synchronize가 모두 성공해야 시작된다.
 
 ```bash
 cpu_image_id="$(docker image inspect team-workspace-singleuser:production-current --format '{{.Id}}')"
@@ -84,9 +88,11 @@ runtime이 구성되어 있어야 한다. Toolkit 설정 명령은 host를 변�
 [NVIDIA 공식 설치 절차](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)에
 따라 별도 작업 창에서 수행하고 Docker를 재시작한다. 이 저장소의 preflight 자체는 읽기
 전용이며 설치나 daemon 설정을 바꾸지 않는다. example을 보호된 운영 파일로 복사한 뒤
-exact driver/toolkit version 및 플랫폼에 할당할 물리 GPU UUID 하나를 채운다. Production
-script는 검증된 파일에서 이 UUID를 읽어 backend와 Hub의 trusted 설정에 동일하게 주입한다.
-ordinal(`0`)이나 MIG UUID로 대체하지 않는다.
+exact driver/toolkit version 및 플랫폼에 할당할 물리 GPU UUID pool을 채운다. 하나 이상의
+UUID를 입력할 수 있고 preflight가 정렬된 canonical pool로 변환한다. Production script는
+검증된 pool을 `PLATFORM_NVIDIA_GPU_DEVICE_IDS`로 backend와 Hub에 동일하게 주입한다.
+ordinal(`0`)이나 MIG UUID로 대체하지 않는다. 정책 generator는 pool 크기가 N이면 기존
+GPU 1개 profile ID/history를 유지하면서 GPU count 1..N의 immutable profile을 만든다.
 
 ```bash
 sudo install -d -m 0750 -o root -g "$(id -gn)" /etc/team-workspace
@@ -99,17 +105,18 @@ nvidia-ctk --version
 sudoedit /etc/team-workspace/gpu-runtime.json
 python3 infra/host/check_gpu_runtime.py \
   --config /etc/team-workspace/gpu-runtime.json \
-  --print-device-id
+  --print-device-ids
 python3 infra/host/check_gpu_runtime.py \
   --config /etc/team-workspace/gpu-runtime.json \
   --image 'sha256:<production.sh가 방금 빌드한 CUDA image ID>'
 ```
 
 preflight는 host `nvidia-smi` inventory, exact toolkit/driver version, Docker의 `nvidia`
-runtime, local immutable image identity를 확인한다. 이어 allowlist의 GPU UUID 하나만
-`--gpus device=<UUID>`로 노출한 격리 container에서 동일 PyTorch tensor probe를 실행한다.
-GPU가 없는 local/CPU-only 배포에서는 이 GPU 전용 검사를 실행하지 않는다. 반대로 GPU
-profile을 활성화할 운영 host에서는 실패를 무시하거나 metadata-only 검사로 대신하면 안 된다.
+runtime, local immutable image identity를 확인한다. 이어 pool의 각 UUID를 하나씩 노출해
+PyTorch tensor probe를 실행하고, 전체 UUID pool도 동시에 노출해 정확한 device 집합과 각
+device의 tensor 실행을 다시 검증한다. GPU가 없는 local/CPU-only 배포에서는 이 GPU 전용
+검사를 실행하지 않는다. 반대로 GPU profile을 활성화할 운영 host에서는 실패를 무시하거나
+metadata-only 검사로 대신하면 안 된다.
 
 `profiles.production.example.json`은 출시 차단 placeholder다. 검토한 값을 채운 뒤
 다음 명령으로 digest를 계산해 `config_digest`에 반영한다.
@@ -201,6 +208,12 @@ NativeAuthenticator의 가입 승인과 외부 OAuth service 접근 권한은 �
 snapshot 전에 검증한다. 이 process는 `control` network, platform DB RW,
 `JUPYTERHUB_RECONCILER_TOKEN_FILE` RO만 받고 portal OAuth/session, 환경 암호화/HMAC,
 admin lifecycle secret은 받지 않는다.
+
+실행 자원 관측도 같은 권한 경계를 사용한다. Hub의 token-only 내부 endpoint는 ready
+single-user container의 persisted full ID, 실행 상태와 platform label을 확인한 뒤 CPU
+millicore 및 cache 제외 memory byte만 반환한다. exact reconciler service 외에는 aggregate
+endpoint를 호출할 수 없으며 Docker 식별자·label·오류 원문은 응답하지 않는다. stats 호출은
+bounded batch이고 개별 실패는 해당 workspace의 측정 누락으로 처리한다.
 
 reconciler는 성공 snapshot의 관측 시작시각을 `/tmp/platform-reconciler-health.json`에
 0600 atomic heartbeat로 남긴다. `python -m app.reconciler --healthcheck`는 이 시각이

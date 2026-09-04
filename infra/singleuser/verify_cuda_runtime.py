@@ -25,6 +25,7 @@ EXPECTED_ACCELERATOR_CONTRACT = {
     "framework": "pytorch",
     "framework_version": "2.7.1",
 }
+MAX_ASSIGNED_GPUS = 64
 EXPECTED_TORCH_BUILD_VERSION = "2.7.1+cu126"
 EXPECTED_PYTHON_VERSION = "3.12.13"
 EXPECTED_PYTHON_EXECUTABLE = "/opt/conda/envs/python312/bin/python"
@@ -69,20 +70,40 @@ def load_accelerator_contract(environment: dict[str, str]) -> dict[str, object]:
         raise CudaRuntimeContractError("accelerator contract does not match the image")
     for key, expected in EXPECTED_ACCELERATOR_CONTRACT.items():
         value = contract[key]
-        if type(value) is not type(expected) or value != expected:
+        if key == "count":
+            if type(value) is not int or not 1 <= value <= MAX_ASSIGNED_GPUS:
+                raise CudaRuntimeContractError(
+                    "accelerator contract does not match the image"
+                )
+        elif type(value) is not type(expected) or value != expected:
             raise CudaRuntimeContractError(
                 "accelerator contract does not match the image"
             )
     return contract
 
 
-def assigned_gpu_uuid(environment: dict[str, str]) -> str:
+def assigned_gpu_uuids(
+    environment: dict[str, str], *, expected_count: int
+) -> list[str]:
     value = environment.get("PLATFORM_NVIDIA_GPU_DEVICE_IDS", "")
-    if not GPU_UUID_RE.fullmatch(value):
+    values = value.split(",") if value else []
+    if (
+        type(expected_count) is not int
+        or not 1 <= expected_count <= MAX_ASSIGNED_GPUS
+        or len(values) != expected_count
+        or any(not GPU_UUID_RE.fullmatch(item) for item in values)
+        or values != sorted(set(values))
+    ):
         raise CudaRuntimeContractError(
-            "exactly one physical NVIDIA GPU UUID must be assigned"
+            "assigned physical NVIDIA GPU UUIDs must exactly match the requested count"
         )
-    return value
+    return values
+
+
+def assigned_gpu_uuid(environment: dict[str, str]) -> str:
+    """Backward-compatible single-GPU parser for external image checks."""
+
+    return assigned_gpu_uuids(environment, expected_count=1)[0]
 
 
 def validate_image_environment(environment: dict[str, str]) -> None:
@@ -254,10 +275,21 @@ def _nvidia_smi_gpu_uuids(
 
 def verify_gpu(
     torch_module: Any,
-    expected_uuid: str,
+    expected_uuids: list[str] | tuple[str, ...] | str,
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> list[dict[str, object]]:
+    if isinstance(expected_uuids, str):
+        expected_uuids = [expected_uuids]
+    else:
+        expected_uuids = list(expected_uuids)
+    if (
+        not expected_uuids
+        or len(expected_uuids) > MAX_ASSIGNED_GPUS
+        or any(not GPU_UUID_RE.fullmatch(value) for value in expected_uuids)
+        or expected_uuids != sorted(set(expected_uuids))
+    ):
+        raise CudaRuntimeContractError("assigned GPU UUID set is invalid")
     cuda = getattr(torch_module, "cuda", None)
     try:
         available = cuda is not None and cuda.is_available() is True
@@ -266,33 +298,45 @@ def verify_gpu(
         raise CudaRuntimeContractError("PyTorch cannot initialize CUDA") from None
     if not available:
         raise CudaRuntimeContractError("PyTorch cannot initialize CUDA")
-    if type(device_count) is not int or device_count != 1:
-        raise CudaRuntimeContractError("CUDA runtime must expose exactly one GPU")
+    if type(device_count) is not int or device_count != len(expected_uuids):
+        raise CudaRuntimeContractError(
+            "CUDA runtime must expose exactly the assigned GPU count"
+        )
     visible_uuids = _nvidia_smi_gpu_uuids(runner)
-    if visible_uuids != [expected_uuid]:
-        raise CudaRuntimeContractError("visible GPU UUID does not match the assignment")
+    if (
+        len(set(visible_uuids)) != len(visible_uuids)
+        or sorted(visible_uuids) != expected_uuids
+    ):
+        raise CudaRuntimeContractError(
+            "visible GPU UUID set does not match the assignment"
+        )
 
-    try:
-        properties = cuda.get_device_properties(0)
-        name = str(properties.name).strip()
-        major = int(properties.major)
-        minor = int(properties.minor)
-        source = torch_module.tensor([[1.0, 2.0]], device="cuda:0")
-        product = torch_module.matmul(source, source.transpose(0, 1))
-        cuda.synchronize(0)
-        result = float(product.item())
-    except Exception:
-        raise CudaRuntimeContractError("CUDA tensor execution probe failed") from None
-    if not name or major < 1 or minor < 0 or result != 5.0:
-        raise CudaRuntimeContractError("CUDA tensor execution result is invalid")
-    return [
-        {
-            "index": 0,
-            "uuid": expected_uuid,
-            "name": name,
-            "compute_capability": f"{major}.{minor}",
-        }
-    ]
+    devices: list[dict[str, object]] = []
+    for index, visible_uuid in enumerate(visible_uuids):
+        try:
+            properties = cuda.get_device_properties(index)
+            name = str(properties.name).strip()
+            major = int(properties.major)
+            minor = int(properties.minor)
+            source = torch_module.tensor([[1.0, 2.0]], device=f"cuda:{index}")
+            product = torch_module.matmul(source, source.transpose(0, 1))
+            cuda.synchronize(index)
+            result = float(product.item())
+        except Exception:
+            raise CudaRuntimeContractError(
+                "CUDA tensor execution probe failed"
+            ) from None
+        if not name or major < 1 or minor < 0 or result != 5.0:
+            raise CudaRuntimeContractError("CUDA tensor execution result is invalid")
+        devices.append(
+            {
+                "index": index,
+                "uuid": visible_uuid,
+                "name": name,
+                "compute_capability": f"{major}.{minor}",
+            }
+        )
+    return devices
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -303,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         environment = dict(os.environ)
-        load_accelerator_contract(environment)
+        accelerator_contract = load_accelerator_contract(environment)
         validate_profile_kernel_contract(environment)
         validate_image_environment(environment)
         try:
@@ -313,7 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         report = verify_metadata(torch)
         devices: list[dict[str, object]] = []
         if args.require_gpu:
-            devices = verify_gpu(torch, assigned_gpu_uuid(environment))
+            devices = verify_gpu(
+                torch,
+                assigned_gpu_uuids(
+                    environment, expected_count=int(accelerator_contract["count"])
+                ),
+            )
         report.update(
             {
                 "schema_version": 1,

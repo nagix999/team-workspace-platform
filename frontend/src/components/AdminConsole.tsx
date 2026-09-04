@@ -2,15 +2,24 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { portalApi } from "../api/client";
 import type { AdminCapacity, Operation, ResourcePolicy, Workspace } from "../api/types";
 import {
+  formatBytes,
   formatDate,
   formatMegabytes,
+  formatMillicores,
   operationStatusPresentation,
   presentError,
   workspaceStatusPresentation,
 } from "../lib/display";
 import { selectLatestOperationsByWorkspace } from "../lib/operations";
+import { cpuLimitToMillicores } from "../lib/profiles";
+import {
+  markAdminUsageStale,
+  markWorkspaceUsageStale,
+  resourceUsageIsStale,
+} from "../lib/resourceUsage";
 import { StatusBadge } from "./StatusBadge";
 import { AdminProfileManager } from "./AdminProfileManager";
+import { WorkspaceResourceUsage } from "./WorkspaceResourceUsage";
 
 interface AdminConsoleProps {
   onPlatformChanged: () => Promise<void>;
@@ -63,10 +72,11 @@ export function gpuPolicyControlState(
   >,
   gpuReservedCount: number,
 ) {
-  const available = policy.maxGpuBudgetCount === 1 &&
-    policy.availableGpuCounts.includes(1);
-  const enabled = policy.gpuBudgetCount === 1 &&
-    policy.selectableGpuCounts.includes(1);
+  const available = policy.maxGpuBudgetCount > 0 &&
+    policy.availableGpuCounts.some((value) =>
+      value > 0 && value <= policy.maxGpuBudgetCount);
+  const enabled = policy.gpuBudgetCount > 0 &&
+    policy.selectableGpuCounts.some((value) => value > 0);
   const lockedByReservation = gpuReservedCount > 0;
   return {
     available,
@@ -130,6 +140,37 @@ export function adminWorkspaceLifecycleControls(
   };
 }
 
+export function adminRuntimePollingInterval(
+  view: AdminConsoleView,
+  lifecyclePollingNeeded: boolean,
+  runningWorkspacePresent: boolean,
+): number | null {
+  if (lifecyclePollingNeeded) return 2_000;
+  if ((view === "overview" || view === "workspaces") && runningWorkspacePresent) {
+    return 15_000;
+  }
+  return null;
+}
+
+interface IntervalScheduler {
+  setInterval: (callback: () => void, delay: number) => unknown;
+  clearInterval: (interval: unknown) => void;
+}
+
+export function scheduleAdminRuntimePolling(
+  callback: () => void,
+  intervalMs: number,
+  scheduler: IntervalScheduler = {
+    setInterval: (scheduled, delay) => globalThis.setInterval(scheduled, delay),
+    clearInterval: (interval) => globalThis.clearInterval(
+      interval as ReturnType<typeof globalThis.setInterval>,
+    ),
+  },
+): () => void {
+  const interval = scheduler.setInterval(callback, intervalMs);
+  return () => scheduler.clearInterval(interval);
+}
+
 function adminOperationTypeLabel(operationType: string): string {
   const labels: Record<string, string> = {
     CREATE: "생성",
@@ -174,6 +215,82 @@ export function AdminOperationSummary({
   );
 }
 
+export function AdminUsageOverview({ capacity }: { capacity: AdminCapacity }) {
+  const usage = capacity.usage;
+  const usageStale = usage !== null && resourceUsageIsStale(usage);
+  const hasActualValues = usage !== null && (
+    usage.measured > 0 || usage.runningTotal === 0
+  );
+  const memoryBudgetBytes = capacity.memoryBudgetMb * 1024 ** 2;
+  const actualValue = (
+    kind: "cpu" | "memory",
+  ) => {
+    if (usage === null) return "확인 불가";
+    if (!hasActualValues) return "측정값 없음";
+    return kind === "cpu"
+      ? formatMillicores(usage.cpuMillicores)
+      : formatBytes(usage.memoryBytes);
+  };
+  return (
+    <>
+      <div
+        className="admin-stat--resource admin-stat--actual"
+        aria-label="CPU 실사용량과 전체 예산"
+      >
+        <span>CPU 실사용 / 전체 예산</span>
+        <strong>
+          {actualValue("cpu")}
+          <small> / {formatMillicores(capacity.cpuBudgetMillicores)}</small>
+        </strong>
+        {hasActualValues && usage && (
+          <i
+            aria-hidden="true"
+            style={{ width: `${percent(usage.cpuMillicores, capacity.cpuBudgetMillicores)}%` }}
+          />
+        )}
+      </div>
+      <div
+        className="admin-stat--resource admin-stat--actual"
+        aria-label="메모리 실사용량과 전체 예산"
+      >
+        <span>메모리 실사용 / 전체 예산</span>
+        <strong>
+          {actualValue("memory")}
+          <small> / {formatBytes(memoryBudgetBytes)}</small>
+        </strong>
+        {hasActualValues && usage && (
+          <i
+            aria-hidden="true"
+            style={{ width: `${percent(usage.memoryBytes, memoryBudgetBytes)}%` }}
+          />
+        )}
+      </div>
+      <div
+        className={`admin-stat--usage-coverage${usage?.unavailable || usageStale ? " is-warning" : ""}`}
+        aria-label="실사용량 측정 범위"
+      >
+        <span>실사용량 측정 범위</span>
+        {usage ? (
+          <>
+            <strong>{usage.measured}<small> / {usage.runningTotal}개 실행 환경</small></strong>
+            <p>
+              {usageStale
+                ? "이전 측정값입니다. 최신 상태를 다시 확인하고 있습니다."
+                : usage.unavailable > 0
+                ? `${usage.unavailable}개 환경은 현재 수집할 수 없습니다.`
+                : usage.runningTotal > 0
+                  ? "모든 실행 환경을 측정했습니다."
+                  : "현재 실행 중인 환경이 없습니다."}
+            </p>
+          </>
+        ) : (
+          <strong>확인 불가</strong>
+        )}
+      </div>
+    </>
+  );
+}
+
 const viewCopy: Record<AdminConsoleView, { title: string; description: string }> = {
   overview: {
     title: "플랫폼 현황",
@@ -211,20 +328,29 @@ export function AdminConsole({
   const [memoryBudgetMb, setMemoryBudgetMb] = useState("");
   const [selectedCpu, setSelectedCpu] = useState<Set<number>>(new Set());
   const [selectedMemory, setSelectedMemory] = useState<Set<number>>(new Set());
+  const [selectedGpu, setSelectedGpu] = useState<Set<number>>(new Set());
   const [gpuEnabled, setGpuEnabled] = useState(false);
+  const [gpuBudgetCount, setGpuBudgetCount] = useState("0");
   const [cpuToAdd, setCpuToAdd] = useState("");
   const [memoryToAdd, setMemoryToAdd] = useState("");
+  const [gpuToAdd, setGpuToAdd] = useState("");
   const [kernelCullingEnabled, setKernelCullingEnabled] = useState(false);
   const [kernelIdleMinutes, setKernelIdleMinutes] = useState("");
 
   const loadRuntime = useCallback(async (signal?: AbortSignal) => {
-    const [capacityResult, workspaceResult] = await Promise.all([
-      portalApi.adminCapacity(signal),
-      portalApi.adminWorkspaces(signal),
-    ]);
-    setCapacity(capacityResult);
-    setWorkspaces(workspaceResult.items);
-    setTotal(workspaceResult.total);
+    try {
+      const [capacityResult, workspaceResult] = await Promise.all([
+        portalApi.adminCapacity(signal),
+        portalApi.adminWorkspaces(signal),
+      ]);
+      setCapacity(capacityResult);
+      setWorkspaces(workspaceResult.items);
+      setTotal(workspaceResult.total);
+    } catch (error) {
+      setCapacity((current) => markAdminUsageStale(current));
+      setWorkspaces((current) => markWorkspaceUsageStale(current));
+      throw error;
+    }
   }, []);
 
   const loadAll = useCallback(async (signal?: AbortSignal) => {
@@ -255,14 +381,21 @@ export function AdminConsole({
         policyResult.selectableMemoryMb,
         policyResult.availableMemoryMb,
       )));
+      setSelectedGpu(new Set(availableResourceSelection(
+        policyResult.selectableGpuCounts.filter((value) => value > 0),
+        policyResult.availableGpuCounts.filter((value) => value > 0),
+      )));
       setGpuEnabled(
         gpuPolicyControlState(policyResult, capacityResult.gpuReservedCount).enabled,
       );
+      setGpuBudgetCount(String(policyResult.gpuBudgetCount));
       setKernelCullingEnabled((policyResult.kernelIdleTimeoutSeconds ?? 0) > 0);
       setKernelIdleMinutes(editableKernelIdleMinutes(policyResult));
       setError(null);
     } catch (requestError) {
       if (requestError instanceof DOMException && requestError.name === "AbortError") return;
+      setCapacity((current) => markAdminUsageStale(current));
+      setWorkspaces((current) => markWorkspaceUsageStale(current));
       setError(presentError(requestError));
     } finally {
       if (!signal?.aborted) setLoading(false);
@@ -297,10 +430,16 @@ export function AdminConsole({
       (workspace.desiredState === "DELETED" &&
         ["PENDING", "RUNNING"].includes(workspace.deletionStatus ?? ""))),
   [activeOperationIds.length, workspaces]);
+  const runtimePollingInterval = adminRuntimePollingInterval(
+    view,
+    pollingNeeded,
+    (capacity?.workspaceRunning ?? 0) > 0 ||
+      workspaces.some((workspace) => workspace.observedState === "RUNNING"),
+  );
 
   useEffect(() => {
-    if (!pollingNeeded) return;
-    const interval = window.setInterval(() => {
+    if (runtimePollingInterval === null) return;
+    return scheduleAdminRuntimePolling(() => {
       void Promise.allSettled([
         loadRuntime(),
         ...activeOperationIds.map((operationId) => portalApi.operation(operationId)),
@@ -321,17 +460,19 @@ export function AdminConsole({
         );
         if (rejected?.status === "rejected") setError(presentError(rejected.reason));
       });
-    }, 2_000);
-    return () => window.clearInterval(interval);
-  }, [activeOperationIds, loadRuntime, pollingNeeded]);
+    }, runtimePollingInterval, {
+      setInterval: (callback, delay) => window.setInterval(callback, delay),
+      clearInterval: (interval) => window.clearInterval(interval as number),
+    });
+  }, [activeOperationIds, loadRuntime, runtimePollingInterval]);
 
   const addResourceValue = (
-    value: number,
+    value: number | null,
     maximum: number,
     setter: React.Dispatch<React.SetStateAction<Set<number>>>,
     clear: React.Dispatch<React.SetStateAction<string>>,
   ) => {
-    if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) {
+    if (value === null || !Number.isSafeInteger(value) || value <= 0 || value > maximum) {
       setError("추가할 값은 현재 전체 예산과 호스트 최대 예산 이하여야 합니다.");
       return;
     }
@@ -349,8 +490,40 @@ export function AdminConsole({
     return next;
   });
 
+  const setGpuPolicyEnabled = (enabled: boolean) => {
+    setGpuEnabled(enabled);
+    if (!enabled) {
+      setGpuBudgetCount("0");
+      return;
+    }
+    const firstAvailable = policy?.availableGpuCounts.find((value) => value > 0);
+    const minimum = Math.max(1, capacity?.gpuReservedCount ?? 0, firstAvailable ?? 1);
+    setGpuBudgetCount((current) => {
+      const parsed = Number(current);
+      return String(Number.isSafeInteger(parsed) && parsed >= minimum
+        ? Math.min(parsed, policy?.maxGpuBudgetCount ?? parsed)
+        : minimum);
+    });
+    setSelectedGpu((current) => {
+      if (current.size > 0) return current;
+      return firstAvailable === undefined ? current : new Set([firstAvailable]);
+    });
+  };
+
+  const addGpuSelection = (value: number) => {
+    const maximum = Math.min(Number(gpuBudgetCount), policy?.maxGpuBudgetCount ?? 0);
+    if (!Number.isSafeInteger(value) || value <= 0 || value > maximum ||
+      !policy?.availableGpuCounts.includes(value)) {
+      setError("GPU 선택값은 현재 전체 예산 이하의 검증된 실행 프로필이어야 합니다.");
+      return;
+    }
+    setSelectedGpu((current) => new Set(current).add(value));
+    setGpuToAdd("");
+    setError(null);
+  };
+
   const unavailablePolicySelections = useMemo(() => {
-    if (!policy) return { cpu: 0, memory: 0 };
+    if (!policy) return { cpu: 0, memory: 0, gpu: 0 };
     return {
       cpu: policy.selectableCpuMillicores.length - availableResourceSelection(
         policy.selectableCpuMillicores,
@@ -360,22 +533,29 @@ export function AdminConsole({
         policy.selectableMemoryMb,
         policy.availableMemoryMb,
       ).length,
+      gpu: policy.selectableGpuCounts.filter((value) => value > 0).length -
+        availableResourceSelection(
+          policy.selectableGpuCounts.filter((value) => value > 0),
+          policy.availableGpuCounts.filter((value) => value > 0),
+        ).length,
     };
   }, [policy]);
 
   const savePolicy = async () => {
     if (!policy || !capacity) return;
-    const cpuBudgetMillicores = Number(cpuBudgetCores) * 1000;
+    const cpuBudgetMillicores = cpuLimitToMillicores(cpuBudgetCores);
     const memoryBudget = Number(memoryBudgetMb);
-    const gpuBudgetCount = gpuEnabled ? 1 : 0;
-    if (!Number.isSafeInteger(cpuBudgetMillicores) || cpuBudgetMillicores <= 0 ||
-      !Number.isSafeInteger(memoryBudget) || memoryBudget <= 0) {
-      setError("CPU 전체 예산과 메모리 전체 예산을 올바르게 입력해 주세요.");
+    const requestedGpuBudgetCount = gpuEnabled ? Number(gpuBudgetCount) : 0;
+    if (cpuBudgetMillicores === null ||
+      !Number.isSafeInteger(memoryBudget) || memoryBudget <= 0 ||
+      !Number.isSafeInteger(requestedGpuBudgetCount) || requestedGpuBudgetCount < 0 ||
+      (gpuEnabled && requestedGpuBudgetCount === 0)) {
+      setError("CPU·메모리 전체 예산과 GPU 전체 예산을 올바르게 입력해 주세요.");
       return;
     }
     if (cpuBudgetMillicores < capacity.cpuReservedMillicores ||
       memoryBudget < capacity.memoryReservedMb ||
-      gpuBudgetCount < capacity.gpuReservedCount) {
+      requestedGpuBudgetCount < capacity.gpuReservedCount) {
       setError("현재 예약량보다 전체 예산을 낮출 수 없습니다.");
       return;
     }
@@ -385,9 +565,18 @@ export function AdminConsole({
       setError("호스트 기준 최대 CPU 또는 메모리 예산을 초과했습니다.");
       return;
     }
-    if (gpuBudgetCount > policy.maxGpuBudgetCount ||
-      (gpuEnabled && !policy.availableGpuCounts.includes(1))) {
-      setError("검증된 NVIDIA GPU 및 CUDA 실행 프로필이 없어 GPU를 공개할 수 없습니다.");
+    if (requestedGpuBudgetCount > policy.maxGpuBudgetCount ||
+      (gpuEnabled && !policy.availableGpuCounts.some((value) =>
+        value > 0 && value <= requestedGpuBudgetCount))) {
+      setError("GPU 전체 예산은 검증된 호스트 GPU 수 이하여야 하며 CUDA 실행 프로필이 필요합니다.");
+      return;
+    }
+    const selectableGpuCounts = [...selectedGpu]
+      .sort((left, right) => left - right);
+    if (gpuEnabled && (selectableGpuCounts.length === 0 ||
+      selectableGpuCounts.some((value) =>
+        value > requestedGpuBudgetCount || !policy.availableGpuCounts.includes(value)))) {
+      setError("사용자 GPU 선택값은 전체 GPU 예산 이하의 검증된 값을 하나 이상 지정해 주세요.");
       return;
     }
     if (selectedCpu.size === 0 || selectedMemory.size === 0) {
@@ -423,11 +612,15 @@ export function AdminConsole({
         memoryBudgetMb: memoryBudget,
         selectableCpuMillicores: [...selectedCpu].sort((left, right) => left - right),
         selectableMemoryMb: [...selectedMemory].sort((left, right) => left - right),
-        gpuBudgetCount,
-        selectableGpuCounts: gpuEnabled ? [0, 1] : [0],
+        gpuBudgetCount: requestedGpuBudgetCount,
+        selectableGpuCounts: gpuEnabled ? [0, ...selectableGpuCounts] : [0],
         kernelIdleTimeoutSeconds,
       });
       setPolicy(updated);
+      setGpuEnabled(
+        gpuPolicyControlState(updated, capacity.gpuReservedCount).enabled,
+      );
+      setGpuBudgetCount(String(updated.gpuBudgetCount));
       setKernelCullingEnabled((updated.kernelIdleTimeoutSeconds ?? 0) > 0);
       setKernelIdleMinutes(editableKernelIdleMinutes(updated));
       setNotice("자원 및 유휴 커널 정책을 저장했습니다. 실행 중인 환경에는 재시작 후 적용됩니다.");
@@ -527,6 +720,7 @@ export function AdminConsole({
             <strong>{formatMegabytes(capacity.memoryReservedMb)}<small> / {formatMegabytes(capacity.memoryBudgetMb)}</small></strong>
             <i style={{ width: `${percent(capacity.memoryReservedMb, capacity.memoryBudgetMb)}%` }} />
           </div>
+          <AdminUsageOverview capacity={capacity} />
         </div>
       )}
 
@@ -543,8 +737,8 @@ export function AdminConsole({
             <div>
               <h4 id="admin-gpu-policy-heading">NVIDIA GPU 환경</h4>
               <p>
-                운영 사전점검을 통과한 물리 GPU 1개를 한 환경에 독점 할당합니다.
-                GPU 메모리 용량 제한이나 공유 할당은 지원하지 않습니다.
+                운영 사전점검을 통과한 물리 GPU 풀에서 선택한 수만큼 한 환경에 독점
+                할당합니다. GPU 메모리 용량 제한, MIG와 공유 할당은 지원하지 않습니다.
               </p>
             </div>
             <div className="admin-kernel-policy__controls">
@@ -556,9 +750,25 @@ export function AdminConsole({
                     policy,
                     capacity.gpuReservedCount,
                   ).canChange}
-                  onChange={(event) => setGpuEnabled(event.target.checked)}
+                  onChange={(event) => setGpuPolicyEnabled(event.target.checked)}
                 />
-                <span>사용자에게 NVIDIA GPU 1개 선택 허용</span>
+                <span>사용자에게 NVIDIA GPU 선택 허용</span>
+              </label>
+              <label>
+                <span>GPU 전체 예산 (개)</span>
+                <input
+                  type="number"
+                  aria-label="GPU 전체 예산"
+                  min={gpuEnabled ? Math.max(1, capacity.gpuReservedCount) : 0}
+                  max={policy.maxGpuBudgetCount}
+                  step="1"
+                  value={gpuBudgetCount}
+                  disabled={saving || !gpuEnabled || !gpuPolicyControlState(
+                    policy,
+                    capacity.gpuReservedCount,
+                  ).available}
+                  onChange={(event) => setGpuBudgetCount(event.target.value)}
+                />
               </label>
             </div>
             {!gpuPolicyControlState(policy, capacity.gpuReservedCount).available ? (
@@ -567,7 +777,8 @@ export function AdminConsole({
               </p>
             ) : (
               <p className="admin-hard-ceiling">
-                호스트 GPU: 1개 · 현재 독점 예약 {capacity.gpuReservedCount}개
+                검증된 호스트 GPU: {policy.maxGpuBudgetCount}개 · 현재 독점 예약 {capacity.gpuReservedCount}개
+                · 미예약 {Math.max(0, policy.maxGpuBudgetCount - capacity.gpuReservedCount)}개
               </p>
             )}
           </section>
@@ -606,15 +817,17 @@ export function AdminConsole({
                 : "확인 불가"}, 메모리 {formatMegabytes(policy.maxMemoryBudgetMb) ?? "확인 불가"}
             </p>
           )}
-          {(unavailablePolicySelections.cpu > 0 || unavailablePolicySelections.memory > 0) && (
+          {(unavailablePolicySelections.cpu > 0 || unavailablePolicySelections.memory > 0 ||
+            unavailablePolicySelections.gpu > 0) && (
             <p className="admin-message admin-message--warning" role="status">
               현재 프로필 카탈로그에서 제거된 이전 선택값은 저장 시 제외됩니다.
-              사용 가능한 CPU와 메모리를 각각 하나 이상 다시 선택해 주세요.
+              사용 가능한 CPU·메모리와 활성화한 경우 GPU 값을 각각 하나 이상 다시 선택해 주세요.
             </p>
           )}
           <p className="admin-resource-note">
             배포 호스트의 최대 예산 안에서 값을 직접 추가할 수 있습니다. 저장 시 검증된
-            Python 런타임마다 CPU × Memory 조합이 생성되며, 이미지와 실행 명령은 바뀌지 않습니다.
+            Python 런타임마다 CPU × Memory × GPU 개수 조합이 생성되며, GPU는 환경별로
+            선택한 수만큼 독점 예약됩니다.
           </p>
           <div className="admin-resource-selectors">
             <section aria-labelledby="admin-cpu-values-heading">
@@ -639,9 +852,9 @@ export function AdminConsole({
                   type="button"
                   disabled={saving || cpuToAdd === ""}
                   onClick={() => addResourceValue(
-                    Number(cpuToAdd) * 1000,
+                    cpuLimitToMillicores(cpuToAdd),
                     Math.min(
-                      Number(cpuBudgetCores || 0) * 1000,
+                      cpuLimitToMillicores(cpuBudgetCores) ?? 0,
                       policy.maxCpuBudgetMillicores ?? Number.MAX_SAFE_INTEGER,
                     ),
                     setSelectedCpu,
@@ -708,6 +921,48 @@ export function AdminConsole({
                   </span>
                 ))}
               </div>
+            </section>
+            <section aria-labelledby="admin-gpu-values-heading">
+              <h4 id="admin-gpu-values-heading">사용자 GPU 선택값</h4>
+              <div className="admin-resource-add">
+                <input
+                  type="number"
+                  aria-label="추가할 GPU 값"
+                  value={gpuToAdd}
+                  min="1"
+                  max={Math.min(
+                    Number(gpuBudgetCount || 0),
+                    policy.maxGpuBudgetCount,
+                  )}
+                  step="1"
+                  placeholder="예: 2"
+                  disabled={saving || !gpuEnabled}
+                  onChange={(event) => setGpuToAdd(event.target.value)}
+                />
+                <button
+                  className="button button--secondary"
+                  type="button"
+                  disabled={saving || !gpuEnabled || gpuToAdd === ""}
+                  onClick={() => addGpuSelection(Number(gpuToAdd))}
+                >GPU 선택값 추가</button>
+              </div>
+              <div className="admin-resource-values" aria-label="선택된 GPU 값">
+                {[...selectedGpu].sort((left, right) => left - right).map((value) => (
+                  <span key={value}>
+                    GPU {value}개
+                    <button
+                      type="button"
+                      aria-label={`GPU ${value}개 제거`}
+                      disabled={saving || !gpuEnabled}
+                      onClick={() => removeResourceValue(value, setSelectedGpu)}
+                    >×</button>
+                  </span>
+                ))}
+              </div>
+              <p className="admin-resource-note">
+                CPU 전용 0개는 항상 포함됩니다. 추가한 값마다 동일 환경에 해당 수의 물리
+                GPU가 함께 예약됩니다.
+              </p>
             </section>
           </div>
           <section className="admin-kernel-policy" aria-labelledby="admin-kernel-policy-heading">
@@ -795,7 +1050,7 @@ export function AdminConsole({
                   <th scope="col">환경</th>
                   <th scope="col">사용자</th>
                   <th scope="col">상태</th>
-                  <th scope="col">자원</th>
+                  <th scope="col">할당 및 실사용</th>
                   <th scope="col">갱신</th>
                   <th scope="col">작업</th>
                 </tr>
@@ -846,8 +1101,15 @@ export function AdminConsole({
                         )}
                       </td>
                       <td>
-                        <span>CPU {workspace.cpuLimit ?? "-"}</span>
-                        <span>메모리 {formatMegabytes(workspace.memoryLimitMb) ?? "-"}</span>
+                        <span>할당 CPU {workspace.cpuLimit ?? "-"}</span>
+                        <span>할당 메모리 {formatMegabytes(workspace.memoryLimitMb) ?? "-"}</span>
+                        <WorkspaceResourceUsage
+                          observedState={workspace.observedState}
+                          resourceUsage={workspace.resourceUsage}
+                          cpuLimit={workspace.cpuLimit}
+                          label={workspace.name}
+                          compact
+                        />
                       </td>
                       <td>{formatDate(workspace.updatedAt ?? workspace.createdAt) ?? "-"}</td>
                       <td>

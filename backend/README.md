@@ -127,6 +127,18 @@ key 교체는 명시적인 재암호화 migration과 restore 시험으로만 수
   않으며 일반 사용자 capacity 응답에도 현재 정책을 안내용으로 포함한다.
   hard ceiling을 낮출 때는 먼저 이 API로 persisted budget을 새 ceiling 이하로 줄인 뒤
   배포 설정을 변경한다. 반대 순서에서는 admission/import가 의도적으로 fail-closed된다.
+- 검증된 NVIDIA UUID inventory는 정렬·중복 제거된 최대 64개 physical GPU pool이다.
+  profile의 `gpu_count`만큼 낮은 UUID부터 결정적으로 할당하며
+  `workspace_gpu_leases.gpu_device_id` primary key가 환경 간 중복 할당을 DB 수준에서 막는다.
+  할당 UUID 집합과 전체 inventory digest는 spawn authorization schema v2에 고정된다.
+  시작 실패와 restart 동안 lease를 보존하고, Hub의 STOPPED/NOT_FOUND 또는 삭제 완료가
+  확인된 뒤에만 반환한다. 배포 GPU 개수와 관리자 GPU budget은 모두 hard ceiling이다.
+- 실행 중 CPU/메모리 사용량은 reconciler가 JupyterHub의 전용
+  `/hub/api/platform/resource-usage` 배치 응답에서 수집해 workspace에 관측 cache로
+  저장한다. 수명주기 상태와 분리해 측정 endpoint 실패는 기존 상태 동기화를 막지 않으며,
+  누락·오래된 측정·프로필 메모리 한도 불일치는 사용량 없음으로 처리한다. 사용자 및 관리자
+  응답에는 server가 계산한 `expires_at`을 포함해 브라우저 refresh가 끊겨도 현재값처럼
+  오인하지 않게 한다.
 - workspace 응답의 `active_operation`은 최신 `PENDING|RUNNING|WAITING_EXTERNAL` lifecycle
   작업의 `{id,operation_type,status,progress_percent,requested_at}` 또는 `null`이다. 새 요청은
   이전 active lifecycle을 `CANCELLED/SUPERSEDED`로 종료하므로 새로고침 뒤에도 이 필드를
@@ -164,4 +176,5 @@ pytest
 테스트는 실제 Hub 대신 `FakeJupyterHubProvider`를 주입하며 OAuth state 단일 사용,
 opaque cookie/암호문 저장, 소유권, transactional 5-slot/idempotency, provisioning
 lease·manifest·재시도, worker 수렴, 관리자 actor/target 분리, 환경 secret/rollback,
-restart/remove, crash-safe deletion과 populated 0003→0007 migration 데이터 보존을 확인한다.
+restart/remove, crash-safe deletion과 populated 0003→0009 migration 데이터 보존,
+다중 GPU의 원자적 lease·재시작 보존·확정 중지 후 반환을 확인한다.

@@ -28,22 +28,25 @@ from check_gpu_runtime import (  # noqa: E402
 
 
 GPU_UUID = "GPU-12345678-1234-5678-9abc-123456789abc"
+GPU_UUID_2 = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 IMAGE_ID = "sha256:" + "a" * 64
 
 
-def runtime_report(gpu_uuid: str = GPU_UUID) -> dict[str, object]:
+def runtime_report(gpu_uuids: list[str] | None = None) -> dict[str, object]:
+    gpu_uuids = gpu_uuids or [GPU_UUID]
     return {
         **EXPECTED_RUNTIME_REPORT,
         "schema_version": 1,
         "mode": "runtime",
-        "device_count": 1,
+        "device_count": len(gpu_uuids),
         "devices": [
             {
-                "index": 0,
+                "index": index,
                 "uuid": gpu_uuid,
                 "name": "Test GPU",
                 "compute_capability": "8.0",
             }
+            for index, gpu_uuid in enumerate(gpu_uuids)
         ],
         "status": "passed",
     }
@@ -53,7 +56,8 @@ class FakeRunner:
     def __init__(self) -> None:
         self.commands: list[list[str]] = []
         self.runtimes: object = {"io.containerd.runc.v2": {}, "nvidia": {}}
-        self.probe_report = runtime_report()
+        self.gpu_uuids = [GPU_UUID]
+        self.probe_report: dict[str, object] | None = None
 
     def __call__(
         self, args: list[str], **kwargs: object
@@ -64,7 +68,9 @@ class FakeRunner:
         elif args == ["docker", "info", "--format", "{{json .Runtimes}}"]:
             stdout = json.dumps(self.runtimes)
         elif args[0] == "nvidia-smi":
-            stdout = f"{GPU_UUID}, 570.124.06\n"
+            stdout = "".join(
+                f"{gpu_uuid}, 570.124.06\n" for gpu_uuid in self.gpu_uuids
+            )
         elif args[:5] == [
             "docker",
             "image",
@@ -82,7 +88,15 @@ class FakeRunner:
         ]:
             stdout = "[]\n"
         elif args[:2] == ["docker", "run"]:
-            stdout = json.dumps(self.probe_report) + "\n"
+            device_argument = next(
+                argument
+                for argument in args
+                if argument.strip('"').startswith("device=")
+            )
+            requested = (
+                device_argument.strip('"').removeprefix("device=").split(",")
+            )
+            stdout = json.dumps(self.probe_report or runtime_report(requested)) + "\n"
         else:
             raise AssertionError(f"unexpected command: {args}")
         return subprocess.CompletedProcess(
@@ -113,10 +127,6 @@ class GpuConfigTests(unittest.TestCase):
             ("gpu_uuids", []),
             ("gpu_uuids", [GPU_UUID.upper()]),
             ("gpu_uuids", [GPU_UUID, GPU_UUID]),
-            (
-                "gpu_uuids",
-                [GPU_UUID, "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"],
-            ),
             ("nvidia_driver_version", "latest"),
             ("nvidia_container_toolkit_version", "latest"),
         )
@@ -126,6 +136,11 @@ class GpuConfigTests(unittest.TestCase):
                 candidate[key] = value
                 with self.assertRaises(GpuPreflightError):
                     self._load(candidate)
+
+        multiple = {**self.config, "gpu_uuids": [GPU_UUID, GPU_UUID_2]}
+        self.assertEqual(self._load(multiple), multiple)
+        unsorted = {**self.config, "gpu_uuids": [GPU_UUID_2, GPU_UUID]}
+        self.assertEqual(self._load(unsorted), multiple)
 
     def test_runtime_image_argument_must_be_immutable(self) -> None:
         self.assertEqual(validate_image_reference(IMAGE_ID), IMAGE_ID)
@@ -169,6 +184,24 @@ class GpuConfigTests(unittest.TestCase):
                 status = main(["--config", str(path), "--print-device-id"])
             self.assertEqual(status, 0)
             self.assertEqual(output.getvalue(), GPU_UUID + "\n")
+
+    def test_print_device_ids_supports_a_validated_pool(self) -> None:
+        config = {**self.config, "gpu_uuids": [GPU_UUID, GPU_UUID_2]}
+        with tempfile.TemporaryDirectory(dir=REPOSITORY_ROOT) as directory:
+            path = Path(directory) / "gpu.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            os.chmod(path, 0o600)
+            output = StringIO()
+            with redirect_stdout(output):
+                status = main(["--config", str(path), "--print-device-ids"])
+            self.assertEqual(status, 0)
+            self.assertEqual(output.getvalue(), f"{GPU_UUID},{GPU_UUID_2}\n")
+
+            error = StringIO()
+            with redirect_stderr(error):
+                status = main(["--config", str(path), "--print-device-id"])
+            self.assertEqual(status, 1)
+            self.assertIn("use --print-device-ids", error.getvalue())
 
     def test_cli_requires_exactly_one_output_or_probe_mode(self) -> None:
         error = StringIO()
@@ -223,6 +256,38 @@ class GpuPreflightTests(unittest.TestCase):
             self.assertIn(required, probe)
         self.assertNotIn("--runtime=nvidia", probe)
 
+    def test_preflight_probes_each_gpu_and_the_complete_pool(self) -> None:
+        runner = FakeRunner()
+        runner.gpu_uuids = [GPU_UUID, GPU_UUID_2]
+        config = {**self.config, "gpu_uuids": runner.gpu_uuids}
+
+        report = run_preflight(config, image=IMAGE_ID, runner=runner)
+
+        probe_commands = [
+            command
+            for command in runner.commands
+            if command[:2] == ["docker", "run"]
+        ]
+        self.assertEqual(len(probe_commands), 3)
+        self.assertEqual(
+            {
+                next(
+                    value
+                    for value in command
+                    if value.strip('"').startswith("device=")
+                )
+                for command in probe_commands
+            },
+            {
+                f"device={GPU_UUID}",
+                f"device={GPU_UUID_2}",
+                f'"device={GPU_UUID},{GPU_UUID_2}"',
+            },
+        )
+        self.assertEqual(len(report["probes"]), 2)
+        self.assertEqual(report["pool_probe"]["device_count"], 2)
+        self.assertEqual(report["runtime_contract"]["count"], 2)
+
     def test_missing_docker_nvidia_runtime_fails_closed(self) -> None:
         runner = FakeRunner()
         runner.runtimes = {"io.containerd.runc.v2": {}}
@@ -239,7 +304,7 @@ class GpuPreflightTests(unittest.TestCase):
                 [
                     {
                         **runtime_report()["devices"][0],
-                        "uuid": "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "uuid": GPU_UUID_2,
                     }
                 ],
             ),
@@ -249,6 +314,7 @@ class GpuPreflightTests(unittest.TestCase):
         ):
             with self.subTest(key=key):
                 runner = FakeRunner()
+                runner.probe_report = runtime_report()
                 runner.probe_report[key] = value
                 with self.assertRaises(GpuPreflightError):
                     run_preflight(self.config, image=IMAGE_ID, runner=runner)

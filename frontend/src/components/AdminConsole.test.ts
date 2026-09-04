@@ -1,15 +1,18 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { Operation, OperationStatus } from "../api/types";
+import type { AdminCapacity, Operation, OperationStatus } from "../api/types";
 import {
+  AdminUsageOverview,
   AdminOperationSummary,
   adminOperationNeedsPolling,
+  adminRuntimePollingInterval,
   adminWorkspaceLifecycleControls,
   adminWorkspaceOperationNeedsPolling,
   availableResourceSelection,
   gpuPolicyControlState,
   resolveKernelIdleTimeoutSeconds,
+  scheduleAdminRuntimePolling,
 } from "./AdminConsole";
 
 const operation = (operationType: string, status: OperationStatus): Operation => ({
@@ -26,6 +29,75 @@ const operation = (operationType: string, status: OperationStatus): Operation =>
 });
 
 describe("AdminConsole operation polling", () => {
+  it("keeps live usage polling scoped to overview/workspaces and cleans up its timer", () => {
+    expect(adminRuntimePollingInterval("overview", false, true)).toBe(15_000);
+    expect(adminRuntimePollingInterval("workspaces", false, true)).toBe(15_000);
+    expect(adminRuntimePollingInterval("resources", false, true)).toBeNull();
+    expect(adminRuntimePollingInterval("profiles", false, true)).toBeNull();
+    expect(adminRuntimePollingInterval("resources", true, false)).toBe(2_000);
+
+    vi.useFakeTimers();
+    try {
+      const callback = vi.fn();
+      const cleanup = scheduleAdminRuntimePolling(callback, 15_000);
+      vi.advanceTimersByTime(30_000);
+      expect(callback).toHaveBeenCalledTimes(2);
+      cleanup();
+      vi.advanceTimersByTime(30_000);
+      expect(callback).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renders aggregate actual usage, budget, and partial measurement coverage", () => {
+    const capacity: AdminCapacity = {
+      users: 4,
+      workspaceCreated: 5,
+      workspaceRunning: 3,
+      workspaceReserved: 3,
+      workspaceLimit: 10,
+      cpuReservedMillicores: 6000,
+      cpuBudgetMillicores: 12000,
+      memoryReservedMb: 6144,
+      memoryBudgetMb: 16384,
+      gpuReservedCount: 0,
+      gpuBudgetCount: 0,
+      usage: {
+        runningTotal: 3,
+        measured: 2,
+        unavailable: 1,
+        cpuMillicores: 2375,
+        memoryBytes: 7_516_192_768,
+        expiresAt: "2099-09-04T01:03:03Z",
+        stale: false,
+      },
+    };
+    const html = renderToStaticMarkup(createElement(AdminUsageOverview, { capacity }));
+    expect(html).toContain("CPU 실사용 / 전체 예산");
+    expect(html).toContain("2.38 core");
+    expect(html).toContain("12 core");
+    expect(html).toContain("메모리 실사용 / 전체 예산");
+    expect(html).toContain("7 GB");
+    expect(html).toContain("16 GB");
+    expect(html).toContain("2<small> / 3개 실행 환경</small>");
+    expect(html).toContain("1개 환경은 현재 수집할 수 없습니다.");
+
+    const stale = renderToStaticMarkup(createElement(AdminUsageOverview, {
+      capacity: {
+        ...capacity,
+        usage: capacity.usage ? { ...capacity.usage, stale: true } : null,
+      },
+    }));
+    expect(stale).toContain("이전 측정값입니다");
+
+    const unavailable = renderToStaticMarkup(createElement(AdminUsageOverview, {
+      capacity: { ...capacity, usage: null },
+    }));
+    expect(unavailable).toContain("확인 불가");
+    expect(unavailable).not.toContain("0 mCPU");
+  });
+
   it.each(["START", "STOP", "RESTART", "DELETE"])(
     "keeps polling an unclaimed %s operation",
     (operationType) => {
@@ -97,12 +169,12 @@ describe("AdminConsole operation polling", () => {
     expect(resolveKernelIdleTimeoutSeconds(true, "60", null)).toBeNull();
   });
 
-  it("enables the GPU toggle only for a verified free one-GPU pool", () => {
+  it("enables GPU controls for a verified multi-GPU pool", () => {
     const configured = {
-      gpuBudgetCount: 1,
-      selectableGpuCounts: [0, 1],
-      availableGpuCounts: [0, 1],
-      maxGpuBudgetCount: 1,
+      gpuBudgetCount: 3,
+      selectableGpuCounts: [0, 1, 2],
+      availableGpuCounts: [0, 1, 2, 3, 4],
+      maxGpuBudgetCount: 4,
     };
     expect(gpuPolicyControlState(configured, 0)).toEqual({
       available: true,
@@ -110,11 +182,20 @@ describe("AdminConsole operation polling", () => {
       lockedByReservation: false,
       canChange: true,
     });
-    expect(gpuPolicyControlState(configured, 1)).toMatchObject({
+    expect(gpuPolicyControlState(configured, 2)).toMatchObject({
       available: true,
       enabled: true,
       lockedByReservation: true,
       canChange: false,
+    });
+    expect(gpuPolicyControlState({
+      ...configured,
+      gpuBudgetCount: 2,
+      selectableGpuCounts: [0, 2],
+      availableGpuCounts: [0, 2, 4],
+    }, 0)).toMatchObject({
+      available: true,
+      enabled: true,
     });
     expect(gpuPolicyControlState({
       ...configured,
@@ -132,8 +213,8 @@ describe("AdminConsole operation polling", () => {
 
   it("allows a stale enabled GPU policy to be switched off after runtime removal", () => {
     const staleEnabled = {
-      gpuBudgetCount: 1,
-      selectableGpuCounts: [0, 1],
+      gpuBudgetCount: 2,
+      selectableGpuCounts: [0, 2],
       availableGpuCounts: [0],
       maxGpuBudgetCount: 0,
     };

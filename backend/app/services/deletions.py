@@ -30,6 +30,8 @@ from ..models import (
     WorkspaceVolumeSlot,
 )
 from ..security import json_dumps_safe
+from .gpu_allocations import release_workspace_gpu_devices
+from .resource_usage import clear_workspace_resource_usage
 
 
 @dataclass(frozen=True)
@@ -285,9 +287,10 @@ def complete_deletion_job(
     slot.provision_status = ProvisionStatus.PROVISIONED.value
     slot.verified_at = now
     workspace.observed_state = ObservedState.NOT_FOUND.value
+    clear_workspace_resource_usage(workspace)
     workspace.stale = False
     workspace.hub_server_url = None
-    workspace.assigned_gpu_device_id = None
+    release_workspace_gpu_devices(db, workspace)
     workspace.archived_at = now
     workspace.deletion_checkpoint = "ARCHIVED"
     workspace.last_error_code = None

@@ -129,7 +129,8 @@ describe("CreateWorkspace", () => {
       kernelName: "pyspark",
       kernelDisplayName: "PySpark CUDA",
     };
-    const all = [profile, gpuBase, gpu4g, gpu4core, otherKernel];
+    const gpuPair = { ...gpuBase, id: "python-cuda-pair", gpuCount: 2 };
+    const all = [profile, gpuBase, gpu4g, gpu4core, otherKernel, gpuPair];
     const gpuKey = workspaceAcceleratorKey(gpuBase);
 
     expect(filterWorkspaceProfiles(all, { acceleratorKey: gpuKey })
@@ -159,6 +160,9 @@ describe("CreateWorkspace", () => {
       4096,
       gpuKey,
     )?.id).toBe("python-cuda-4g");
+    expect(filterWorkspaceProfiles(all, {
+      acceleratorKey: workspaceAcceleratorKey(gpuPair),
+    }).map((item) => item.id)).toEqual(["python-cuda-pair"]);
   });
 
   it("defaults to CPU when the server returns a GPU offer first", () => {
@@ -167,14 +171,14 @@ describe("CreateWorkspace", () => {
       id: "python-cuda",
       name: "Python CUDA",
       acceleratorKind: "nvidia",
-      gpuCount: 1,
+      gpuCount: 2,
       cudaVersion: "12.6",
       gpuFramework: "pytorch",
       gpuFrameworkVersion: "2.7.1",
     };
     const html = render({ profiles: [gpuProfile, profile] });
     expect(html).toContain('<option value="none:0:-:-:-" selected="">CPU 전용</option>');
-    expect(html).toContain("NVIDIA GPU 1개 · CUDA 12.6 · PyTorch 2.7.1");
+    expect(html).toContain("NVIDIA GPU 2개 · CUDA 12.6 · PyTorch 2.7.1");
     expect(html).toContain("가속기 CPU 전용");
   });
 

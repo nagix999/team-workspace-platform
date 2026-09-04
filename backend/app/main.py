@@ -7,7 +7,7 @@ from urllib.parse import quote, urlsplit
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import case, delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -55,6 +55,7 @@ from .schemas import (
 from .security import SignedInternalRequest, TokenCipher, verify_internal_signature
 from .serialization import (
     audit_dict,
+    iso,
     operation_dict,
     user_dict,
     workspace_dict,
@@ -115,7 +116,7 @@ from .services.workspaces import (
 )
 
 
-EXPECTED_DATABASE_REVISION = "0007"
+EXPECTED_DATABASE_REVISION = "0009"
 
 
 def create_app(
@@ -144,7 +145,7 @@ def create_app(
 
     app = FastAPI(
         title="Team Development Platform API",
-        version="0.1.6",
+        version="0.1.7",
         lifespan=lifespan,
     )
     app.state.settings = settings
@@ -191,6 +192,7 @@ def create_app(
             active_operation,
             datetime.utcnow()
             - timedelta(seconds=settings.reconciliation_freshness_seconds),
+            settings.reconciliation_freshness_seconds,
         )
 
     def current_context(
@@ -1170,7 +1172,8 @@ def create_app(
         owner = db.get(User, workspace.owner_user_id)
         if owner is None:  # pragma: no cover - guarded by FK
             raise AppError(500, "INVARIANT_VIOLATION", "Workspace owner is missing")
-        freshness_cutoff = datetime.utcnow() - timedelta(
+        usage_snapshot_at = datetime.utcnow()
+        freshness_cutoff = usage_snapshot_at - timedelta(
             seconds=settings.reconciliation_freshness_seconds
         )
         if (
@@ -1793,21 +1796,82 @@ def create_app(
             )
             or 0
         )
-        freshness_cutoff = datetime.utcnow() - timedelta(
+        usage_snapshot_at = datetime.utcnow()
+        freshness_cutoff = usage_snapshot_at - timedelta(
             seconds=settings.reconciliation_freshness_seconds
         )
-        running_workspaces = int(
-            db.scalar(
-                select(func.count(Workspace.id)).where(
-                    Workspace.archived_at.is_(None),
-                    Workspace.observed_state == ObservedState.RUNNING.value,
-                    Workspace.stale.is_(False),
-                    Workspace.deletion_started_at.is_(None),
-                    Workspace.last_reconciled_at.is_not(None),
-                    Workspace.last_reconciled_at >= freshness_cutoff,
-                )
-            )
-            or 0
+        running_condition = (
+            Workspace.archived_at.is_(None)
+            & (Workspace.observed_state == ObservedState.RUNNING.value)
+            & Workspace.stale.is_(False)
+            & Workspace.deletion_started_at.is_(None)
+            & Workspace.last_reconciled_at.is_not(None)
+            & (Workspace.last_reconciled_at >= freshness_cutoff)
+        )
+        measured_condition = (
+            running_condition
+            & Workspace.resource_usage_observed_at.is_not(None)
+            & (Workspace.resource_usage_observed_at >= freshness_cutoff)
+            & Workspace.cpu_usage_millicores.is_not(None)
+            & Workspace.memory_usage_bytes.is_not(None)
+            & Workspace.memory_limit_bytes.is_not(None)
+        )
+        # Keep coverage and sums in one SQLite statement. Separate SELECTs in
+        # sqlite3's legacy transaction mode do not guarantee one read snapshot,
+        # allowing a reconciler commit between them to produce impossible
+        # measured/running counts.
+        usage_row = db.execute(
+            select(
+                func.coalesce(
+                    func.sum(case((running_condition, 1), else_=0)), 0
+                ),
+                func.coalesce(
+                    func.sum(case((measured_condition, 1), else_=0)), 0
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (measured_condition, Workspace.cpu_usage_millicores),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (measured_condition, Workspace.memory_usage_bytes),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.min(
+                    case(
+                        (running_condition, Workspace.last_reconciled_at),
+                        else_=None,
+                    )
+                ),
+                func.min(
+                    case(
+                        (
+                            measured_condition,
+                            Workspace.resource_usage_observed_at,
+                        ),
+                        else_=None,
+                    )
+                ),
+            ).select_from(Workspace)
+        ).one()
+        running_workspaces = int(usage_row[0])
+        measured_usage = int(usage_row[1])
+        usage_freshness_sources = [usage_snapshot_at]
+        if usage_row[4] is not None:
+            usage_freshness_sources.append(usage_row[4])
+        if usage_row[5] is not None:
+            usage_freshness_sources.append(usage_row[5])
+        usage_expires_at = min(usage_freshness_sources) + timedelta(
+            seconds=settings.reconciliation_freshness_seconds
         )
         reservations = active_reservations(db)
         # This administrative inventory remains available specifically so the
@@ -1835,6 +1899,15 @@ def create_app(
                     "reserved": reservations.gpu_count,
                     "limit": policy.gpu_budget_count,
                 },
+            },
+            "usage": {
+                "running_total": running_workspaces,
+                "measured": measured_usage,
+                "unavailable": running_workspaces - measured_usage,
+                "cpu_millicores": int(usage_row[2]),
+                "memory_bytes": int(usage_row[3]),
+                "expires_at": iso(usage_expires_at),
+                "stale": False,
             },
         }
 
@@ -1900,14 +1973,14 @@ def create_app(
                     environment_hmac_key=settings.internal_hmac_key,
                 )
                 return {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "authorized": True,
                     "authorization": approval.authorization.model_dump(),
                 }
             assert isinstance(payload, SpawnCheckRequest)
             approval = check_spawn_authorization(db, payload)
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "authorized": True,
                 "spawn_authorization_id": approval.authorization.spawn_authorization_id,
             }

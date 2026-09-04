@@ -23,6 +23,7 @@ ACCELERATOR_CONTRACT = {
     "framework": "pytorch",
     "framework_version": "2.7.1",
 }
+MAX_GPU_POOL_SIZE = 64
 EXPECTED_RUNTIME_REPORT = {
     "framework": "pytorch",
     "framework_version": "2.7.1",
@@ -89,15 +90,17 @@ def load_gpu_config(path: Path) -> dict[str, Any]:
     gpu_uuids = config["gpu_uuids"]
     if (
         not isinstance(gpu_uuids, list)
-        or len(gpu_uuids) != 1
+        or not 1 <= len(gpu_uuids) <= MAX_GPU_POOL_SIZE
         or any(not isinstance(value, str) for value in gpu_uuids)
         or any(not GPU_UUID_RE.fullmatch(value) for value in gpu_uuids)
-        or gpu_uuids != sorted(set(gpu_uuids))
+        or len(set(gpu_uuids)) != len(gpu_uuids)
     ):
         raise GpuPreflightError(
-            "gpu_uuids must contain exactly one canonical physical NVIDIA GPU UUID"
+            "gpu_uuids must contain 1-64 unique canonical physical NVIDIA GPU UUIDs"
         )
-    return config
+    canonical = dict(config)
+    canonical["gpu_uuids"] = sorted(gpu_uuids)
+    return canonical
 
 
 def _run_checked(
@@ -194,9 +197,21 @@ def _verify_image_identity(image: str, runner: Runner) -> tuple[str, list[str]]:
     return image_id, repository_digests
 
 
-def _runtime_probe_command(image: str, gpu_uuid: str) -> list[str]:
+def _runtime_probe_command(image: str, gpu_uuids: list[str]) -> list[str]:
+    if not gpu_uuids:
+        raise GpuPreflightError("CUDA runtime probe requires at least one GPU")
+    device_ids = ",".join(gpu_uuids)
+    # Docker parses --gpus as CSV. Literal quotes keep a multi-device value in
+    # one `device=` field when argv is constructed without an intermediate shell.
+    gpu_request = (
+        f'"device={device_ids}"'
+        if len(gpu_uuids) > 1
+        else f"device={device_ids}"
+    )
     accelerator_contract = json.dumps(
-        ACCELERATOR_CONTRACT, sort_keys=True, separators=(",", ":")
+        {**ACCELERATOR_CONTRACT, "count": len(gpu_uuids)},
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return [
         "docker",
@@ -204,7 +219,7 @@ def _runtime_probe_command(image: str, gpu_uuid: str) -> list[str]:
         "--rm",
         "--pull=never",
         "--gpus",
-        f"device={gpu_uuid}",
+        gpu_request,
         "--network=none",
         "--read-only",
         "--user=1000:100",
@@ -216,7 +231,7 @@ def _runtime_probe_command(image: str, gpu_uuid: str) -> list[str]:
         "--env",
         f"PLATFORM_ACCELERATOR_CONTRACT={accelerator_contract}",
         "--env",
-        f"PLATFORM_NVIDIA_GPU_DEVICE_IDS={gpu_uuid}",
+        f"PLATFORM_NVIDIA_GPU_DEVICE_IDS={device_ids}",
         "--env",
         "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
         "--entrypoint=/opt/conda/envs/python312/bin/python",
@@ -226,7 +241,7 @@ def _runtime_probe_command(image: str, gpu_uuid: str) -> list[str]:
     ]
 
 
-def _validate_runtime_report(output: str, gpu_uuid: str) -> dict[str, Any]:
+def _validate_runtime_report(output: str, gpu_uuids: list[str]) -> dict[str, Any]:
     try:
         report = json.loads(output.strip())
     except json.JSONDecodeError:
@@ -250,26 +265,31 @@ def _validate_runtime_report(output: str, gpu_uuid: str) -> dict[str, Any]:
         or report["mode"] != "runtime"
         or report["status"] != "passed"
         or type(report["device_count"]) is not int
-        or report["device_count"] != 1
+        or report["device_count"] != len(gpu_uuids)
     ):
-        raise GpuPreflightError("CUDA runtime probe did not pass exactly")
+        raise GpuPreflightError("CUDA runtime probe did not pass for the exact GPU count")
     devices = report["devices"]
-    if not isinstance(devices, list) or len(devices) != 1:
-        raise GpuPreflightError("CUDA runtime report must contain one device")
-    device = devices[0]
-    if not isinstance(device, dict):
-        raise GpuPreflightError("CUDA runtime device report is malformed")
-    _exact_keys(device, {"index", "uuid", "name", "compute_capability"}, "GPU")
-    if (
-        type(device["index"]) is not int
-        or device["index"] != 0
-        or device["uuid"] != gpu_uuid
-        or not isinstance(device["name"], str)
-        or not device["name"].strip()
-        or not isinstance(device["compute_capability"], str)
-        or not re.fullmatch(r"[1-9][0-9]*\.[0-9]+", device["compute_capability"])
-    ):
-        raise GpuPreflightError("CUDA runtime device report does not match")
+    if not isinstance(devices, list) or len(devices) != len(gpu_uuids):
+        raise GpuPreflightError("CUDA runtime report has the wrong device count")
+    reported_uuids: list[str] = []
+    for expected_index, device in enumerate(devices):
+        if not isinstance(device, dict):
+            raise GpuPreflightError("CUDA runtime device report is malformed")
+        _exact_keys(device, {"index", "uuid", "name", "compute_capability"}, "GPU")
+        if (
+            type(device["index"]) is not int
+            or device["index"] != expected_index
+            or not isinstance(device["uuid"], str)
+            or not GPU_UUID_RE.fullmatch(device["uuid"])
+            or not isinstance(device["name"], str)
+            or not device["name"].strip()
+            or not isinstance(device["compute_capability"], str)
+            or not re.fullmatch(r"[1-9][0-9]*\.[0-9]+", device["compute_capability"])
+        ):
+            raise GpuPreflightError("CUDA runtime device report does not match")
+        reported_uuids.append(device["uuid"])
+    if sorted(reported_uuids) != gpu_uuids:
+        raise GpuPreflightError("CUDA runtime device set does not match the assignment")
     return report
 
 
@@ -324,11 +344,23 @@ def run_preflight(
     for gpu_uuid in config["gpu_uuids"]:
         result = _run_checked(
             runner,
-            _runtime_probe_command(image, gpu_uuid),
+            _runtime_probe_command(image, [gpu_uuid]),
             description=f"CUDA runtime probe for {gpu_uuid}",
             timeout=120,
         )
-        probes.append(_validate_runtime_report(result.stdout, gpu_uuid))
+        probes.append(_validate_runtime_report(result.stdout, [gpu_uuid]))
+    if len(config["gpu_uuids"]) == 1:
+        pool_report = probes[0]
+    else:
+        pool_probe = _run_checked(
+            runner,
+            _runtime_probe_command(image, config["gpu_uuids"]),
+            description="CUDA runtime probe for the complete GPU pool",
+            timeout=min(600, max(120, 30 * len(config["gpu_uuids"]))),
+        )
+        pool_report = _validate_runtime_report(
+            pool_probe.stdout, config["gpu_uuids"]
+        )
     return {
         "schema_version": 1,
         "status": "passed",
@@ -338,8 +370,12 @@ def run_preflight(
         "nvidia_driver_version": config["nvidia_driver_version"],
         "nvidia_container_toolkit_version": toolkit_version,
         "gpu_uuids": config["gpu_uuids"],
-        "runtime_contract": ACCELERATOR_CONTRACT,
+        "runtime_contract": {
+            **ACCELERATOR_CONTRACT,
+            "count": len(config["gpu_uuids"]),
+        },
         "probes": probes,
+        "pool_probe": pool_report,
     }
 
 
@@ -349,11 +385,20 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--image")
     mode.add_argument("--print-device-id", action="store_true")
+    mode.add_argument("--print-device-ids", action="store_true")
     args = parser.parse_args(argv)
     try:
         config = load_gpu_config(args.config)
         if args.print_device_id:
+            if len(config["gpu_uuids"]) != 1:
+                raise GpuPreflightError(
+                    "--print-device-id is only compatible with a single-GPU policy; "
+                    "use --print-device-ids"
+                )
             print(config["gpu_uuids"][0])
+            return 0
+        if args.print_device_ids:
+            print(",".join(config["gpu_uuids"]))
             return 0
         missing = [
             command

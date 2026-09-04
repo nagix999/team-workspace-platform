@@ -61,6 +61,14 @@ class ApprovedProfile:
 
 
 @dataclass(frozen=True)
+class HubResourceUsage:
+    cpu_usage_millicores: int
+    memory_usage_bytes: int
+    memory_limit_bytes: int
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
 class HubServer:
     state: HubServerState
     ready: bool = False
@@ -69,6 +77,7 @@ class HubServer:
     started_at: datetime | None = None
     last_activity_at: datetime | None = None
     failure_summary: str | None = None
+    resource_usage: HubResourceUsage | None = None
 
 
 class JupyterHubProvider(Protocol):

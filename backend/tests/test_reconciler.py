@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 
 from app.db import Base
 from app.domain import HubServerState
-from app.hub import FakeJupyterHubProvider, HubServer
+from app.hub import FakeJupyterHubProvider, HubResourceUsage, HubServer
 from app.main import create_app
 from app.models import AuditEvent, Operation, Workspace
 from app.reconciler import (
@@ -22,6 +22,7 @@ from app.reconciler import (
     ReconcilerConfig,
     ReconciliationError,
     WorkspaceReconciler,
+    _merge_resource_usage_snapshot,
     clear_heartbeat,
     heartbeat_is_fresh,
     read_reconciler_token,
@@ -62,6 +63,54 @@ class BrokenAsyncBody(httpx.AsyncByteStream):
     async def __aiter__(self):
         yield b'{"kind":"service"'
         raise httpx.ReadError("synthetic mid-body disconnect")
+
+
+def _usage_snapshot(now: datetime, items: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "captured_at": now.isoformat() + "Z",
+        "items": items,
+    }
+
+
+def _usage_item(**overrides) -> dict[str, object]:
+    value: dict[str, object] = {
+        "username": "alice",
+        "server_name": "server-a",
+        "cpu_usage_millicores": 100,
+        "memory_usage_bytes": 1024,
+        "memory_limit_bytes": 2048,
+    }
+    value.update(overrides)
+    return value
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        lambda now: _usage_snapshot(now + timedelta(seconds=1), []),
+        lambda now: _usage_snapshot(now - timedelta(seconds=301), []),
+        lambda now: _usage_snapshot(now, [_usage_item(cpu_usage_millicores=True)]),
+        lambda now: _usage_snapshot(now, [_usage_item(memory_usage_bytes=-1)]),
+        lambda now: _usage_snapshot(now, [_usage_item(memory_usage_bytes=4096)]),
+        lambda now: _usage_snapshot(
+            now, [_usage_item(cpu_usage_millicores=2_147_483_648)]
+        ),
+        lambda now: _usage_snapshot(now, [_usage_item(), _usage_item()]),
+        lambda now: _usage_snapshot(now, [_usage_item(server_name="unknown")]),
+    ],
+)
+def test_resource_usage_snapshot_rejects_future_stale_overflow_and_bad_bindings(
+    snapshot,
+):
+    now = datetime.utcnow()
+    servers = {
+        ("alice", "server-a"): HubServer(
+            state=HubServerState.RUNNING, ready=True
+        )
+    }
+    with pytest.raises(ReconciliationError):
+        _merge_resource_usage_snapshot(snapshot(now), servers, received_at=now)
 
 
 def test_reconciler_config_and_token_file_are_minimal_and_strict(
@@ -153,15 +202,24 @@ def test_fresh_running_snapshot_restores_admin_count_and_launch(reconciliation_e
         == 409
     )
 
+    usage_observed_at = datetime.utcnow()
+    started_at = datetime.utcnow()
     snapshot = HubSnapshot(
         servers={
             ("alice", server_name): HubServer(
                 state=HubServerState.RUNNING,
                 ready=True,
                 progress_percent=100,
-                started_at=datetime.utcnow(),
+                started_at=started_at,
+                resource_usage=HubResourceUsage(
+                    cpu_usage_millicores=375,
+                    memory_usage_bytes=536_870_912,
+                    memory_limit_bytes=1_073_741_824,
+                    observed_at=usage_observed_at,
+                ),
             )
-        }
+        },
+        captured_at=usage_observed_at,
     )
     reconciler = WorkspaceReconciler(
         app.state.session_factory, StaticSnapshotSource(snapshot)
@@ -170,12 +228,148 @@ def test_fresh_running_snapshot_restores_admin_count_and_launch(reconciliation_e
 
     capacity = client.get("/api/v1/admin/capacity").json()
     assert capacity["workspaces"]["running"] == 1
+    aggregate_usage = capacity["usage"]
+    aggregate_expires_at = aggregate_usage.pop("expires_at")
+    assert datetime.fromisoformat(aggregate_expires_at.removesuffix("Z")) > datetime.utcnow()
+    assert aggregate_usage == {
+        "running_total": 1,
+        "measured": 1,
+        "unavailable": 0,
+        "cpu_millicores": 375,
+        "memory_bytes": 536_870_912,
+        "stale": False,
+    }
+    # Reuse the fixture client. Starting a second TestClient lifespan for the
+    # same FastAPI application while the first one is active can deadlock in
+    # Starlette's portal teardown and is unrelated to the permission boundary
+    # this assertion exercises.
+    login(client, hub, "alice")
+    own_workspace = client.get("/api/v1/workspaces").json()["items"][0]
+    assert own_workspace["resource_usage"] == {
+        "cpu_millicores": 375,
+        "memory_bytes": 536_870_912,
+        "memory_limit_bytes": 1_073_741_824,
+        "observed_at": usage_observed_at.isoformat() + "Z",
+        "expires_at": (
+            usage_observed_at
+            + timedelta(seconds=app.state.settings.reconciliation_freshness_seconds)
+        ).isoformat()
+        + "Z",
+        "stale": False,
+    }
+    login(client, hub, "admin")
+    admin_workspace = client.get("/api/v1/admin/workspaces").json()["items"][0]
+    assert admin_workspace["resource_usage"] == own_workspace["resource_usage"]
+    with app.state.session_factory() as db:
+        version_before_usage_only_update = db.get(Workspace, workspace_id).row_version
+    second_observed_at = datetime.utcnow()
+    reconciler.apply_snapshot(
+        HubSnapshot(
+            servers={
+                ("alice", server_name): HubServer(
+                    state=HubServerState.RUNNING,
+                    ready=True,
+                    progress_percent=100,
+                    started_at=started_at,
+                    resource_usage=HubResourceUsage(
+                        cpu_usage_millicores=400,
+                        memory_usage_bytes=536_870_912,
+                        memory_limit_bytes=1_073_741_824,
+                        observed_at=second_observed_at,
+                    ),
+                )
+            },
+            captured_at=second_observed_at,
+        )
+    )
+    with app.state.session_factory() as db:
+        row = db.get(Workspace, workspace_id)
+        assert row and row.cpu_usage_millicores == 400
+        assert row.row_version == version_before_usage_only_update
+    with app.state.session_factory() as db:
+        row = db.get(Workspace, workspace_id)
+        assert row
+        row.resource_usage_observed_at = datetime.utcnow() - timedelta(minutes=1)
+        db.commit()
+    old_usage = client.get("/api/v1/admin/workspaces").json()["items"][0]
+    assert old_usage["stale"] is False
+    assert old_usage["resource_usage"]["stale"] is True
     launched = client.get(
         f"/api/v1/admin/workspaces/{workspace_id}/launch", follow_redirects=False
     )
     assert launched.status_code == 303
     assert "token=" not in launched.headers["location"]
     assert admin["user"]["role"] == "ADMIN"
+
+    # A later measurement whose Docker limit disagrees with the immutable
+    # profile must be treated as unavailable while lifecycle remains healthy.
+    missing_captured_at = datetime.utcnow()
+    reconciler.apply_snapshot(
+        HubSnapshot(
+            servers={
+                ("alice", server_name): HubServer(
+                    state=HubServerState.RUNNING,
+                    ready=True,
+                    progress_percent=100,
+                    resource_usage=HubResourceUsage(
+                        cpu_usage_millicores=10,
+                        memory_usage_bytes=1024,
+                        memory_limit_bytes=2_147_483_648,
+                        observed_at=missing_captured_at,
+                    ),
+                )
+            },
+            captured_at=missing_captured_at,
+        )
+    )
+    admin_workspace = client.get("/api/v1/admin/workspaces").json()["items"][0]
+    assert admin_workspace["resource_usage"] is None
+    unavailable_usage = client.get("/api/v1/admin/capacity").json()["usage"]
+    assert datetime.fromisoformat(
+        unavailable_usage.pop("expires_at").removesuffix("Z")
+    ) > datetime.utcnow()
+    assert unavailable_usage == {
+        "running_total": 1,
+        "measured": 0,
+        "unavailable": 1,
+        "cpu_millicores": 0,
+        "memory_bytes": 0,
+        "stale": False,
+    }
+
+
+def test_usage_expiry_uses_earliest_lifecycle_or_measurement(reconciliation_env):
+    app, hub, client = reconciliation_env
+    workspace_id = _running_workspace(app, hub, client)
+    observed_at = datetime.utcnow()
+    lifecycle_at = observed_at - timedelta(seconds=5)
+    with app.state.session_factory() as db:
+        workspace = db.get(Workspace, workspace_id)
+        assert workspace
+        workspace.stale = False
+        workspace.last_reconciled_at = lifecycle_at
+        workspace.cpu_usage_millicores = 250
+        workspace.memory_usage_bytes = 268_435_456
+        workspace.memory_limit_bytes = 1_073_741_824
+        workspace.resource_usage_observed_at = observed_at
+        db.commit()
+
+    expected_expiry = (
+        lifecycle_at
+        + timedelta(seconds=app.state.settings.reconciliation_freshness_seconds)
+    ).isoformat() + "Z"
+    own_workspace = client.get(f"/api/v1/workspaces/{workspace_id}").json()[
+        "workspace"
+    ]
+    assert own_workspace["stale"] is False
+    assert own_workspace["resource_usage"]["stale"] is False
+    assert own_workspace["resource_usage"]["expires_at"] == expected_expiry
+
+    login(client, hub, "admin")
+    aggregate = client.get("/api/v1/admin/capacity").json()["usage"]
+    assert aggregate["stale"] is False
+    assert aggregate["measured"] == 1
+    assert aggregate["expires_at"] == expected_expiry
 
 
 def test_external_stop_remove_is_idempotently_audited(reconciliation_env):
@@ -185,6 +379,11 @@ def test_external_stop_remove_is_idempotently_audited(reconciliation_env):
         workspace = db.get(Workspace, workspace_id)
         assert workspace
         server_name = workspace.hub_server_name
+        workspace.cpu_usage_millicores = 100
+        workspace.memory_usage_bytes = 1024
+        workspace.memory_limit_bytes = 2048
+        workspace.resource_usage_observed_at = datetime.utcnow()
+        db.commit()
 
     source = StaticSnapshotSource(
         HubSnapshot(
@@ -213,6 +412,10 @@ def test_external_stop_remove_is_idempotently_audited(reconciliation_env):
         ).all()
         assert workspace and workspace.observed_state == "NOT_FOUND"
         assert workspace.stale is False
+        assert workspace.cpu_usage_millicores is None
+        assert workspace.memory_usage_bytes is None
+        assert workspace.memory_limit_bytes is None
+        assert workspace.resource_usage_observed_at is None
         assert len(events) == 2
         assert '"observed_state":"STOPPED"' in events[0].safe_metadata_json
         assert '"observed_state":"NOT_FOUND"' in events[1].safe_metadata_json
@@ -413,6 +616,23 @@ def test_hub_snapshot_client_strictly_parses_least_privilege_page(user_options):
                     "scopes": ["list:users", "read:servers", "read:users:name"],
                 },
             )
+        if request.url.path == "/hub/api/platform/resource-usage":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": 1,
+                    "captured_at": datetime.utcnow().isoformat() + "Z",
+                    "items": [
+                        {
+                            "username": "alice",
+                            "server_name": "ws-0123456789abcdef0123456789abcdef",
+                            "cpu_usage_millicores": 250,
+                            "memory_usage_bytes": 268_435_456,
+                            "memory_limit_bytes": 1_073_741_824,
+                        }
+                    ],
+                },
+            )
         assert request.url.path == "/hub/api/users"
         assert request.url.params["include_stopped_servers"] == "1"
         return httpx.Response(
@@ -468,6 +688,8 @@ def test_hub_snapshot_client_strictly_parses_least_privilege_page(user_options):
     server = snapshot.servers[("alice", "ws-0123456789abcdef0123456789abcdef")]
     assert server.state == HubServerState.RUNNING
     assert server.full_url is None
+    assert server.resource_usage is not None
+    assert server.resource_usage.cpu_usage_millicores == 250
     assert "already-consumed-sensitive-value" not in repr(server)
 
 
@@ -486,6 +708,15 @@ def test_hub_snapshot_client_rejects_unhashable_pending_as_snapshot_error(
                     "token_id": "token-id",
                     "session_id": None,
                     "scopes": ["list:users", "read:servers", "read:users:name"],
+                },
+            )
+        if request.url.path == "/hub/api/platform/resource-usage":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": 1,
+                    "captured_at": datetime.utcnow().isoformat() + "Z",
+                    "items": [],
                 },
             )
         return httpx.Response(
@@ -537,3 +768,48 @@ def test_hub_snapshot_client_rejects_unhashable_pending_as_snapshot_error(
             await http_client.aclose()
 
     asyncio.run(scenario())
+
+
+def test_metrics_endpoint_failure_does_not_discard_lifecycle_snapshot():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/hub/api/user":
+            return httpx.Response(
+                200,
+                json={
+                    "kind": "service",
+                    "admin": False,
+                    "name": "platform-reconciler",
+                    "token_id": "token-id",
+                    "session_id": None,
+                    "scopes": ["list:users", "read:servers", "read:users:name"],
+                },
+            )
+        if request.url.path == "/hub/api/users":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [],
+                    "_pagination": {
+                        "offset": 0,
+                        "limit": 100,
+                        "total": 0,
+                        "next": None,
+                    },
+                },
+            )
+        assert request.url.path == "/hub/api/platform/resource-usage"
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    async def scenario() -> HubSnapshot:
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        source = HubSnapshotClient(
+            hub_internal_url="http://jupyterhub:8081",
+            token="x" * 32,
+            client=http_client,
+        )
+        try:
+            return await source.fetch()
+        finally:
+            await http_client.aclose()
+
+    assert asyncio.run(scenario()).servers == {}

@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..db import begin_immediate
-from ..accelerators import NVIDIA_GPU_DEVICE_ID_RE, stored_profile_accelerator
+from ..accelerators import stored_profile_accelerator
 from ..domain import DesiredState, OperationStatus, ProvisionStatus, UserStatus
 from ..errors import AppError
 from ..models import (
@@ -33,6 +33,10 @@ from .environment import (
     spawn_snapshot_purpose,
     validate_environment_name,
     validate_environment_value,
+)
+from .gpu_allocations import (
+    spawn_authorization_gpu_device_ids,
+    workspace_gpu_device_ids,
 )
 from .resource_profiles import dynamic_base
 
@@ -82,7 +86,17 @@ def _validate_mutable_invariants(
     profile = db.get(
         WorkspaceProfile, (authorization.profile_id, authorization.profile_version)
     )
-    invariant_ok = all((operation, workspace, user, slot, profile))
+    try:
+        assigned_gpu_device_ids = (
+            workspace_gpu_device_ids(db, workspace) if workspace is not None else ()
+        )
+        authorized_gpu_device_ids = spawn_authorization_gpu_device_ids(authorization)
+    except ValueError:
+        assigned_gpu_device_ids = ()
+        authorized_gpu_device_ids = ()
+        invariant_ok = False
+    else:
+        invariant_ok = all((operation, workspace, user, slot, profile))
     if invariant_ok:
         assert operation and workspace and user and slot and profile
         invariant_ok = (
@@ -107,16 +121,14 @@ def _validate_mutable_invariants(
             and (
                 (
                     profile.gpu_count == 0
-                    and workspace.assigned_gpu_device_id is None
-                    and authorization.gpu_device_id is None
+                    and not assigned_gpu_device_ids
+                    and not authorized_gpu_device_ids
                     and authorization.gpu_inventory_digest is None
                 )
                 or (
-                    profile.gpu_count == 1
-                    and workspace.assigned_gpu_device_id == authorization.gpu_device_id
-                    and isinstance(authorization.gpu_device_id, str)
-                    and NVIDIA_GPU_DEVICE_ID_RE.fullmatch(authorization.gpu_device_id)
-                    is not None
+                    profile.gpu_count > 0
+                    and len(assigned_gpu_device_ids) == profile.gpu_count
+                    and assigned_gpu_device_ids == authorized_gpu_device_ids
                     and isinstance(authorization.gpu_inventory_digest, str)
                 )
             )
@@ -163,6 +175,12 @@ def _binding(
         raise AppError(
             403, "SPAWN_INVARIANT_FAILED", "GPU authorization does not match profile"
         )
+    try:
+        authorized_gpu_device_ids = spawn_authorization_gpu_device_ids(authorization)
+    except ValueError as exc:
+        raise AppError(
+            403, "SPAWN_INVARIANT_FAILED", "GPU authorization is invalid"
+        ) from exc
     return SpawnAuthorizationBinding(
         spawn_authorization_id=authorization.id,
         workspace_id=workspace.id,
@@ -190,7 +208,7 @@ def _binding(
         workspace_environment_generation=authorization.workspace_environment_generation,
         kernel_idle_timeout_seconds=authorization.kernel_idle_timeout_seconds,
         gpu_count=authorization.gpu_count,
-        gpu_device_id=authorization.gpu_device_id,
+        gpu_device_ids=list(authorized_gpu_device_ids),
         gpu_inventory_digest=authorization.gpu_inventory_digest,
         valid_until_unix=int(
             authorization.expires_at.replace(tzinfo=timezone.utc).timestamp()

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from ..config import Settings
 from ..errors import AppError
 from ..models import ResourcePolicy, WorkspaceProfile
-from ..accelerators import stored_profile_accelerator
+from ..accelerators import MAX_NVIDIA_GPU_COUNT, stored_profile_accelerator
 from ..policy_values import (
     KERNEL_IDLE_TIMEOUT_DEFAULT_SECONDS,
     KERNEL_IDLE_TIMEOUT_MAX_SECONDS,
@@ -64,11 +64,11 @@ def resource_catalog(db: Session, settings: Settings) -> ResourceCatalog:
             cpu_values.add(cpu)
             memory_values.add(profile.memory_limit_mb)
             gpu_values.add(accelerator.count)
-    if not cpu_values or not memory_values:
+    if not cpu_values or not memory_values or 0 not in gpu_values:
         raise AppError(
             503,
             "RESOURCE_CATALOG_EMPTY",
-            "No workspace resource profile fits the configured hard ceiling",
+            "No CPU workspace resource profile fits the configured hard ceiling",
         )
     return ResourceCatalog(
         tuple(sorted(cpu_values)),
@@ -147,8 +147,12 @@ def selected_resource_values(
         or not isinstance(memories, list)
         or not isinstance(gpu_counts, list)
         or any(type(value) is not int or value <= 0 for value in cpus + memories)
-        or any(type(value) is not int or value not in {0, 1} for value in gpu_counts)
+        or any(
+            type(value) is not int or not 0 <= value <= MAX_NVIDIA_GPU_COUNT
+            for value in gpu_counts
+        )
         or not gpu_counts
+        or 0 not in gpu_counts
     ):
         raise AppError(500, "RESOURCE_POLICY_INVALID", "Resource policy is invalid")
     return set(cpus), set(memories), set(gpu_counts)
@@ -243,7 +247,7 @@ def update_resource_policy(
         cpu_budget_millicores > settings.workspace_cpu_budget_millicores
         or memory_budget_mb > settings.workspace_memory_budget_mb
         or gpu_budget_count > len(settings.nvidia_gpu_device_ids)
-        or gpu_budget_count not in {0, 1}
+        or not 0 <= gpu_budget_count <= MAX_NVIDIA_GPU_COUNT
     ):
         raise AppError(
             422,
@@ -270,9 +274,13 @@ def update_resource_policy(
         or not selected_memory
         or selected_gpu != selectable_gpu_counts
         or not selected_gpu
+        or 0 not in selected_gpu
         or any(type(value) is not int or value <= 0 for value in selected_cpu)
         or any(type(value) is not int or value <= 0 for value in selected_memory)
-        or any(type(value) is not int or value not in {0, 1} for value in selected_gpu)
+        or any(
+            type(value) is not int or not 0 <= value <= MAX_NVIDIA_GPU_COUNT
+            for value in selected_gpu
+        )
         or any(value > cpu_budget_millicores for value in selected_cpu)
         or any(value > memory_budget_mb for value in selected_memory)
         or any(value > gpu_budget_count for value in selected_gpu)
@@ -295,7 +303,10 @@ def update_resource_policy(
     from .resource_profiles import ensure_resource_profile_matrix
 
     ensure_resource_profile_matrix(
-        db, cpu_millicores=selected_cpu, memory_mb=selected_memory
+        db,
+        cpu_millicores=selected_cpu,
+        memory_mb=selected_memory,
+        gpu_counts=selected_gpu,
     )
     ensure_default_offers(db)
     candidates = db.scalars(

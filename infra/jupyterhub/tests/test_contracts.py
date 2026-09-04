@@ -33,6 +33,7 @@ from profile_policy import (  # noqa: E402
     profile_digest,
 )
 from profile_image_check import (  # noqa: E402
+    _bounded_gpu_verification_assignments,
     check_profile_images,
     docker_verification_command,
 )
@@ -50,6 +51,8 @@ import spawn_guard  # noqa: E402
 
 
 GPU_DEVICE_ID = "GPU-01234567-89ab-cdef-0123-456789abcdef"
+GPU_DEVICE_ID_2 = "GPU-12345678-1234-5678-9abc-123456789abc"
+GPU_DEVICE_ID_3 = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 CPU_ACCELERATOR = {
     "kind": "none",
     "count": 0,
@@ -69,13 +72,18 @@ NVIDIA_ACCELERATOR = {
 
 
 def schema_v3_profile(
-    source: dict[str, object], *, nvidia: bool, profile_id: str | None = None
+    source: dict[str, object],
+    *,
+    nvidia: bool,
+    profile_id: str | None = None,
+    gpu_count: int = 1,
 ) -> dict[str, object]:
     profile = deepcopy(source)
     profile["accelerator"] = deepcopy(NVIDIA_ACCELERATOR if nvidia else CPU_ACCELERATOR)
     if profile_id is not None:
         profile["id"] = profile_id
     if nvidia:
+        profile["accelerator"]["count"] = gpu_count
         profile["python_version"] = "3.12.13"
         profile["kernels"] = [
             {
@@ -356,7 +364,8 @@ class ProfilePolicyTests(unittest.TestCase):
         invalid_profiles = []
         for field, value in (
             ("count", True),
-            ("count", 2),
+            ("count", 0),
+            ("count", 65),
             ("sharing", "shared"),
             ("cuda_version", "12"),
             ("framework", "tensorflow"),
@@ -425,6 +434,27 @@ class ProfilePolicyTests(unittest.TestCase):
         self.assertEqual(derived["accelerator"], NVIDIA_ACCELERATOR)
         self.assertEqual(derived["cpu_limit"], 3.5)
         self.assertNotEqual(derived["config_digest"], gpu["config_digest"])
+
+        multi_gpu = schema_v3_profile(
+            source["profiles"][1],
+            nvidia=True,
+            profile_id="python312-cuda-gpu2",
+            gpu_count=2,
+        )
+        derived_multi = derive_resource_profile(
+            multi_gpu,
+            cpu_millicores=3_500,
+            memory_mb=3_072,
+            gpu_count=2,
+        )
+        self.assertEqual(derived_multi["accelerator"]["count"], 2)
+        with self.assertRaisesRegex(ProfilePolicyError, "immutable runtime base"):
+            derive_resource_profile(
+                multi_gpu,
+                cpu_millicores=3_500,
+                memory_mb=3_072,
+                gpu_count=1,
+            )
 
     def test_v3_production_generator_pins_cpu_and_gpu_images_separately(self) -> None:
         source = json.loads(
@@ -543,6 +573,74 @@ class ProfilePolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "profiles.json"
             path.write_text(json.dumps(policy), encoding="utf-8")
+            load_profile_policy(path)
+
+    def test_gpu_pool_expands_immutable_count_profiles_and_preserves_gpu1(self) -> None:
+        template = json.loads(
+            (ROOT / "profiles.production-template.json").read_text(encoding="utf-8")
+        )
+        cpu_image_id = "sha256:" + "a" * 64
+        gpu_image_id = "sha256:" + "b" * 64
+        initial = generate_policy(
+            template=template,
+            image_id=cpu_image_id,
+            gpu_image_id=gpu_image_id,
+            shared_volume_name="jupyter-shared",
+        )
+        expanded = generate_policy(
+            template=template,
+            image_id=cpu_image_id,
+            gpu_image_id=gpu_image_id,
+            gpu_count=3,
+            shared_volume_name="jupyter-shared",
+            previous=initial,
+        )
+        repeated = generate_policy(
+            template=template,
+            image_id=cpu_image_id,
+            gpu_image_id=gpu_image_id,
+            gpu_count=3,
+            shared_volume_name="jupyter-shared",
+            previous=expanded,
+        )
+
+        initial_gpu = next(
+            row
+            for row in initial["profiles"]
+            if row["accelerator"]["kind"] == "nvidia"
+        )
+        gpu_profiles = {
+            row["id"]: row
+            for row in expanded["profiles"]
+            if row["accelerator"]["kind"] == "nvidia"
+        }
+        self.assertEqual(
+            set(gpu_profiles),
+            {
+                initial_gpu["id"],
+                f"{initial_gpu['id']}-gpu2",
+                f"{initial_gpu['id']}-gpu3",
+            },
+        )
+        self.assertEqual(
+            {row["accelerator"]["count"] for row in gpu_profiles.values()},
+            {1, 2, 3},
+        )
+        self.assertEqual(gpu_profiles[initial_gpu["id"]], initial_gpu)
+        self.assertEqual(repeated, expanded)
+        with self.assertRaisesRegex(RuntimeError, "history exceeds"):
+            generate_policy(
+                template=template,
+                image_id=cpu_image_id,
+                gpu_image_id=gpu_image_id,
+                gpu_count=2,
+                shared_volume_name="jupyter-shared",
+                previous=expanded,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profiles.json"
+            path.write_text(json.dumps(expanded), encoding="utf-8")
             load_profile_policy(path)
 
     def test_v3_generation_retains_v2_cpu_history_with_original_digest(self) -> None:
@@ -805,7 +903,7 @@ class ProfilePolicyTests(unittest.TestCase):
         profile = schema_v3_profile(
             source["profiles"][1], nvidia=True, profile_id="python312-cuda"
         )
-        with self.assertRaisesRegex(ValueError, "exact GPU UUID"):
+        with self.assertRaisesRegex(ValueError, "canonical GPU UUID set"):
             docker_verification_command(profile)
 
         command = docker_verification_command(
@@ -838,6 +936,117 @@ class ProfilePolicyTests(unittest.TestCase):
             )
         )
         self.assertNotIn("--gpus", cpu_command)
+
+    def test_multi_gpu_profile_image_check_uses_the_exact_assigned_set(self) -> None:
+        source = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        profile = schema_v3_profile(
+            source["profiles"][1],
+            nvidia=True,
+            profile_id="python312-cuda-gpu2",
+            gpu_count=2,
+        )
+        with self.assertRaisesRegex(ValueError, "canonical GPU UUID set"):
+            docker_verification_command(
+                profile, nvidia_gpu_device_id=[GPU_DEVICE_ID]
+            )
+
+        command = docker_verification_command(
+            profile,
+            nvidia_gpu_device_id=[GPU_DEVICE_ID, GPU_DEVICE_ID_2],
+        )
+
+        self.assertIn(
+            f"PLATFORM_NVIDIA_GPU_DEVICE_IDS={GPU_DEVICE_ID},{GPU_DEVICE_ID_2}",
+            command,
+        )
+        self.assertIn(f'"device={GPU_DEVICE_ID},{GPU_DEVICE_ID_2}"', command)
+        accelerator = next(
+            argument.removeprefix("PLATFORM_ACCELERATOR_CONTRACT=")
+            for argument in command
+            if argument.startswith("PLATFORM_ACCELERATOR_CONTRACT=")
+        )
+        self.assertEqual(json.loads(accelerator)["count"], 2)
+
+    def test_profile_image_check_covers_each_enabled_gpu_count(self) -> None:
+        source = json.loads(
+            (ROOT / "profiles.local-dev.json").read_text(encoding="utf-8")
+        )
+        gpu1 = schema_v3_profile(
+            source["profiles"][1], nvidia=True, profile_id="python312-cuda"
+        )
+        gpu2 = schema_v3_profile(
+            source["profiles"][1],
+            nvidia=True,
+            profile_id="python312-cuda-gpu2",
+            gpu_count=2,
+        )
+        document = {
+            "schema_version": 3,
+            "shared_volume": source["shared_volume"],
+            "profiles": [gpu1, gpu2],
+        }
+        commands: list[list[str]] = []
+
+        def record(command: list[str], *, check: bool, timeout: int):
+            self.assertTrue(check)
+            self.assertEqual(timeout, 120)
+            commands.append(command)
+            return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            policy_path = Path(directory) / "profiles.json"
+            policy_path.write_text(json.dumps(document), encoding="utf-8")
+            managed, skipped = check_profile_images(
+                policy_path,
+                allow_unsafe_policy=True,
+                execute=True,
+                nvidia_gpu_device_ids=[
+                    GPU_DEVICE_ID,
+                    GPU_DEVICE_ID_2,
+                    GPU_DEVICE_ID_3,
+                ],
+                runner=record,
+            )
+
+        self.assertEqual((managed, skipped), (2, 0))
+        # One wrapper probe per immutable runtime plus exact-size tensor groups
+        # that make every physical UUID execute each profile image.
+        self.assertEqual(len(commands), 7)
+        tensor_commands = [command for command in commands if "--gpus" in command]
+        self.assertEqual(
+            {
+                next(
+                    value
+                    for value in command
+                    if value.strip('"').startswith("device=")
+                )
+                for command in tensor_commands
+            },
+            {
+                f"device={GPU_DEVICE_ID}",
+                f"device={GPU_DEVICE_ID_2}",
+                f"device={GPU_DEVICE_ID_3}",
+                f'"device={GPU_DEVICE_ID},{GPU_DEVICE_ID_2}"',
+                f'"device={GPU_DEVICE_ID},{GPU_DEVICE_ID_3}"',
+            },
+        )
+
+    def test_large_gpu_pool_profile_probes_grow_linearly(self) -> None:
+        pool = tuple(
+            f"GPU-{index:08x}-1234-5678-9abc-{index:012x}"
+            for index in range(64)
+        )
+        assignments = [
+            _bounded_gpu_verification_assignments(pool, required_count=count)
+            for count in range(1, len(pool) + 1)
+        ]
+        self.assertEqual(sum(map(len, assignments)), 64)
+        for count, candidates in enumerate(assignments, start=1):
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(len(candidates[0]), count)
+            self.assertIn(pool[-1], candidates[0])
 
     def test_gpu_profile_image_check_deduplicates_identical_runtime_probes(
         self,
@@ -896,7 +1105,7 @@ class ProfilePolicyTests(unittest.TestCase):
             ["/usr/local/libexec/verify_cuda_runtime.py", "--require-gpu"],
         )
 
-    def test_gpu_profile_image_check_probes_current_and_retained_images(
+    def test_gpu_profile_image_check_probes_retained_images_on_expanded_pool(
         self,
     ) -> None:
         source = json.loads(
@@ -933,18 +1142,22 @@ class ProfilePolicyTests(unittest.TestCase):
                 policy,
                 allow_unsafe_policy=False,
                 execute=True,
-                nvidia_gpu_device_id=GPU_DEVICE_ID,
+                nvidia_gpu_device_ids=[
+                    GPU_DEVICE_ID,
+                    GPU_DEVICE_ID_2,
+                    GPU_DEVICE_ID_3,
+                ],
                 runner=record,
             )
 
         self.assertEqual((managed, skipped), (2, 0))
-        self.assertEqual(len(commands), 4)
+        self.assertEqual(len(commands), 8)
         wrapper_commands = [
             command for command in commands if "--entrypoint" not in command
         ]
         tensor_commands = [command for command in commands if "--entrypoint" in command]
         self.assertEqual(len(wrapper_commands), 2)
-        self.assertEqual(len(tensor_commands), 2)
+        self.assertEqual(len(tensor_commands), 6)
         self.assertEqual(
             {command[-3] for command in tensor_commands},
             {retained["image"], current["image"]},
@@ -953,8 +1166,22 @@ class ProfilePolicyTests(unittest.TestCase):
             {command[-3] for command in wrapper_commands},
             {retained["image"], current["image"]},
         )
+        for image in (retained["image"], current["image"]):
+            image_commands = [
+                command for command in tensor_commands if command[-3] == image
+            ]
+            self.assertEqual(
+                {
+                    next(
+                        value.removeprefix("device=")
+                        for value in command
+                        if value.startswith("device=")
+                    )
+                    for command in image_commands
+                },
+                {GPU_DEVICE_ID, GPU_DEVICE_ID_2, GPU_DEVICE_ID_3},
+            )
         for command in tensor_commands:
-            self.assertIn(f"device={GPU_DEVICE_ID}", command)
             self.assertEqual(
                 command[-2:],
                 ["/usr/local/libexec/verify_cuda_runtime.py", "--require-gpu"],
@@ -1104,6 +1331,7 @@ class DockerSpawnerProfileTests(unittest.TestCase):
             unsafe_local_dev=True,
             max_cpu_millicores=8_000,
             max_memory_mb=4_096,
+            nvidia_gpu_device_ids=(),
         )
         self.authorization = {
             "workspace_id": "workspace-12345678",
@@ -1115,7 +1343,7 @@ class DockerSpawnerProfileTests(unittest.TestCase):
             "private_volume_slot_id": "slot-12345678",
             "kernel_idle_timeout_seconds": 3_600,
             "gpu_count": 0,
-            "gpu_device_id": None,
+            "gpu_device_ids": [],
             "gpu_inventory_digest": None,
         }
 
@@ -1229,9 +1457,23 @@ class DockerSpawnerProfileTests(unittest.TestCase):
         profile = schema_v3_profile(
             self.policy["profiles"][("python312-cpu1-mem1024", 1)],
             nvidia=True,
-            profile_id="python312-cuda",
+            profile_id="python312-cuda-gpu2",
+            gpu_count=2,
         )
-        self.config.nvidia_gpu_device_id = GPU_DEVICE_ID
+        self.config.nvidia_gpu_device_ids = (
+            GPU_DEVICE_ID,
+            GPU_DEVICE_ID_2,
+            GPU_DEVICE_ID_3,
+        )
+        self.authorization.update(
+            {
+                "gpu_count": 2,
+                "gpu_device_ids": [GPU_DEVICE_ID, GPU_DEVICE_ID_2],
+                "gpu_inventory_digest": spawn_guard.nvidia_gpu_inventory_digest(
+                    self.config.nvidia_gpu_device_ids
+                ),
+            }
+        )
         spawner = SimpleNamespace()
         with patch.object(spawn_guard, "_get_config", return_value=self.config):
             spawn_guard._apply_local_policy(spawner, self.authorization, profile)
@@ -1239,11 +1481,12 @@ class DockerSpawnerProfileTests(unittest.TestCase):
             create = spawn_guard.extra_create_kwargs(spawner)
 
         self.assertEqual(
-            spawner.environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"], GPU_DEVICE_ID
+            spawner.environment["PLATFORM_NVIDIA_GPU_DEVICE_IDS"],
+            f"{GPU_DEVICE_ID},{GPU_DEVICE_ID_2}",
         )
         self.assertEqual(
             json.loads(spawner.environment["PLATFORM_ACCELERATOR_CONTRACT"]),
-            {"schema_version": 1, **NVIDIA_ACCELERATOR},
+            {"schema_version": 1, **NVIDIA_ACCELERATOR, "count": 2},
         )
         self.assertEqual(
             spawner.environment["NVIDIA_DRIVER_CAPABILITIES"], "compute,utility"
@@ -1254,7 +1497,7 @@ class DockerSpawnerProfileTests(unittest.TestCase):
                 {
                     "Driver": "nvidia",
                     "Count": 0,
-                    "DeviceIDs": [GPU_DEVICE_ID],
+                    "DeviceIDs": [GPU_DEVICE_ID, GPU_DEVICE_ID_2],
                     "Capabilities": [["gpu"]],
                     "Options": {},
                 }
@@ -1275,10 +1518,10 @@ class DockerSpawnerProfileTests(unittest.TestCase):
             api_v146.close()
         self.assertEqual(serialized["DeviceRequests"], host["device_requests"])
         self.assertEqual(create["labels"]["platform.accelerator.kind"], "nvidia")
-        self.assertEqual(create["labels"]["platform.accelerator.count"], "1")
+        self.assertEqual(create["labels"]["platform.accelerator.count"], "2")
         self.assertEqual(create["labels"]["platform.accelerator.sharing"], "exclusive")
 
-    def test_gpu_profile_rejects_missing_or_noncanonical_trusted_device_id(
+    def test_gpu_profile_rejects_missing_or_noncanonical_trusted_device_pool(
         self,
     ) -> None:
         profile = schema_v3_profile(
@@ -1286,15 +1529,26 @@ class DockerSpawnerProfileTests(unittest.TestCase):
             nvidia=True,
             profile_id="python312-cuda",
         )
-        for device_id in (None, "0", GPU_DEVICE_ID.upper()):
-            self.config.nvidia_gpu_device_id = device_id
-            spawner = SimpleNamespace(_platform_profile=profile)
+        authorization = {
+            **self.authorization,
+            "gpu_count": 1,
+            "gpu_device_ids": [GPU_DEVICE_ID],
+            "gpu_inventory_digest": spawn_guard.nvidia_gpu_inventory_digest(
+                GPU_DEVICE_ID
+            ),
+        }
+        for device_ids in ((), ("0",), (GPU_DEVICE_ID.upper(),)):
+            self.config.nvidia_gpu_device_ids = device_ids
+            spawner = SimpleNamespace(
+                _platform_profile=profile,
+                _platform_spawn_authorization=authorization,
+            )
             with (
-                self.subTest(device_id=device_id),
+                self.subTest(device_ids=device_ids),
                 patch.object(spawn_guard, "_get_config", return_value=self.config),
                 self.assertRaisesRegex(
                     spawn_guard.SpawnGuardError,
-                    "NVIDIA GPU device policy is invalid",
+                    "NVIDIA GPU device pool is invalid",
                 ),
             ):
                 spawn_guard.extra_host_config(spawner)
@@ -1356,6 +1610,7 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             unsafe_local_dev=True,
             max_cpu_millicores=8_000,
             max_memory_mb=4_096,
+            nvidia_gpu_device_ids=(),
         )
 
     def authorization(self, environment: dict[str, str]) -> dict[str, object]:
@@ -1377,7 +1632,7 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
             "memory_limit_bytes": self.profile["memory_limit_bytes"],
             "kernel_idle_timeout_seconds": 3_600,
             "gpu_count": 0,
-            "gpu_device_id": None,
+            "gpu_device_ids": [],
             "gpu_inventory_digest": None,
             "private_volume_slot_id": "slot-12345678",
             "private_volume_slot_number": 1,
@@ -1551,14 +1806,21 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
 
     def test_signed_gpu_binding_must_match_profile_and_local_inventory(self) -> None:
         gpu_profile = schema_v3_profile(
-            self.profile, nvidia=True, profile_id="python312-cuda"
+            self.profile,
+            nvidia=True,
+            profile_id="python312-cuda-gpu2",
+            gpu_count=2,
         )
         config = SimpleNamespace(**vars(self.config))
         config.profiles = {
             **self.config.profiles,
             (gpu_profile["id"], gpu_profile["version"]): gpu_profile,
         }
-        config.nvidia_gpu_device_id = GPU_DEVICE_ID
+        config.nvidia_gpu_device_ids = (
+            GPU_DEVICE_ID,
+            GPU_DEVICE_ID_2,
+            GPU_DEVICE_ID_3,
+        )
         self.assertEqual(
             spawn_guard.nvidia_gpu_inventory_digest(GPU_DEVICE_ID),
             "sha256:df1a007a9153b95d91a0881a0eb37c09590d10572c2c51afeae956271349a0b8",
@@ -1572,10 +1834,10 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 "runtime_base_profile_id": gpu_profile["id"],
                 "runtime_base_profile_version": gpu_profile["version"],
                 "runtime_base_profile_config_digest": gpu_profile["config_digest"],
-                "gpu_count": 1,
-                "gpu_device_id": GPU_DEVICE_ID,
+                "gpu_count": 2,
+                "gpu_device_ids": [GPU_DEVICE_ID, GPU_DEVICE_ID_2],
                 "gpu_inventory_digest": spawn_guard.nvidia_gpu_inventory_digest(
-                    GPU_DEVICE_ID
+                    config.nvidia_gpu_device_ids
                 ),
             }
         )
@@ -1587,11 +1849,16 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
                 profile_id=gpu_profile["id"],
                 profile_version=gpu_profile["version"],
             )
-        self.assertEqual(validated["accelerator"], NVIDIA_ACCELERATOR)
+        self.assertEqual(validated["accelerator"]["count"], 2)
 
         for field, invalid in (
-            ("gpu_count", 0),
-            ("gpu_device_id", "GPU-ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            ("gpu_count", 1),
+            ("gpu_device_ids", [GPU_DEVICE_ID]),
+            (
+                "gpu_device_ids",
+                [GPU_DEVICE_ID, "GPU-ffffffff-ffff-ffff-ffff-ffffffffffff"],
+            ),
+            ("gpu_device_ids", [GPU_DEVICE_ID_2, GPU_DEVICE_ID]),
             ("gpu_inventory_digest", "sha256:" + "0" * 64),
         ):
             changed = deepcopy(authorization)
@@ -1615,7 +1882,7 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
     def test_cpu_profile_rejects_any_gpu_authorization_binding(self) -> None:
         authorization = self.authorization({})
         authorization["gpu_count"] = 1
-        authorization["gpu_device_id"] = GPU_DEVICE_ID
+        authorization["gpu_device_ids"] = [GPU_DEVICE_ID]
         authorization["gpu_inventory_digest"] = spawn_guard.nvidia_gpu_inventory_digest(
             GPU_DEVICE_ID
         )
@@ -1748,7 +2015,7 @@ class WorkspaceEnvironmentTests(unittest.IsolatedAsyncioTestCase):
         async def signed_post(_url, payload):
             captured.append(deepcopy(payload))
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "authorized": True,
                 "spawn_authorization_id": public["spawn_authorization_id"],
             }

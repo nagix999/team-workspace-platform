@@ -19,7 +19,7 @@ function templateKey(template: RuntimeProfileTemplate): string {
 
 function runtimeAcceleratorLabel(runtime: RuntimeProfileTemplate): string {
   return runtime.acceleratorKind === "nvidia"
-    ? `NVIDIA GPU 1개 · CUDA ${runtime.cudaVersion} · PyTorch ${runtime.gpuFrameworkVersion}`
+    ? `NVIDIA GPU ${runtime.gpuCount}개 · CUDA ${runtime.cudaVersion} · PyTorch ${runtime.gpuFrameworkVersion}`
     : "CPU 전용";
 }
 
@@ -28,6 +28,8 @@ interface AdminKernelGroup {
   kernelName: string;
   displayName: string;
   pythonVersion: string;
+  acceleratorKind: RuntimeProfileTemplate["acceleratorKind"];
+  gpuCount: number;
   acceleratorLabel: string;
   profiles: AdminWorkspaceProfile[];
 }
@@ -39,12 +41,17 @@ export function groupAdminProfilesByKernel(
   for (const profile of profiles) {
     const runtime = profile.runtimeProfile;
     const acceleratorLabel = runtimeAcceleratorLabel(runtime);
-    const key = `${runtime.kernelName}:${runtime.pythonVersion}:${runtime.acceleratorKind}:${runtime.cudaVersion ?? "-"}:${runtime.gpuFrameworkVersion ?? "-"}`;
+    const gpuCountKey = runtime.acceleratorKind === "nvidia"
+      ? `:${runtime.gpuCount}`
+      : "";
+    const key = `${runtime.kernelName}:${runtime.pythonVersion}:${runtime.acceleratorKind}${gpuCountKey}:${runtime.cudaVersion ?? "-"}:${runtime.gpuFrameworkVersion ?? "-"}`;
     const group = groups.get(key) ?? {
       key,
       kernelName: runtime.kernelName,
       displayName: runtime.kernelDisplayName,
       pythonVersion: runtime.pythonVersion,
+      acceleratorKind: runtime.acceleratorKind,
+      gpuCount: runtime.gpuCount,
       acceleratorLabel,
       profiles: [],
     };
@@ -60,7 +67,9 @@ export function groupAdminProfilesByKernel(
         left.id.localeCompare(right.id)),
     }))
     .sort((left, right) =>
-      left.pythonVersion.localeCompare(right.pythonVersion) || left.key.localeCompare(right.key));
+      left.pythonVersion.localeCompare(right.pythonVersion) ||
+      Number(left.acceleratorKind === "nvidia") - Number(right.acceleratorKind === "nvidia") ||
+      left.gpuCount - right.gpuCount || left.key.localeCompare(right.key));
 }
 
 export function AdminProfileManager({

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import unittest
@@ -18,6 +19,7 @@ from verify_cuda_runtime import (  # noqa: E402
     EXPECTED_KERNEL_CONTRACT,
     EXPECTED_PYTHON_EXECUTABLE,
     assigned_gpu_uuid,
+    assigned_gpu_uuids,
     load_accelerator_contract,
     validate_image_environment,
     validate_profile_kernel_contract,
@@ -27,6 +29,7 @@ from verify_cuda_runtime import (  # noqa: E402
 
 
 GPU_UUID = "GPU-12345678-1234-5678-9abc-123456789abc"
+GPU_UUID_2 = "GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 
 class _Tensor:
@@ -52,7 +55,7 @@ class _Cuda:
         return self.count
 
     def get_device_properties(self, index: int) -> SimpleNamespace:
-        if index != 0:
+        if index < 0 or index >= self.count:
             raise AssertionError("unexpected GPU index")
         return SimpleNamespace(name="Test GPU", major=8, minor=0)
 
@@ -67,11 +70,12 @@ class _Torch:
 
     def __init__(self, *, available: bool = True, count: int = 1) -> None:
         self.cuda = _Cuda(available=available, count=count)
+        self.tensor_devices: list[str] = []
 
-    @staticmethod
-    def tensor(value: object, *, device: str) -> _Tensor:
-        if value != [[1.0, 2.0]] or device != "cuda:0":
+    def tensor(self, value: object, *, device: str) -> _Tensor:
+        if value != [[1.0, 2.0]] or not re.fullmatch(r"cuda:[0-9]+", device):
             raise AssertionError("unexpected tensor")
+        self.tensor_devices.append(device)
         return _Tensor()
 
     @staticmethod
@@ -91,10 +95,22 @@ class CudaRuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(loaded, EXPECTED_ACCELERATOR_CONTRACT)
 
+        multi_contract = {
+            **EXPECTED_ACCELERATOR_CONTRACT,
+            "count": 2,
+        }
+        self.assertEqual(
+            load_accelerator_contract(
+                {"PLATFORM_ACCELERATOR_CONTRACT": json.dumps(multi_contract)}
+            ),
+            multi_contract,
+        )
+
         for mutation in (
             "",
             "[]",
-            self.contract.replace('"count":1', '"count":2'),
+            self.contract.replace('"count":1', '"count":0'),
+            self.contract.replace('"count":1', '"count":65'),
             self.contract.replace('"count":1', '"count":true'),
             self.contract[:-1] + ',"extra":true}',
         ):
@@ -117,6 +133,32 @@ class CudaRuntimeContractTests(unittest.TestCase):
         ):
             with self.subTest(value=value), self.assertRaises(CudaRuntimeContractError):
                 assigned_gpu_uuid({"PLATFORM_NVIDIA_GPU_DEVICE_IDS": value})
+
+    def test_assignment_requires_the_exact_sorted_gpu_set(self) -> None:
+        self.assertEqual(
+            assigned_gpu_uuids(
+                {
+                    "PLATFORM_NVIDIA_GPU_DEVICE_IDS": (
+                        f"{GPU_UUID},{GPU_UUID_2}"
+                    )
+                },
+                expected_count=2,
+            ),
+            [GPU_UUID, GPU_UUID_2],
+        )
+        for value, count in (
+            (GPU_UUID, 2),
+            (f"{GPU_UUID_2},{GPU_UUID}", 2),
+            (f"{GPU_UUID},{GPU_UUID}", 2),
+            (f"{GPU_UUID},{GPU_UUID_2}", 1),
+        ):
+            with self.subTest(value=value, count=count), self.assertRaises(
+                CudaRuntimeContractError
+            ):
+                assigned_gpu_uuids(
+                    {"PLATFORM_NVIDIA_GPU_DEVICE_IDS": value},
+                    expected_count=count,
+                )
 
     def test_image_environment_pins_driver_capabilities_and_kernel_search_path(
         self,
@@ -224,6 +266,25 @@ class CudaRuntimeContractTests(unittest.TestCase):
             ],
         )
         self.assertEqual(torch.cuda.synchronized, [0])
+        self.assertEqual(torch.tensor_devices, ["cuda:0"])
+
+    def test_runtime_executes_a_tensor_probe_on_every_assigned_gpu(self) -> None:
+        torch = _Torch(count=2)
+
+        def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=f"{GPU_UUID}\n{GPU_UUID_2}\n",
+                stderr="",
+            )
+
+        devices = verify_gpu(torch, [GPU_UUID, GPU_UUID_2], runner=runner)
+
+        self.assertEqual([device["index"] for device in devices], [0, 1])
+        self.assertEqual([device["uuid"] for device in devices], [GPU_UUID, GPU_UUID_2])
+        self.assertEqual(torch.cuda.synchronized, [0, 1])
+        self.assertEqual(torch.tensor_devices, ["cuda:0", "cuda:1"])
 
     def test_runtime_rejects_device_count_or_uuid_drift(self) -> None:
         def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -234,7 +295,7 @@ class CudaRuntimeContractTests(unittest.TestCase):
                 stderr="",
             )
 
-        with self.assertRaisesRegex(CudaRuntimeContractError, "exactly one"):
+        with self.assertRaisesRegex(CudaRuntimeContractError, "assigned GPU count"):
             verify_gpu(_Torch(count=2), GPU_UUID, runner=runner)
         with self.assertRaisesRegex(CudaRuntimeContractError, "assignment"):
             verify_gpu(_Torch(), GPU_UUID, runner=runner)

@@ -25,6 +25,7 @@ const legacyWorkspace: Workspace = {
   observedState: "STOPPED",
   progressPercent: null,
   stale: false,
+  resourceUsage: null,
   lastErrorCode: null,
   lastErrorSummary: null,
   createdAt: null,
@@ -95,12 +96,85 @@ describe("WorkspaceCard profile compatibility", () => {
     const html = render({
       ...legacyWorkspace,
       acceleratorKind: "nvidia",
-      gpuCount: 1,
+      gpuCount: 2,
       cudaVersion: "12.6",
       gpuFramework: "pytorch",
       gpuFrameworkVersion: "2.7.1",
     });
-    expect(html).toContain("NVIDIA GPU 1개 · CUDA 12.6 · PyTorch 2.7.1");
+    expect(html).toContain("NVIDIA GPU 2개 · CUDA 12.6 · PyTorch 2.7.1");
+  });
+
+  it("shows current CPU and memory use against the assigned limits", () => {
+    const html = render({
+      ...legacyWorkspace,
+      desiredState: "RUNNING",
+      observedState: "RUNNING",
+      cpuLimit: "2.0",
+      resourceUsage: {
+        cpuMillicores: 375,
+        memoryBytes: 536_870_912,
+        memoryLimitBytes: 1_073_741_824,
+        observedAt: "2026-09-04T01:02:03Z",
+        expiresAt: "2099-09-04T01:03:03Z",
+        stale: false,
+      },
+    });
+    expect(html).toContain("CPU 및 메모리 실사용량");
+    expect(html).toContain("측정됨");
+    expect(html).toContain("375 mCPU");
+    expect(html).toContain("2 core");
+    expect(html).toContain("512 MB");
+    expect(html).toContain("1 GB");
+  });
+
+  it("distinguishes stale, measuring, unavailable, and stopped usage", () => {
+    const stale = render({
+      ...legacyWorkspace,
+      desiredState: "RUNNING",
+      observedState: "RUNNING",
+      resourceUsage: {
+        cpuMillicores: 0,
+        memoryBytes: 0,
+        memoryLimitBytes: 1_073_741_824,
+        observedAt: "2026-09-04T01:02:03Z",
+        expiresAt: "2099-09-04T01:03:03Z",
+        stale: true,
+      },
+    });
+    expect(stale).toContain("이전 측정값");
+    expect(stale).toContain("최신 상태가 아니므로 현재 사용량과 다를 수 있습니다.");
+
+    const expired = render({
+      ...legacyWorkspace,
+      desiredState: "RUNNING",
+      observedState: "RUNNING",
+      resourceUsage: {
+        cpuMillicores: 0,
+        memoryBytes: 0,
+        memoryLimitBytes: 1_073_741_824,
+        observedAt: "2020-01-01T00:00:00Z",
+        expiresAt: "2020-01-01T00:00:30Z",
+        stale: false,
+      },
+    });
+    expect(expired).toContain("이전 측정값");
+
+    const measuring = render({ ...legacyWorkspace, observedState: "STARTING" });
+    expect(measuring).toContain("측정 중");
+    expect(measuring).toContain("환경 상태 전환 후 실사용량을 측정합니다.");
+
+    const unavailable = render({
+      ...legacyWorkspace,
+      desiredState: "RUNNING",
+      observedState: "RUNNING",
+      resourceUsage: null,
+    });
+    expect(unavailable).toContain("수집 불가");
+    expect(unavailable).not.toContain("0 mCPU");
+
+    const stopped = render(legacyWorkspace);
+    expect(stopped).toContain("중지된 환경은 실사용량을 측정하지 않습니다.");
+    expect(stopped).not.toContain("0 B");
   });
 
   it("does not silently hide a malformed enforced quota", () => {

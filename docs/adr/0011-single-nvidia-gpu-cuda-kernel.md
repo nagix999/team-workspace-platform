@@ -1,7 +1,8 @@
 # ADR-0011: 단일 NVIDIA GPU와 CUDA Python kernel
 
-- 상태: 승인
+- 상태: [ADR-0013](0013-multi-nvidia-gpu-exclusive-pool.md)으로 대체됨
 - 일자: 2026-09-03
+- 대체 일자: 2026-09-04
 - 관련 결정: [ADR-0004](0004-single-host-compose.md), [ADR-0008](0008-derived-resource-profiles-and-stopped-creation.md), [ADR-0010](0010-idle-kernel-culling.md)
 
 ## 배경

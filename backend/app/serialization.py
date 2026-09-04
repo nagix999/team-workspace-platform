@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .models import (
     AuditEvent,
@@ -63,6 +63,7 @@ def workspace_dict(
     latest_delete_operation: Operation | None = None,
     active_operation: Operation | None = None,
     freshness_cutoff: datetime | None = None,
+    resource_usage_ttl_seconds: int | None = None,
 ) -> dict[str, object]:
     effective_stale = workspace.stale or bool(
         freshness_cutoff is not None
@@ -79,6 +80,42 @@ def workspace_dict(
         and workspace.deletion_started_at is None
     ):
         launch_url = f"/api/v1/workspaces/{workspace.id}/launch"
+    usage_values = (
+        workspace.cpu_usage_millicores,
+        workspace.memory_usage_bytes,
+        workspace.memory_limit_bytes,
+        workspace.resource_usage_observed_at,
+    )
+    resource_usage: dict[str, object] | None = None
+    if (
+        workspace.observed_state == "RUNNING"
+        and all(value is not None for value in usage_values)
+    ):
+        usage_expires_at: datetime | None = None
+        if resource_usage_ttl_seconds is not None:
+            # The measurement is only current while both the metrics sample and
+            # its containing lifecycle observation are current. Hub lifecycle
+            # collection precedes Docker stats collection, so extending this
+            # deadline from the newer metrics timestamp can briefly present a
+            # sample as live after the workspace itself has become stale.
+            usage_freshness_sources = [workspace.resource_usage_observed_at]
+            if workspace.last_reconciled_at is not None:
+                usage_freshness_sources.append(workspace.last_reconciled_at)
+            usage_expires_at = min(usage_freshness_sources) + timedelta(
+                seconds=resource_usage_ttl_seconds
+            )
+        usage_stale = effective_stale or bool(
+            freshness_cutoff is not None
+            and workspace.resource_usage_observed_at < freshness_cutoff
+        )
+        resource_usage = {
+            "cpu_millicores": workspace.cpu_usage_millicores,
+            "memory_bytes": workspace.memory_usage_bytes,
+            "memory_limit_bytes": workspace.memory_limit_bytes,
+            "observed_at": iso(workspace.resource_usage_observed_at),
+            "expires_at": iso(usage_expires_at),
+            "stale": usage_stale,
+        }
     value: dict[str, object] = {
         "id": workspace.id,
         "name": workspace.display_name,
@@ -89,6 +126,7 @@ def workspace_dict(
         "progress_percent": workspace.progress_percent,
         "launch_url": launch_url,
         "stale": effective_stale,
+        "resource_usage": resource_usage,
         "last_error_code": workspace.last_error_code,
         "last_error_summary": workspace.last_error_summary,
         "restart_required": (

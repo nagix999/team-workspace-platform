@@ -38,8 +38,9 @@ Docker limit으로 전달하면 기존의 immutable image/kernel/command 검증 
 ## 결과와 위험
 
 - 더 큰 호스트는 hard ceiling 설정을 높인 뒤 웹에서 8 core, 16 GiB 같은 값을 추가할 수 있다.
-- 선택값의 cross product만큼 DB profile/offer row가 늘어난다. 각 축은 최대 32개로 제한하고
-  관리 화면은 명시적으로 선택된 값만 노출한다.
+- 선택값의 cross product만큼 DB profile/offer row가 늘어난다. 각 축은 최대 32개로 제한하고,
+  실제 runtime family × CPU × memory 결과가 1,024개를 넘는 정책은 row를 만들기 전에
+  거부한다. 관리 화면은 명시적으로 선택된 값만 노출한다.
 - CPU/RAM은 Docker hard limit이지만 전체 budget을 host 실측 없이 높이면 control plane이
   압박될 수 있다. 운영자는 부하 시험 후 hard ceiling을 설정해야 한다.
 - 중지 상태 생성도 private slot 하나를 사용하므로 사용자당 5개 보존 환경 한도는 유지된다.

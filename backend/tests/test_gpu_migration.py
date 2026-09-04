@@ -8,10 +8,128 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+from test_multi_gpu_migration import _seed_bound_gpu_history
+
 
 def _alembic_config() -> Config:
     backend_root = Path(__file__).resolve().parents[1]
     return Config(str(backend_root / "alembic.ini"))
+
+
+def _assert_populated_0005(database_url: str) -> None:
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == "0005"
+        for table in (
+            "users",
+            "workspace_profiles",
+            "workspace_profile_offers",
+            "workspace_volume_slots",
+            "workspaces",
+            "operations",
+            "spawn_authorizations",
+            "resource_policies",
+        ):
+            assert connection.execute(
+                text(f"SELECT count(*) FROM {table}")
+            ).scalar_one() == 1
+
+        assert connection.execute(
+            text(
+                "SELECT w.profile_id, o.runtime_profile_id, s.workspace_id "
+                "FROM workspaces w "
+                "JOIN workspace_profile_offers o "
+                "ON o.id = w.profile_offer_id "
+                "JOIN spawn_authorizations s ON s.workspace_id = w.id"
+            )
+        ).one() == (
+            "gpu-profile",
+            "gpu-profile",
+            "10000000-0000-0000-0000-000000000003",
+        )
+        for table in (
+            "workspace_profiles",
+            "workspaces",
+            "spawn_authorizations",
+            "resource_policies",
+        ):
+            columns = {
+                row[1]
+                for row in connection.execute(text(f"PRAGMA table_info({table})"))
+            }
+            assert not any(
+                "gpu" in column or "accelerator" in column for column in columns
+            )
+        assert connection.execute(text("PRAGMA foreign_key_check")).all() == []
+
+        with pytest.raises(IntegrityError, match="FOREIGN KEY constraint failed"):
+            connection.execute(
+                text("DELETE FROM workspace_profiles WHERE id='gpu-profile'")
+            )
+        connection.rollback()
+    engine.dispose()
+
+
+@pytest.mark.parametrize("source_revision", ["0006", "0009"])
+def test_populated_gpu_history_downgrades_to_0005_without_partial_schema(
+    tmp_path, monkeypatch, source_revision
+):
+    database_url = f"sqlite:///{tmp_path / f'gpu-{source_revision}-rollback.db'}"
+    monkeypatch.setenv("PLATFORM_DATABASE_URL", database_url)
+    monkeypatch.setenv("PLATFORM_ALLOW_INSECURE_DEV_SECRETS", "1")
+    monkeypatch.setenv("PLATFORM_INSECURE_LOCAL_DEV", "true")
+    config = _alembic_config()
+    command.upgrade(config, "0006")
+
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+        _seed_bound_gpu_history(connection)
+    engine.dispose()
+
+    if source_revision == "0009":
+        command.upgrade(config, "0009")
+        engine = create_engine(database_url)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE workspaces SET cpu_usage_millicores=125, "
+                    "memory_usage_bytes=1024, memory_limit_bytes=2147483648, "
+                    "resource_usage_observed_at=CURRENT_TIMESTAMP"
+                )
+            )
+        engine.dispose()
+
+    command.downgrade(config, "0005")
+    _assert_populated_0005(database_url)
+
+    engine = create_engine(database_url)
+    with engine.connect() as connection:
+        table_names = set(
+            connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).scalars()
+        )
+        assert not any(name.startswith("_alembic_tmp") for name in table_names)
+        assert "workspace_gpu_leases" not in table_names
+        assert "internal_egress_policies" not in table_names
+        assert "internal_egress_rules" not in table_names
+        workspace_columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(workspaces)"))
+        }
+        assert {
+            "assigned_gpu_device_ids_json",
+            "cpu_usage_millicores",
+            "memory_usage_bytes",
+            "memory_limit_bytes",
+            "resource_usage_observed_at",
+        }.isdisjoint(workspace_columns)
+    engine.dispose()
 
 
 def test_0006_upgrade_preserves_cpu_rows_and_enforces_gpu_contracts(

@@ -238,6 +238,15 @@ describe("portal API normalization", () => {
         memory_mb: { reserved: 7168, limit: 16384 },
         gpu_count: { reserved: 1, limit: 1 },
       },
+      usage: {
+        running_total: 7,
+        measured: 6,
+        unavailable: 1,
+        cpu_millicores: 2375,
+        memory_bytes: 7516192768,
+        expires_at: "2099-09-04T01:03:03Z",
+        stale: false,
+      },
     })).toEqual({
       users: 10,
       workspaceCreated: 23,
@@ -250,39 +259,64 @@ describe("portal API normalization", () => {
       memoryBudgetMb: 16384,
       gpuReservedCount: 1,
       gpuBudgetCount: 1,
+      usage: {
+        runningTotal: 7,
+        measured: 6,
+        unavailable: 1,
+        cpuMillicores: 2375,
+        memoryBytes: 7516192768,
+        expiresAt: "2099-09-04T01:03:03Z",
+        stale: false,
+      },
     });
   });
 
-  it("normalizes resource choices and host hard ceilings", () => {
+  it("fails closed instead of presenting malformed aggregate usage as zero", () => {
+    const base = {
+      users: 1,
+      workspaces: { created: 2, running: 2, reserved: 2, limit: 5 },
+    };
+    expect(normalizeAdminCapacity(base).usage).toBeNull();
+    for (const usage of [
+      { running_total: 2, measured: 1, unavailable: 0, cpu_millicores: 0, memory_bytes: 0 },
+      { running_total: 1, measured: 1, unavailable: 0, cpu_millicores: 0, memory_bytes: 0 },
+      { running_total: 2, measured: -1, unavailable: 3, cpu_millicores: 0, memory_bytes: 0 },
+      { running_total: 2, measured: 0, unavailable: 2, cpu_millicores: 1, memory_bytes: 0 },
+    ]) {
+      expect(normalizeAdminCapacity({ ...base, usage }).usage).toBeNull();
+    }
+  });
+
+  it("normalizes resource choices and a multi-GPU host ceiling", () => {
     expect(normalizeResourcePolicy({ resource_policy: {
       version: 4,
       cpu_budget_millicores: 12000,
       memory_budget_mb: 16384,
       selectable_cpu_millicores: [2000, 1000, 1000],
       selectable_memory_mb: [4096, 2048],
-      gpu_budget_count: 1,
-      selectable_gpu_counts: [1, 0, 1],
+      gpu_budget_count: 3,
+      selectable_gpu_counts: [2, 0, 1, 2, 65],
       available_cpu_millicores: [500, 1000, 2000, 4000],
       available_memory_mb: [1024, 2048, 4096, 8192],
-      available_gpu_counts: [0, 1],
+      available_gpu_counts: [0, 1, 2, 3, 4, 65],
       kernel_idle_timeout_seconds: 3600,
       kernel_idle_timeout_bounds: {
         min_seconds: 300,
         max_seconds: 604800,
         step_seconds: 60,
       },
-      hard_ceiling: { cpu_millicores: 16000, memory_mb: 32768, gpu_count: 1 },
+      hard_ceiling: { cpu_millicores: 16000, memory_mb: 32768, gpu_count: 4 },
       updated_at: "2026-08-11T01:00:00Z",
     } })).toMatchObject({
       version: 4,
       selectableCpuMillicores: [1000, 2000],
       selectableMemoryMb: [2048, 4096],
-      gpuBudgetCount: 1,
-      selectableGpuCounts: [0, 1],
-      availableGpuCounts: [0, 1],
+      gpuBudgetCount: 3,
+      selectableGpuCounts: [0, 1, 2],
+      availableGpuCounts: [0, 1, 2, 3, 4],
       maxCpuBudgetMillicores: 16000,
       maxMemoryBudgetMb: 32768,
-      maxGpuBudgetCount: 1,
+      maxGpuBudgetCount: 4,
       kernelIdleTimeoutSeconds: 3600,
       kernelIdleTimeoutBounds: {
         minSeconds: 300,
@@ -332,7 +366,7 @@ describe("portal API normalization", () => {
     });
   });
 
-  it("defaults legacy policies to CPU-only and fails closed on oversized GPU values", () => {
+  it("defaults legacy policies to CPU-only and preserves valid multi-GPU values", () => {
     expect(normalizeResourcePolicy({ resource_policy: {
       version: 1,
       cpu_budget_millicores: 8000,
@@ -355,9 +389,24 @@ describe("portal API normalization", () => {
       available_gpu_counts: [0, 1, 2],
       hard_ceiling: { gpu_count: 9 },
     } })).toMatchObject({
+      gpuBudgetCount: 7,
+      selectableGpuCounts: [0, 1, 2],
+      availableGpuCounts: [0, 1, 2],
+      maxGpuBudgetCount: 9,
+    });
+
+    expect(normalizeResourcePolicy({ resource_policy: {
+      version: 3,
+      cpu_budget_millicores: 8000,
+      memory_budget_mb: 8192,
+      gpu_budget_count: 65,
+      selectable_gpu_counts: [0, 64, 65],
+      available_gpu_counts: [0, 64, 65],
+      hard_ceiling: { gpu_count: 65 },
+    } })).toMatchObject({
       gpuBudgetCount: 0,
-      selectableGpuCounts: [0, 1],
-      availableGpuCounts: [0, 1],
+      selectableGpuCounts: [0, 64],
+      availableGpuCounts: [0, 64],
       maxGpuBudgetCount: 0,
     });
   });
@@ -515,6 +564,7 @@ describe("portal API normalization", () => {
         operationType: "STOP",
         status: "PENDING",
       },
+      resourceUsage: null,
     });
 
     expect(normalizeOperation({
@@ -531,7 +581,45 @@ describe("portal API normalization", () => {
     });
   });
 
-  it("accepts an exact CUDA PyTorch profile and rejects partial accelerator metadata", () => {
+  it("accepts only a complete, bounded UTC workspace resource measurement", () => {
+    const base = {
+      id: "workspace-usage",
+      desired_state: "RUNNING",
+      observed_state: "RUNNING",
+    };
+    expect(normalizeWorkspace({
+      ...base,
+      resource_usage: {
+        cpu_millicores: 375,
+        memory_bytes: 536_870_912,
+        memory_limit_bytes: 1_073_741_824,
+        observed_at: "2026-09-04T01:02:03.123456Z",
+        expires_at: "2099-09-04T01:03:03Z",
+        stale: false,
+      },
+    }).resourceUsage).toEqual({
+      cpuMillicores: 375,
+      memoryBytes: 536_870_912,
+      memoryLimitBytes: 1_073_741_824,
+      observedAt: "2026-09-04T01:02:03.123456Z",
+      expiresAt: "2099-09-04T01:03:03Z",
+      stale: false,
+    });
+
+    for (const resourceUsage of [
+      null,
+      { cpu_millicores: -1, memory_bytes: 0, memory_limit_bytes: 1, observed_at: "2026-09-04T01:02:03Z", stale: false },
+      { cpu_millicores: 0, memory_bytes: 2, memory_limit_bytes: 1, observed_at: "2026-09-04T01:02:03Z", stale: false },
+      { cpu_millicores: 0, memory_bytes: 0, memory_limit_bytes: 1, observed_at: "2026-09-04T10:02:03+09:00", stale: false },
+      { cpu_millicores: 0, memory_bytes: 0, memory_limit_bytes: 1, observed_at: "2026-02-30T01:02:03Z", stale: false },
+      { cpu_millicores: 0, memory_bytes: 0, memory_limit_bytes: 1, observed_at: "2026-09-04T01:02:03Z", stale: "false" },
+    ]) {
+      expect(normalizeWorkspace({ ...base, resource_usage: resourceUsage }).resourceUsage)
+        .toBeNull();
+    }
+  });
+
+  it("accepts one or more exclusive GPUs and rejects partial accelerator metadata", () => {
     const base = {
       version: 1,
       name: "Python CUDA",
@@ -552,16 +640,25 @@ describe("portal API normalization", () => {
       { ...base, id: "python-cuda" },
       { ...base, id: "missing-cuda", cuda_version: undefined },
       { ...base, id: "bad-framework", gpu_framework: "tensorflow" },
-      { ...base, id: "shared-gpu", gpu_count: 2 },
+      { ...base, id: "multi-gpu", gpu_count: 2 },
+      { ...base, id: "too-many-gpus", gpu_count: 65 },
+      { ...base, id: "zero-gpu", gpu_count: 0 },
     ] });
-    expect(profiles).toEqual([expect.objectContaining({
-      id: "python-cuda",
-      acceleratorKind: "nvidia",
-      gpuCount: 1,
-      cudaVersion: "12.6",
-      gpuFramework: "pytorch",
-      gpuFrameworkVersion: "2.7.1",
-    })]);
+    expect(profiles).toEqual([
+      expect.objectContaining({
+        id: "python-cuda",
+        acceleratorKind: "nvidia",
+        gpuCount: 1,
+        cudaVersion: "12.6",
+        gpuFramework: "pytorch",
+        gpuFrameworkVersion: "2.7.1",
+      }),
+      expect.objectContaining({
+        id: "multi-gpu",
+        acceleratorKind: "nvidia",
+        gpuCount: 2,
+      }),
+    ]);
   });
 
   it("drops malformed, disabled, and duplicate profile rows fail-closed", () => {
@@ -951,8 +1048,8 @@ describe("portal API normalization", () => {
         memoryBudgetMb: 8192,
         selectableCpuMillicores: [1000, 2000],
         selectableMemoryMb: [1024, 2048],
-        gpuBudgetCount: 1,
-        selectableGpuCounts: [0, 1],
+        gpuBudgetCount: 4,
+        selectableGpuCounts: [0, 1, 2, 4],
         kernelIdleTimeoutSeconds: 7200,
       })).resolves.toMatchObject({ kernelIdleTimeoutSeconds: 7200 });
       const [url, init] = fetchMock.mock.calls[0] ?? [];
@@ -964,8 +1061,8 @@ describe("portal API normalization", () => {
         memory_budget_mb: 8192,
         selectable_cpu_millicores: [1000, 2000],
         selectable_memory_mb: [1024, 2048],
-        gpu_budget_count: 1,
-        selectable_gpu_counts: [0, 1],
+        gpu_budget_count: 4,
+        selectable_gpu_counts: [0, 1, 2, 4],
         kernel_idle_timeout_seconds: 7200,
       });
     } finally {

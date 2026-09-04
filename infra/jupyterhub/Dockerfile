@@ -24,7 +24,7 @@ RUN python -m pip install --no-cache-dir -r /tmp/platform-jupyterhub-requirement
       --create-home --shell /usr/sbin/nologin jupyterhub \
  && install -d -o 10001 -g 10001 -m 0700 /srv/jupyterhub
 
-COPY --chown=10001:10001 jupyterhub_config.py native_user_admin.py nativeauth_compat.py oauth_log_policy.py rbac_policy.py spawn_guard.py platform_spawner.py profile_policy.py public_url_policy.py local_volume_policy.py local_docker_provisioner.py local_provisioner_agent.py /etc/jupyterhub/
+COPY --chown=10001:10001 jupyterhub_config.py native_user_admin.py nativeauth_compat.py oauth_log_policy.py rbac_policy.py resource_usage.py resource_usage_handler.py spawn_guard.py platform_spawner.py profile_policy.py public_url_policy.py local_volume_policy.py local_docker_provisioner.py local_provisioner_agent.py /etc/jupyterhub/
 
 USER 10001:10001
 WORKDIR /srv/jupyterhub

@@ -6,15 +6,15 @@
     "method": "POST",
     "path": "/internal/v1/spawn-authorizations/consume",
     "body": {
-      "schema_version": 1,
+      "schema_version": 2,
       "username": "alice",
       "server_name": "ws-0123456789abcdef0123456789abcdef",
       "profile_id": "python-local",
       "profile_version": 1,
       "spawn_ticket": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-"
     },
-    "canonical_body": "{\"profile_id\":\"python-local\",\"profile_version\":1,\"schema_version\":1,\"server_name\":\"ws-0123456789abcdef0123456789abcdef\",\"spawn_ticket\":\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-\",\"username\":\"alice\"}",
-    "content_sha256": "ac75c69aaec12519a08f8c1a27fe93b83cb32c7df2e9eb2a2fb0becd6a0257c1",
-    "signature_hex": "c96ef3643f4620a96e7fc5ac27bbf7e61483c398878baa79198b15086ccc8208"
+    "canonical_body": "{\"profile_id\":\"python-local\",\"profile_version\":1,\"schema_version\":2,\"server_name\":\"ws-0123456789abcdef0123456789abcdef\",\"spawn_ticket\":\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef0123456789_-\",\"username\":\"alice\"}",
+    "content_sha256": "49293a59a9f8d1167443404e5cb8c3c553bb1377cdc9709f81c04b0b8f94d1bb",
+    "signature_hex": "28ffa477ccdf0d5f34adada8bed96f856f0ec2b1f3c52f1831e1d81e5ab3ba47"
   }
 }

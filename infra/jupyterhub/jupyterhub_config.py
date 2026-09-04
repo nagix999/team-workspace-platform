@@ -51,6 +51,7 @@ from rbac_policy import (  # noqa: E402
     validate_builtin_admin_browser_access,
     validate_singleuser_browser_oauth_contract,
 )
+from resource_usage_handler import RESOURCE_USAGE_HANDLERS  # noqa: E402
 from spawn_guard import GuardConfig, configure as configure_spawn_guard  # noqa: E402
 import spawn_guard  # noqa: E402
 
@@ -189,24 +190,32 @@ enabled_gpu_profiles = [
     for key, profile in enabled_profiles.items()
     if (accelerator_contract(profile) or {}).get("kind") == "nvidia"
 ]
-nvidia_gpu_device_id_value = os.environ.get(
-    "JUPYTERHUB_NVIDIA_GPU_DEVICE_ID", ""
+nvidia_gpu_device_ids_value = os.environ.get(
+    "JUPYTERHUB_NVIDIA_GPU_DEVICE_IDS", ""
 ).strip()
 if enabled_gpu_profiles:
     try:
-        nvidia_gpu_device_id = spawn_guard.validate_nvidia_gpu_device_id(
-            nvidia_gpu_device_id_value
+        nvidia_gpu_device_ids = spawn_guard.validate_nvidia_gpu_device_ids(
+            nvidia_gpu_device_ids_value
         )
     except spawn_guard.SpawnGuardError as exc:
         raise RuntimeError(
-            "enabled NVIDIA profile requires one exact trusted physical GPU UUID"
+            "enabled NVIDIA profiles require a canonical trusted physical GPU UUID pool"
         ) from exc
-elif nvidia_gpu_device_id_value:
+    largest_enabled_gpu_profile = max(
+        accelerator_contract(enabled_profiles[key])["count"]
+        for key in enabled_gpu_profiles
+    )
+    if largest_enabled_gpu_profile > len(nvidia_gpu_device_ids):
+        raise RuntimeError(
+            "enabled NVIDIA profile history exceeds the trusted physical GPU pool"
+        )
+elif nvidia_gpu_device_ids_value:
     raise RuntimeError(
-        "JUPYTERHUB_NVIDIA_GPU_DEVICE_ID is set without an enabled NVIDIA profile"
+        "JUPYTERHUB_NVIDIA_GPU_DEVICE_IDS is set without an enabled NVIDIA profile"
     )
 else:
-    nvidia_gpu_device_id = None
+    nvidia_gpu_device_ids = ()
 
 admin_users = {
     item.strip()
@@ -341,7 +350,7 @@ configure_spawn_guard(
         unsafe_local_dev=unsafe_local_runtime,
         max_cpu_millicores=positive_int_env("PLATFORM_WORKSPACE_CPU_BUDGET_MILLICORES"),
         max_memory_mb=positive_int_env("PLATFORM_WORKSPACE_MEMORY_BUDGET_MB"),
-        nvidia_gpu_device_id=nvidia_gpu_device_id,
+        nvidia_gpu_device_ids=nvidia_gpu_device_ids,
     )
 )
 
@@ -467,6 +476,7 @@ if web_provisioning_enabled or workspace_deletion_enabled:
     )
 c.JupyterHub.services = hub_services
 c.JupyterHub.load_roles = platform_load_roles()
+c.JupyterHub.extra_handlers = RESOURCE_USAGE_HANDLERS
 
 
 # Hub-level quota is the final defense even when portal checks race or are bypassed.

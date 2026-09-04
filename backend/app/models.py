@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -114,7 +115,7 @@ class WorkspaceProfile(Base):
             "(accelerator_kind = 'none' AND gpu_count = 0 AND "
             "cuda_version IS NULL AND gpu_framework IS NULL AND "
             "gpu_framework_version IS NULL) OR "
-            "(accelerator_kind = 'nvidia' AND gpu_count = 1 AND "
+            "(accelerator_kind = 'nvidia' AND gpu_count BETWEEN 1 AND 64 AND "
             "cuda_version IS NOT NULL AND gpu_framework = 'pytorch' AND "
             "gpu_framework_version IS NOT NULL)",
             name="ck_profiles_accelerator_contract",
@@ -227,6 +228,26 @@ class Workspace(Base):
             ["workspace_volume_slots.id", "workspace_volume_slots.owner_user_id"],
             name="fk_workspaces_volume_owner",
         ),
+        CheckConstraint(
+            "cpu_usage_millicores IS NULL OR cpu_usage_millicores >= 0",
+            name="ck_workspaces_cpu_usage_nonnegative",
+        ),
+        CheckConstraint(
+            "memory_usage_bytes IS NULL OR memory_usage_bytes >= 0",
+            name="ck_workspaces_memory_usage_nonnegative",
+        ),
+        CheckConstraint(
+            "memory_limit_bytes IS NULL OR memory_limit_bytes > 0",
+            name="ck_workspaces_memory_limit_positive",
+        ),
+        CheckConstraint(
+            "(cpu_usage_millicores IS NULL AND memory_usage_bytes IS NULL AND "
+            "memory_limit_bytes IS NULL AND resource_usage_observed_at IS NULL) OR "
+            "(cpu_usage_millicores IS NOT NULL AND memory_usage_bytes IS NOT NULL AND "
+            "memory_limit_bytes IS NOT NULL AND resource_usage_observed_at IS NOT NULL "
+            "AND memory_usage_bytes <= memory_limit_bytes)",
+            name="ck_workspaces_resource_usage_complete",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -239,6 +260,7 @@ class Workspace(Base):
     profile_offer_version: Mapped[int | None] = mapped_column(Integer)
     profile_offer_name_snapshot: Mapped[str | None] = mapped_column(String(80))
     assigned_gpu_device_id: Mapped[str | None] = mapped_column(String(96))
+    assigned_gpu_device_ids_json: Mapped[str | None] = mapped_column(Text)
     hub_target_key: Mapped[str] = mapped_column(
         String(255), nullable=False, unique=True
     )
@@ -255,6 +277,10 @@ class Workspace(Base):
     hub_started_at: Mapped[datetime | None] = mapped_column(DateTime)
     hub_last_activity_at: Mapped[datetime | None] = mapped_column(DateTime)
     last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    cpu_usage_millicores: Mapped[int | None] = mapped_column(Integer)
+    memory_usage_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    memory_limit_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    resource_usage_observed_at: Mapped[datetime | None] = mapped_column(DateTime)
     deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime)
     deletion_checkpoint: Mapped[str | None] = mapped_column(String(64))
     environment_generation: Mapped[int] = mapped_column(
@@ -283,6 +309,25 @@ Index(
     unique=True,
     sqlite_where=Workspace.archived_at.is_(None),
 )
+
+
+class WorkspaceGpuLease(Base):
+    """Exclusive physical-device ownership retained through confirmed teardown."""
+
+    __tablename__ = "workspace_gpu_leases"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "gpu_device_id", name="uq_workspace_gpu_lease_binding"
+        ),
+    )
+
+    gpu_device_id: Mapped[str] = mapped_column(String(96), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utcnow
+    )
 
 Index(
     "uq_workspace_assigned_gpu_device",
@@ -372,9 +417,9 @@ class SpawnAuthorization(Base):
         ),
         CheckConstraint(
             "(gpu_count = 0 AND gpu_device_id IS NULL AND "
-            "gpu_inventory_digest IS NULL) OR "
-            "(gpu_count = 1 AND gpu_device_id IS NOT NULL AND "
-            "gpu_inventory_digest IS NOT NULL)",
+            "gpu_device_ids_json IS NULL AND gpu_inventory_digest IS NULL) OR "
+            "(gpu_count BETWEEN 1 AND 64 AND gpu_device_id IS NOT NULL AND "
+            "gpu_device_ids_json IS NOT NULL AND gpu_inventory_digest IS NOT NULL)",
             name="ck_spawn_auth_gpu_contract",
         ),
         UniqueConstraint(
@@ -432,6 +477,7 @@ class SpawnAuthorization(Base):
     )
     gpu_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     gpu_device_id: Mapped[str | None] = mapped_column(String(96))
+    gpu_device_ids_json: Mapped[str | None] = mapped_column(Text)
     gpu_inventory_digest: Mapped[str | None] = mapped_column(String(71))
     environment_digest: Mapped[str | None] = mapped_column(String(76))
     environment_snapshot_cipher: Mapped[str | None] = mapped_column(Text)
@@ -458,7 +504,7 @@ class ResourcePolicy(Base):
             name="ck_resource_policy_kernel_idle_timeout",
         ),
         CheckConstraint(
-            "gpu_budget_count BETWEEN 0 AND 1",
+            "gpu_budget_count BETWEEN 0 AND 64",
             name="ck_resource_policy_gpu_budget",
         ),
     )

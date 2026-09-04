@@ -340,10 +340,11 @@ ceiling 안에서 사용자가 선택할 CPU·메모리 값을 추가할 수 있
 
 ### 8.1 선택: NVIDIA GPU runtime 활성화
 
-현재 GPU 범위는 **x86_64 host의 물리 NVIDIA GPU 정확히 1개를 workspace 하나에 독점 할당**하는
-초기 계약이다. 제공하는 kernel은 Python 3.12.13의 `python312-cuda` 하나이며 PyTorch
-`2.7.1+cu126`/CUDA 12.6으로 고정된다. 일반 Python kernel을 선택하면 GPU가 보이지 않는다.
-GPU memory quota, MIG, time-slicing, 여러 GPU 동시 할당, 사용자 CUDA extension compile용
+현재 GPU 범위는 **x86_64 단일 host의 물리 NVIDIA GPU 풀에서 사용자가 선택한 1개 이상을
+workspace 하나에 독점 할당**하는 계약이다. 제공하는 kernel은 Python 3.12.13의
+`python312-cuda` 하나이며 PyTorch `2.7.1+cu126`/CUDA 12.6으로 고정된다. 일반 Python kernel을
+선택하면 GPU가 보이지 않는다. GPU memory quota, MIG, MPS/time-slicing, 여러 workspace의 동일
+GPU 공유, topology-aware 배치, 다중 host GPU scheduling과 사용자 CUDA extension compile용
 `nvcc`는 지원 범위가 아니다.
 
 Python 자체가 CUDA를 제공하는 것은 아니다. 이 플랫폼은 CPU single-user image와 별도인
@@ -378,7 +379,7 @@ docker info --format '{{json .Runtimes}}'
 마지막 출력에는 `nvidia` runtime이 있어야 한다. Toolkit 설치 package/repository 명령은 OS별로
 달라지므로 이 문서 끝의 NVIDIA 공식 설치 문서를 그대로 따른다.
 
-플랫폼에 허용할 GPU UUID 하나와 실제 version을 Git 밖의 운영 파일에 고정한다. 아래 예제는
+플랫폼에 허용할 GPU UUID 1~64개와 실제 version을 Git 밖의 운영 파일에 고정한다. 아래 예제는
 secret은 아니지만 scheduler 입력이므로 무결성이 중요하다. 저장소의 예제 파일을 root 소유
 일반 파일로 복사하고 값을 직접 검토한다.
 
@@ -390,17 +391,30 @@ sudo install -m 0640 -o root -g "$(id -gn)" \
 sudoedit /etc/team-workspace/gpu-runtime.json
 ```
 
-형식은 다음과 같고 `gpu_uuids`에는 `nvidia-smi`가 출력한 `GPU-...` 물리 UUID 하나만 넣는다.
-index `0`, PCI bus ID, MIG UUID 또는 여러 UUID는 허용되지 않는다. version도 위 명령의 실제
-출력과 정확히 같아야 한다.
+형식은 다음과 같고 `gpu_uuids`에는 `nvidia-smi`가 출력한 `GPU-...` 물리 UUID를 중복 없이
+넣는다. 입력 순서와 무관하게 플랫폼이 내부에서 사전순으로 canonicalize한다. index `0`, PCI
+bus ID와 MIG UUID는 허용되지 않는다. 목록에 등록한 모든 GPU가 독점 할당 풀에 포함되므로
+운영에 공개할 장치만 넣는다. version도 위 명령의 실제 출력과 정확히 같아야 한다.
 
 ```json
 {
   "schema_version": 1,
   "nvidia_driver_version": "EXACT_DRIVER_VERSION",
   "nvidia_container_toolkit_version": "EXACT_TOOLKIT_VERSION",
-  "gpu_uuids": ["GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
+  "gpu_uuids": [
+    "GPU-11111111-1111-1111-1111-111111111111",
+    "GPU-22222222-2222-2222-2222-222222222222"
+  ]
 }
+```
+
+형식과 canonical 순서를 확인할 때는 모든 UUID를 출력하는 옵션을 사용한다. 단일 GPU 호환 옵션인
+`--print-device-id`는 목록이 여러 개면 의도적으로 실패한다.
+
+```bash
+python3 infra/host/check_gpu_runtime.py \
+  --config /etc/team-workspace/gpu-runtime.json \
+  --print-device-ids
 ```
 
 `.env.production`에는 다음 절대경로만 넣는다. GPU UUID를 `.env.production`이나 Compose 파일에
@@ -413,12 +427,13 @@ PLATFORM_GPU_RUNTIME_CONFIG_FILE=/etc/team-workspace/gpu-runtime.json
 이후 `make production-preflight`는 DB를 변경하기 전에 다음을 모두 확인한다.
 
 - 설정 파일이 일반 non-symlink 파일이고 group/world writable이 아님
-- 설정한 driver/toolkit version과 물리 GPU UUID가 현재 host inventory와 정확히 일치
+- 설정한 driver/toolkit version과 물리 GPU UUID 집합이 현재 host inventory와 정확히 일치
 - Docker `nvidia` runtime 존재
 - CPU image와 별도로 만든 CUDA image가 검토한 CPU image ID를 base로 사용
-- 새 image뿐 아니라 재시작 가능하게 남은 모든 enabled GPU history image에서 container에
-  allowlist UUID 하나만 보이며 각 image의 PyTorch/CUDA/kernel 계약이 일치
-- `torch.cuda.is_available()`과 실제 CUDA tensor 연산/synchronize 성공
+- 새 image뿐 아니라 재시작 가능하게 남은 모든 enabled GPU history image에서 각 allowlist
+  GPU의 개별 probe와 전체 풀 동시 probe가 성공하고 PyTorch/CUDA/kernel 계약이 일치
+- `torch.cuda.is_available()`, 정확한 device 수와 각 장치의 실제 CUDA tensor
+  연산/synchronize 성공
 
 CUDA image의 첫 build는 크고 `download.pytorch.org` 접근이 필요할 수 있다. 위 검증 중 하나라도
 실패하면 GPU profile policy를 생성하거나 DB migration을 시작하지 않는다. 오류를 우회하려고
@@ -443,6 +458,11 @@ infra/egress-proxy/approved-domains.production.txt
 `/32`와 TCP port를
 등록한다. 저장 직후 desired revision이 올라가고, 정상일 때 수 초 안에 applied revision이
 같아져야 한다. 실패 상태에서는 이전 정상 정책이 유지되며 **적용 재시도**를 사용할 수 있다.
+
+최초 `v0.1.7` 배포에서는 다중 GPU lease 및 CPU·메모리 관측 schema와 Hub 전용 endpoint가
+함께 추가되므로 일부 서비스만 골라 재시작하지 말고 `production-up`으로 전체 stack을 같은
+release로 재생성한다. 적용 후 관리자 현황의 실행 환경 수, 측정 성공·누락 합계와 환경별
+CPU·메모리 사용량을 확인한다.
 
 같은 host의 서비스를 대상으로 할 때 process가 `127.0.0.1`에만 listen하면 container의
 loopback과 다른 주소이므로 접근할 수 없다. host LAN 주소 또는 보안 검토한 `0.0.0.0`에
@@ -479,7 +499,7 @@ make production-preflight
 - 실행 중 single-user container와 local/domain-test stack 부재
 - Platform/Hub DB volume이 둘 다 존재하거나 둘 다 존재하지 않음
 - digest-pinned base image와 전체 Python/CPU/메모리 profile image 계약
-- GPU 활성화 시 별도 CUDA/PyTorch image, 정확한 GPU UUID·driver·toolkit과 CUDA tensor 계약
+- GPU 활성화 시 별도 CUDA/PyTorch image, 정확한 GPU UUID 풀·driver·toolkit과 개별/전체 풀 CUDA tensor 계약
 - production Compose 렌더링과 Gateway `nginx -t`
 
 첫 build는 image 다운로드와 Python/npm 설치 때문에 오래 걸릴 수 있다. 중간에 실패하면 원인을
@@ -501,7 +521,7 @@ make production-ps
 `production-up`은 preflight를 다시 실행하고 다음 순서로 진행한다.
 
 1. Host·TLS·Engine/Compose·image/Compose 계약과 DB idle을 다시 사전 검사; GPU가 활성화된
-   경우 exact UUID를 주입한 CUDA tensor smoke도 반복
+   경우 exact UUID 집합을 주입한 CUDA tensor smoke도 반복
 2. 기존 Gateway와 제어면 내부 service를 중지하고 DB idle을 다시 확인
 3. 기존 DB가 있으면 Platform/Hub SQLite online backup 생성
 4. Production profile policy를 exact single-user image ID에 결속하고 Alembic migration과
@@ -518,6 +538,11 @@ make production-ps
 
 새 설치면 DB volume 두 개를 새로 만든다. 기존 운영 DB 변경 뒤 실패하면 script가 출력한 backup
 경로를 보존하고 무작정 `production-up`을 반복하지 않는다.
+
+GPU profile import가 끝나면 관리자 **자원·커널 정책**에서 GPU를 활성화하고 전체 예산을
+검증된 GPU 수 이하로 입력한다. 이어 사용자가 선택할 GPU 개수(예: 1, 2, 4)를 추가한다.
+각 선택값은 전체 GPU 예산 이하여야 하며 CPU 전용 0개는 자동으로 유지된다. 실행 중 GPU
+예약 합계보다 예산을 낮출 수 없다.
 
 `production-up`은 Engine major version을 검사해 network 정의를 자동 선택한다. Engine 28+은
 base Compose의 `internal=true`, IPv6 off, ICC on, IPv4/IPv6 isolated-gateway exact set을
@@ -650,7 +675,7 @@ curl --fail --silent --show-error https://alice.cyberailabs.team/healthz
   연결되고 비밀번호 본문은 Platform API 요청에 포함되지 않음
 - 잘못된 비밀번호 반복 시 rate limit 확인
 - 관리자 화면에서 생성 환경 수, 실제 실행 수, CPU/RAM 예약과 ceiling 확인
-- GPU를 활성화한 경우 GPU hard ceiling, 선택 정책과 예약 수 확인
+- GPU를 활성화한 경우 검증된 풀 크기 이하의 GPU 전체 예산, 사용자 선택 개수와 예약 합계 확인
 - 관리자 자원·커널 정책에서 유휴 커널 자동 정리 on/off와 시간 저장
 
 ### 13.3 workspace
@@ -661,10 +686,10 @@ curl --fail --silent --show-error https://alice.cyberailabs.team/healthz
 - 환경변수 변경 시 restart 필요 안내
 - 시작 후 JupyterLab, Notebook kernel, terminal과 WebSocket 동작
 - GPU 환경에서 `python312-cuda`만 표시되고 `torch.__version__ == "2.7.1+cu126"`,
-  `torch.version.cuda == "12.6"`, `torch.cuda.is_available() is True`, device 수 1과 CUDA tensor
-  연산 성공; CPU 환경에서는 GPU가 보이지 않음
-- 첫 GPU workspace가 실행 중이면 두 번째 GPU workspace 시작은 capacity 부족으로 거부되고,
-  첫 환경을 정상 중지한 뒤 다음 환경이 시작됨
+  `torch.version.cuda == "12.6"`, `torch.cuda.is_available() is True`, device 수가 선택한 GPU
+  개수와 같으며 각 장치의 CUDA tensor 연산 성공; CPU 환경에서는 GPU가 보이지 않음
+- 여러 GPU 환경을 동시에 시작해 UUID가 중복되지 않음을 확인하고, 남은 미예약 GPU보다 큰
+  요청은 capacity 부족으로 거부되며 기존 환경을 정상 중지한 뒤에는 시작됨
 - 테스트용 timeout 적용 후 busy kernel 유지, idle kernel 정리와 파일 보존 확인
 - `/home/jovyan/work` private data 영속성
 - `/home/jovyan/shared` 팀 공유 read/write와 재시작 후 보존
@@ -797,7 +822,7 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 | production Hub DB volume | ID/password hash, OAuth, named-server 상태 |
 | `secrets/production` | DB 암호문 복호화와 서비스 인증에 필요한 key |
 | `.runtime/production/profiles.json` | 기존 workspace의 immutable runtime 결속 |
-| `/etc/team-workspace/gpu-runtime.json` | 선택한 물리 GPU와 검증할 driver/toolkit 계약(GPU 사용 시) |
+| `/etc/team-workspace/gpu-runtime.json` | 독점 풀의 물리 GPU UUID 집합과 검증할 driver/toolkit 계약(GPU 사용 시) |
 | `platform.managed=true` private volumes | 사용자 작업 데이터 |
 | `jupyter-shared` | 팀 공유 데이터 |
 | TLS/ACME 계정 자료 | 인증서 갱신 연속성 |
@@ -847,7 +872,7 @@ backup bundle은 Platform/Hub DB만 복원한다. secret, profile policy와 priv
 - [ ] 회사/VPN CIDR allowlist와 상위 ACL 확인
 - [ ] live execution network option, host bridge IPv4/routable IPv6 주소 부재와 Docker restart 후 연결 차단 확인
 - [ ] CPU/RAM ceiling에 control-plane/OS 여유 포함
-- [ ] GPU 사용 시 driver/toolkit/runtime, 외부 관리 GPU policy 파일과 exact UUID/tensor probe 확인
+- [ ] GPU 사용 시 driver/toolkit/runtime, 외부 관리 GPU UUID 풀과 개별/전체 풀 tensor probe 확인
 - [ ] GPU memory quota·MIG·공유 할당이 제공되지 않는 제한을 운영자와 사용자에게 공지
 - [ ] egress domain과 blocked-user 정책 검토
 - [ ] `make production-preflight` 성공
